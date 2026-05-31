@@ -3,12 +3,19 @@ use std::io::{Read, Write, BufReader, BufWriter};
 use crate::weights::Weights;
 use crate::features::Features;
 
-/// Binary file format for persisting weights
-/// Structure:
-/// - Header: magic number (4 bytes), version (4 bytes), n_features (4 bytes)
-/// - Features section: for each feature: name_len (4) + name + n_cells (4) + cells...
-/// - Weight data: all weights in row-major order
-
+/// Binary serialization format for Othello position weights.
+///
+/// File format:
+/// - Header (12 bytes):
+///   - Magic number: 0xDEADBEEF (4 bytes) - file validation
+///   - Format version: 1 (4 bytes) - compatibility checking
+///   - Number of features: N (4 bytes)
+/// - Feature metadata (variable):
+///   - For each feature: name_length + name + cells_count + cell_indices
+/// - Weight data (variable):
+///   - All weights in row-major order: [feature][empty_range][pattern]
+///
+/// The single file contains everything needed to reconstruct weights from disk.
 const MAGIC_NUMBER: u32 = 0xDEADBEEF;
 const FORMAT_VERSION: u32 = 1;
 

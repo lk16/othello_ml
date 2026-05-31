@@ -1,17 +1,24 @@
 use crate::board::Board;
 use crate::weights::Weights;
 
-/// Training data point
+/// Training data point: a board position paired with its ground truth evaluation.
 #[derive(Debug, Clone)]
 pub struct TrainingExample {
     pub board: Board,
-    pub target_score: i32, // Ground truth from Edax
+    pub target_score: i32, // Ground truth score from Edax
 }
 
-/// SGD trainer for optimizing weights
+/// SGD (Stochastic Gradient Descent) trainer for optimizing Othello position weights.
+///
+/// Training process:
+/// 1. Forward pass: evaluate board with current weights
+/// 2. Compute error: target_score - predicted_score
+/// 3. Backward pass: for each feature contributing to the prediction,
+///    update its weight: w = w - learning_rate * gradient
+/// 4. Repeat for multiple epochs over training data
 pub struct Trainer {
-    learning_rate: f32,
-    batch_size: usize,
+    learning_rate: f32,  // Step size for weight updates
+    batch_size: usize,   // Number of examples per training batch
 }
 
 impl Trainer {

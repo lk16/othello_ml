@@ -1,12 +1,16 @@
 // Board representation for Othello (8x8 board)
 // Uses two 64-bit integers: one for each player's discs
+// This is a standard bitboard representation used in many game engines.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
-    // Bitboards: bit position i represents cell i
-    // Cells are indexed 0-63 in standard chess ordering: a1=0, h1=7, a8=56, h8=63
-    pub player: u64,  // Current player's discs
-    pub opponent: u64, // Opponent's discs
+    // Bitboards: bit position i represents cell i (0-63)
+    // Cell mapping: a1=0, b1=1, ..., h1=7 (rank 1)
+    //              a2=8, b2=9, ..., h2=15 (rank 2)
+    //              ...
+    //              a8=56, b8=57, ..., h8=63 (rank 8)
+    pub player: u64,    // Current player's discs
+    pub opponent: u64,  // Opponent's discs
 }
 
 impl Board {

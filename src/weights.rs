@@ -1,9 +1,16 @@
 use crate::features::Features;
 
-/// Weight table for evaluating positions
-/// Stores scores indexed by [feature_idx][empty_count_range][pattern_index]
+/// Weight table for evaluating Othello positions.
+///
+/// Stores evaluation weights indexed by:
+/// - Feature index: which of the 47 features (0-46)
+/// - Empty count range: which of the 30 disc-count tables (indices 0-29 for empties 2,4,6,...,60)
+/// - Pattern index: which pattern configuration within that feature (0 to 3^cells-1)
+///
+/// Each weight is an i16 representing the evaluation contribution of that feature configuration.
+/// Position evaluation = sum of all feature weights for the current board state.
 pub struct Weights {
-    // Feature scores: for each feature, for each empty count level, for each pattern
+    // Feature scores: [feature][empty_range][pattern] = score
     feature_weights: Vec<Vec<Vec<i16>>>,
     empty_ranges: Vec<u32>, // 2, 4, 6, 8, ... 60
     features: Features,

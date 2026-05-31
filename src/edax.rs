@@ -2,7 +2,16 @@ use std::process::{Command, Stdio};
 use std::io::Write;
 use std::env;
 
-/// Interface to Edax for getting ground truth evaluations
+/// Interface to Edax engine for obtaining ground truth position evaluations.
+///
+/// The Edax interface communicates with the Edax binary via subprocess.
+/// It expects the path to the Edax executable in the EDAX_PATH environment variable.
+///
+/// Usage:
+/// ```ignore
+/// let edax = EdaxInterface::new()?;
+/// let score = edax.evaluate("position startpos moves e2e4")?;
+/// ```
 pub struct EdaxInterface {
     edax_path: String,
 }

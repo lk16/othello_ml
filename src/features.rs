@@ -1,7 +1,13 @@
 use crate::board::Board;
 
-/// Represents the 47 Edax features
-/// Each feature is a set of cells and can have up to 3^N states
+/// Represents the 47 Edax features used for position evaluation.
+/// Each feature is a subset of board cells that forms a pattern.
+/// The pattern can be any subset: corners, edges, diagonals, rows, columns, etc.
+///
+/// Features work by converting the pattern of discs in a subset to an index:
+/// - Each cell can be empty (0), player disc (1), or opponent disc (2)
+/// - Index = sum of (value * 3^position) for each cell in the feature
+/// - This gives a trinary index from 0 to 3^N-1 where N is the number of cells
 #[derive(Debug, Clone)]
 pub struct Features {
     features: Vec<Feature>,
