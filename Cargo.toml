@@ -1,0 +1,14 @@
+[package]
+name = "othello_eval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[[bin]]
+name = "othello_eval"
+path = "src/main.rs"
+
+[lib]
+name = "othello_eval"
+path = "src/lib.rs"
