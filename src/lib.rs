@@ -7,7 +7,7 @@ pub mod training;
 pub mod weights;
 
 pub use board::Board;
-pub use edax::{edax_available, EdaxInterface};
+pub use edax::{board_to_fen, edax_available, EdaxInterface};
 pub use features::Features;
 pub use positions::{extract_positions, load_games, Game, Position};
 pub use training::{Trainer, TrainingExample};

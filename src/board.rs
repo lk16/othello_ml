@@ -81,6 +81,79 @@ impl Board {
     pub fn cell_to_coords(cell: u32) -> (u32, u32) {
         (cell % 8, cell / 8)
     }
+
+    /// Compute a bitboard of all legal moves for the current player.
+    ///
+    /// A move is legal at an empty cell if placing a disc there would flip
+    /// at least one opponent disc in any of the 8 directions.
+    pub fn get_moves(&self) -> u64 {
+        // Mask: exclude the rightmost column to prevent horizontal wrapping
+        // 0x7E7E7E7E7E7E7E7E = all columns except 'H'
+        let mask = self.opponent & 0x7E7E7E7E7E7E7E7E;
+        let mut moves: u64 = 0;
+
+        // Horizontal / vertical / diagonal shift amounts
+        for &shift in &[1, 7, 9, 8] {
+            // Direction: positive shift (left/up)
+            let mut flip = mask & (self.player << shift);
+            flip |= mask & (flip << shift);
+            let mask_dir = mask & (mask << shift);
+            flip |= mask_dir & (flip << (2 * shift));
+            flip |= mask_dir & (flip << (2 * shift));
+            moves |= flip << shift;
+
+            // Direction: negative shift (right/down)
+            let mut flip = mask & (self.player >> shift);
+            flip |= mask & (flip >> shift);
+            let mask_dir = mask & (mask >> shift);
+            flip |= mask_dir & (flip >> (2 * shift));
+            flip |= mask_dir & (flip >> (2 * shift));
+            moves |= flip >> shift;
+        }
+
+        // Only empty cells are legal moves, mask to 64 bits
+        moves & !(self.player | self.opponent) & 0xFFFFFFFFFFFFFFFF
+    }
+
+    /// Check whether the current player has any legal moves.
+    pub fn has_moves(&self) -> bool {
+        self.get_moves() != 0
+    }
+
+    /// Check whether the game is over (neither player has legal moves).
+    pub fn is_game_end(&self) -> bool {
+        !self.has_moves() && !self.pass_move().has_moves()
+    }
+
+    /// Return the board after a pass (swap sides).
+    ///
+    /// The current player has no legal moves so they pass;
+    /// the opponent becomes the new side to move.
+    pub fn pass_move(&self) -> Board {
+        Board {
+            player: self.opponent,
+            opponent: self.player,
+        }
+    }
+
+    /// Exact final score from the perspective of the side to move.
+    ///
+    /// At game end, all remaining empty squares go to the winner.
+    /// - If side to move wins: 64 - 2×opponent_discs  (positive)
+    /// - If opponent wins:    2×player_discs - 64   (negative)
+    /// - Tie: 0
+    pub fn final_score(&self) -> i32 {
+        let me = self.player_discs() as i32;
+        let opp = self.opponent_discs() as i32;
+
+        if me > opp {
+            64 - 2 * opp
+        } else if opp > me {
+            -64 + 2 * me
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,5 +197,63 @@ mod tests {
         board.place_disc(0);
         assert_eq!(board.get_cell(0), Cell::Player);
         assert_eq!(board.player_discs(), 1);
+    }
+
+    #[test]
+    fn test_initial_has_moves() {
+        let board = Board::initial();
+        assert!(board.has_moves());
+        // The initial position has exactly 4 legal moves for black
+        assert_eq!(board.get_moves().count_ones(), 4);
+    }
+
+    #[test]
+    fn test_pass_move() {
+        let board = Board::initial();
+        let passed = board.pass_move();
+        // After pass, former opponent becomes player
+        assert_eq!(passed.player, board.opponent);
+        assert_eq!(passed.opponent, board.player);
+    }
+
+    #[test]
+    fn test_is_not_game_end_initially() {
+        let board = Board::initial();
+        assert!(!board.is_game_end());
+    }
+
+    #[test]
+    fn test_game_end_and_final_score() {
+        // Create a game-end position: black controls entire board
+        let board = Board {
+            player: 0xFFFFFFFFFFFFFFFF, // all discs
+            opponent: 0,
+        };
+        assert!(!board.has_moves()); // no empty squares
+        assert!(board.is_game_end());
+        // Player wins: 64 - 2*0 = 64
+        assert_eq!(board.final_score(), 64);
+
+        // Opponent wins
+        let board = Board {
+            player: 0,
+            opponent: 0xFFFFFFFFFFFFFFFF,
+        };
+        assert_eq!(board.final_score(), -64);
+
+        // Tie: 32 each
+        let board = Board {
+            player: 0x00000000FFFFFFFF,
+            opponent: 0xFFFFFFFF00000000,
+        };
+        assert_eq!(board.final_score(), 0);
+    }
+
+    #[test]
+    fn test_get_moves_empty_board() {
+        // An empty board: no opponent discs to flip → no moves
+        let board = Board::new();
+        assert!(!board.has_moves());
+        assert_eq!(board.get_moves(), 0);
     }
 }

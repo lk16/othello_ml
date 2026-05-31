@@ -1,202 +1,361 @@
 use crate::board::Board;
-use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// Interface to the Edax engine for obtaining ground truth position evaluations.
 ///
-/// Starts Edax as a persistent subprocess and communicates via stdin/stdout pipes.
-/// This avoids the per-evaluation process-spawn overhead (critical for thousands
-/// of training positions).
+/// Uses Edax's `-solve /dev/stdin` batch mode (one process per training run):
+///   1. Start Edax with `-solve /dev/stdin -level <N>`
+///   2. Write all positions as "problems" to stdin
+///   3. Close stdin
+///   4. Read stdout, parse scores
+///   5. Wait for Edax to exit
 ///
-/// ## Edax FEN format
+/// ## Problem format
 ///
-/// 64 characters (A1..H1, A2..H2, …, A8..H8):
-///   `X` = black disc, `O` = white disc, `-` = empty
-/// Followed by a space and the side to move (`X` or `O`).
+/// Each position is written as:
+///   `<64-squares> X;\n`
 ///
-/// ## Edax protocol
-///
-///   set board <fen>   →  set the board position
-///   eval              →  evaluate and print the score
-///   quit              →  exit
-///
-/// Edax's `eval` score is from the perspective of the side to move:
-/// positive  = side to move is better,
-/// negative  = opponent is better.
-pub struct EdaxInterface {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    reader: BufReader<std::process::ChildStdout>,
-}
+/// Where squares use `X` for the side-to-move discs, `O` for opponent discs,
+/// and `-` for empty cells. The side to move is always normalized to `X`.
+/// This means evaluations are always from the side-to-move perspective,
+/// matching the training target convention.
+pub struct EdaxInterface;
 
 impl EdaxInterface {
-    /// Start Edax in persistent mode.
+    /// Evaluate a batch of positions.
     ///
-    /// Reads the path to the Edax binary from the `EDAX_PATH` environment variable.
-    /// Stderr is discarded so it doesn't fill the pipe buffer.
-    pub fn new() -> Result<Self, String> {
-        let edax_path = env::var("EDAX_PATH")
-            .map_err(|_| "EDAX_PATH environment variable not set".to_string())?;
+    /// Each board's `player` bitboard is the side to move.
+    ///
+    /// Handles three cases before sending to Edax:
+    ///   1. **Game end** (neither side has moves) → exact final score, no Edax call
+    ///   2. **Pass** (current player has no moves, opponent does) → swap sides,
+    ///      evaluate the passed position, negate the result
+    ///   3. **Normal** → send to Edax as-is
+    ///
+    /// `edax_path` is the path to the Edax binary.
+    /// `level` is the search level (0–60, must be even).
+    ///
+    /// Returns a `Vec<i32>` of scores, one per position, in the same order.
+    /// Scores are from the side-to-move perspective.
+    pub fn batch_evaluate(
+        positions: &[Board],
+        level: u32,
+        edax_path: &str,
+    ) -> Result<Vec<i32>, String> {
+        let n = positions.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut child = Command::new(&edax_path)
+        // Classify each position: game-end, pass, or normal
+        enum Action {
+            Normal(Board),
+            Pass(Board),    // passed board (swapped sides)
+            GameEnd(i32),   // exact final score
+        }
+
+        let actions: Vec<Action> = positions
+            .iter()
+            .map(|board| {
+                if board.is_game_end() {
+                    Action::GameEnd(board.final_score())
+                } else if !board.has_moves() {
+                    Action::Pass(board.pass_move())
+                } else {
+                    Action::Normal(*board)
+                }
+            })
+            .collect();
+
+        // Collect only the positions that need Edax evaluation
+        let edax_boards: Vec<Board> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Normal(b) | Action::Pass(b) => Some(*b),
+                Action::GameEnd(_) => None,
+            })
+            .collect();
+
+        let edax_scores = if edax_boards.is_empty() {
+            Vec::new()
+        } else {
+            Self::run_edax_solve(&edax_boards, level, edax_path)?
+        };
+
+        // Map scores back to the original order
+        let mut score_iter = edax_scores.into_iter();
+        let scores: Vec<i32> = actions
+            .iter()
+            .map(|action| match action {
+                Action::GameEnd(score) => *score,
+                Action::Normal(_) => score_iter.next().expect("score count mismatch"),
+                Action::Pass(_) => -score_iter.next().expect("score count mismatch"),
+            })
+            .collect();
+
+        Ok(scores)
+    }
+
+    /// Default number of positions per Edax process chunk.
+    ///
+    /// Each chunk spawns a separate Edax process, writes positions to stdin,
+    /// closes stdin, reads results, and exits. This avoids overflowing OS pipe
+    /// buffers on large datasets (2M+ positions).
+    const CHUNK_SIZE: usize = 100;
+
+    /// Run Edax -solve on a list of boards, chunking into separate processes.
+    ///
+    /// All boards must have legal moves for the side to move — game-ends and
+    /// passes must be handled by the caller before reaching this function.
+    fn run_edax_solve(
+        boards: &[Board],
+        level: u32,
+        edax_path: &str,
+    ) -> Result<Vec<i32>, String> {
+        let n = boards.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let num_chunks = (n + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE;
+        let mut all_scores = Vec::with_capacity(n);
+        let chunk_start = std::time::Instant::now();
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * Self::CHUNK_SIZE;
+            let end = usize::min(start + Self::CHUNK_SIZE, n);
+            let chunk = &boards[start..end];
+
+            let scores = Self::run_edax_solve_chunk(chunk, level, edax_path)
+                .map_err(|e| format!("Chunk {}/{} (positions {}-{}): {}", chunk_idx + 1, num_chunks, start + 1, end, e))?;
+
+            all_scores.extend(scores);
+
+            // Progress with ETA
+            if num_chunks > 1 {
+                let done = chunk_idx + 1;
+                let elapsed = chunk_start.elapsed().as_secs_f64().max(0.001);
+                let avg_per_chunk = elapsed / done as f64;
+                let remaining = avg_per_chunk * (num_chunks - done) as f64;
+                eprint!(
+                    "\r  [{:3}%] chunk {}/{} | {}/{} pos | ETA: {:.0}s          ",
+                    done * 100 / num_chunks, done, num_chunks, end, n, remaining
+                );
+                let _ = std::io::stderr().flush();
+            }
+        }
+
+        if num_chunks > 1 {
+            eprintln!();
+        }
+
+        Ok(all_scores)
+    }
+
+    /// Run a single Edax -solve process on a small chunk of boards.
+    fn run_edax_solve_chunk(
+        boards: &[Board],
+        level: u32,
+        edax_path: &str,
+    ) -> Result<Vec<i32>, String> {
+        use std::path::Path;
+
+        // Edax needs to run from the directory above its binary so it can
+        // find data/ (book, evaluation weights, etc.). Matches flippy:
+        //   cwd = self.edax_path.parent.parent
+        let edax_bin = Path::new(edax_path);
+        let cwd = edax_bin
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| Path::new("."));
+
+        let mut child = Command::new(edax_path)
+            .arg("-solve")
+            .arg("/dev/stdin")
+            .arg("-level")
+            .arg(level.to_string())
+            .arg("-verbose")
+            .arg("3")
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to start Edax '{}': {}", edax_path, e))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open Edax stdin".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Failed to open Edax stdout".to_string())?;
-        let reader = BufReader::new(stdout);
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "Failed to open Edax stdin".to_string())?;
 
-        Ok(EdaxInterface {
-            child,
-            stdin,
-            reader,
-        })
+            let mut input = String::with_capacity(boards.len() * 70);
+            for board in boards {
+                input.push_str(&Self::board_to_problem(board));
+            }
+            stdin
+                .write_all(input.as_bytes())
+                .map_err(|e| format!("Error writing to Edax: {}", e))?;
+            // stdin is dropped here → closed, signalling EOF to Edax
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed to wait for Edax: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Edax exited with error (status: {}): {}",
+                output.status, stderr.trim()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Self::parse_solve_output(&stdout, boards.len())
     }
 
-    /// Convert a [`Board`] to an Edax FEN string.
+    /// Convert a board to Edax problem format.
     ///
-    /// When `black_to_move` is true,  `player` bits → `X`, `opponent` bits → `O`.
-    /// When `black_to_move` is false, `player` bits → `O`, `opponent` bits → `X`.
-    /// The side-to-move character is always `X` for black, `O` for white.
-    pub fn board_to_fen(board: &Board, black_to_move: bool) -> String {
-        let mut fen = String::with_capacity(66);
+    /// Always normalizes so `X` is the side to move, `O` is the opponent.
+    /// `board.player` = side to move → `X`, `board.opponent` → `O`.
+    fn board_to_problem(board: &Board) -> String {
+        let mut squares = String::with_capacity(70); // 64 squares + " X;\n" + margin
         for i in 0..64 {
             let bit = 1u64 << i;
-            let (is_black, is_white) = if black_to_move {
-                (board.player & bit != 0, board.opponent & bit != 0)
+            if board.player & bit != 0 {
+                squares.push('X');
+            } else if board.opponent & bit != 0 {
+                squares.push('O');
             } else {
-                (board.opponent & bit != 0, board.player & bit != 0)
-            };
-            fen.push(if is_black {
-                'X'
-            } else if is_white {
-                'O'
-            } else {
-                '-'
-            });
+                squares.push('-');
+            }
         }
-        fen.push(' ');
-        fen.push(if black_to_move { 'X' } else { 'O' });
-        fen
+        squares.push_str(" X;\n");
+        squares
     }
 
-    /// Evaluate a board position.
+    /// Parse the stdout from `edax -solve`.
     ///
-    /// Sends `set board <fen>` followed by `eval` to the persistent Edax
-    /// process, then reads output lines until a numeric score is found.
-    ///
-    /// Returns the score from the perspective of the side to move:
-    /// positive = good for the side to move, negative = good for the opponent.
-    pub fn evaluate(&mut self, board: &Board, black_to_move: bool) -> Result<i32, String> {
-        let fen = Self::board_to_fen(board, black_to_move);
-        writeln!(self.stdin, "set board {}", fen)
-            .and_then(|_| writeln!(self.stdin, "eval"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|e| format!("Error writing to Edax: {}", e))?;
+    /// With `-verbose 3`, Edax outputs a block per position separated by
+    /// `*** problem ***` markers. Within each block, it prints a score line
+    /// for each search depth iteration. We take the **last** score in each
+    /// block (the deepest/final evaluation), matching the Python flippy
+    /// parser behaviour.
+    fn parse_solve_output(stdout: &str, expected_count: usize) -> Result<Vec<i32>, String> {
+        let mut scores = Vec::with_capacity(expected_count);
 
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF — Edax crashed or closed stdout
-                    return Err("Edax closed stdout unexpectedly".to_string());
+        // Split on "*** problem" markers — each block is one position.
+        // The first element is text before the first marker (banner or empty).
+        let blocks: Vec<&str> = stdout.split("*** problem").collect();
+        let problems = if blocks.len() > 1 { &blocks[1..] } else { &[] };
+
+        for block in problems {
+            let mut last_score: Option<i32> = None;
+
+            for line in block.lines() {
+                let line = line.trim();
+                if line.is_empty()
+                    || line.starts_with("----")
+                    || line.contains("positions;")
+                    || line.contains("/dev/stdin")
+                {
+                    continue;
                 }
-                Ok(_) => {
-                    if let Some(score) = Self::parse_eval_line(&line) {
-                        return Ok(score);
-                    }
-                    // otherwise keep reading — skip board display, banners, etc.
+
+                if let Some(score) = Self::parse_solve_line(line) {
+                    last_score = Some(score);
                 }
-                Err(e) => {
-                    return Err(format!("Error reading Edax output: {}", e));
+            }
+
+            match last_score {
+                Some(score) => scores.push(score),
+                None => {
+                    return Err(format!(
+                        "No score found in problem block {}. Block content:\n{}",
+                        scores.len() + 1,
+                        &block[..block.len().min(500)]
+                    ));
                 }
             }
         }
+
+        if scores.len() != expected_count {
+            return Err(format!(
+                "Expected {} scores from Edax but parsed {}.\n\
+                 Make sure all input positions have at least one legal move.",
+                expected_count,
+                scores.len()
+            ));
+        }
+
+        Ok(scores)
     }
 
-    /// Try to extract a numeric score from an Edax output line.
+    /// Parse one output line from Edax's -solve output.
     ///
-    /// Handles several common Edax output formats:
-    ///   "+12.34"         — bare score line
-    ///   "  +12.34"       — indented score line
-    ///   "score: +12.34"   — labelled score
-    ///   "eval = -5"       — alternative label
-    fn parse_eval_line(line: &str) -> Option<i32> {
-        let line = line.trim();
-        if line.is_empty() {
+    /// Expected format: `<depth>@<confidence>%  <+score>  <moves...>`
+    /// Examples: ` 10@100%  +12  f5  g6  ...`
+    ///           `  5@73%   -3  d3  c4  ...`
+    fn parse_solve_line(line: &str) -> Option<i32> {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        if columns.len() < 2 {
             return None;
         }
 
-        // Look for a token that looks like a signed number: +12.34 or -5.00 or +10
-        for token in line.split(&[' ', ':', '='][..]) {
-            let token = token.trim();
-            // Must start with a sign and be at least "+0"
-            if token.len() < 2 {
-                continue;
-            }
-            let first = token.chars().next().unwrap();
-            if first != '+' && first != '-' {
-                continue;
-            }
-            // Collect characters that belong to the number
-            let num_str: String = token
-                .chars()
-                .take_while(|&c| c == '+' || c == '-' || c == '.' || c.is_ascii_digit())
-                .collect();
-            if num_str.len() > 1 {
-                if let Ok(val) = num_str.parse::<f64>() {
-                    return Some(val.round() as i32);
-                }
-            }
+        // First column must be depth[@confidence%]
+        if !columns[0].contains('@') && !columns[0].ends_with('%') {
+            // Could be just a depth number, but -verbose 3 includes @confidence
         }
 
-        None
-    }
+        // Check that the first column looks like "N@M%" or "N"
+        let first = columns[0];
+        let has_at = first.contains('@');
+        let has_pct = first.ends_with('%') || first.contains('%');
 
-    /// Cleanly shut down Edax.
-    ///
-    /// Sends `quit` and waits for the process to exit.
-    /// It is safe to drop this struct without calling `shutdown` — the
-    /// process will be killed on drop, but explicit shutdown is cleaner.
-    pub fn shutdown(mut self) -> Result<(), String> {
-        let _ = writeln!(self.stdin, "quit");
-        let _ = self.stdin.flush();
-        self.child.wait().map_err(|e| e.to_string())?;
-        Ok(())
+        if !has_at && !has_pct && first.parse::<u32>().is_err() {
+            return None; // Not a depth column — not a score line
+        }
+
+        // Second column is the score: +12, -5, etc.
+        let score_str = columns[1];
+        // Strip angle brackets sometimes used for exact scores: <+10>
+        let score_str = score_str.trim_matches(|c: char| c == '<' || c == '>');
+        score_str.parse::<i32>().ok()
     }
 }
 
-impl Drop for EdaxInterface {
-    fn drop(&mut self) {
-        // Best-effort cleanup: try to quit gracefully, then kill if needed.
-        let _ = writeln!(self.stdin, "quit");
-        let _ = self.stdin.flush();
-        // Don't block — if Edax is stuck, the OS will reap the zombie.
-        // We use try_wait to avoid hanging the whole program on drop.
-        if let Ok(Some(_)) = self.child.try_wait() {
-            // already exited
+/// Convert a board to an Edax FEN string (used for eval file persistence).
+///
+/// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
+///   `X` = black disc, `O` = white disc, `-` = empty
+/// Followed by a space and the side to move (`X` for black, `O` for white).
+pub fn board_to_fen(board: &Board, black_to_move: bool) -> String {
+    let mut fen = String::with_capacity(66);
+    for i in 0..64 {
+        let bit = 1u64 << i;
+        let (is_black, is_white) = if black_to_move {
+            (board.player & bit != 0, board.opponent & bit != 0)
         } else {
-            // Give it a moment, then kill
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = self.child.kill();
-        }
+            (board.opponent & bit != 0, board.player & bit != 0)
+        };
+        fen.push(if is_black {
+            'X'
+        } else if is_white {
+            'O'
+        } else {
+            '-'
+        });
     }
+    fen.push(' ');
+    fen.push(if black_to_move { 'X' } else { 'O' });
+    fen
 }
 
 /// Check whether Edax is available (EDAX_PATH is set).
 pub fn edax_available() -> bool {
-    env::var("EDAX_PATH").is_ok()
+    std::env::var("EDAX_PATH").is_ok()
 }
 
 #[cfg(test)]
@@ -211,18 +370,42 @@ mod tests {
     }
 
     #[test]
+    fn test_board_to_problem_initial() {
+        let board = Board::initial();
+        let problem = EdaxInterface::board_to_problem(&board);
+
+        // Should end with " X;\n"
+        assert!(problem.ends_with(" X;\n"));
+        // 64 squares + " X;\n" = 68 chars
+        assert_eq!(problem.len(), 68);
+
+        let squares = &problem[..64];
+        assert_eq!(squares.chars().filter(|&c| c == 'X').count(), 2);
+        assert_eq!(squares.chars().filter(|&c| c == 'O').count(), 2);
+        assert_eq!(squares.chars().filter(|&c| c == '-').count(), 60);
+    }
+
+    #[test]
+    fn test_board_to_problem_normalizes_to_x() {
+        // Even with black_to_move=false, board_to_problem always uses X
+        // for the side to move (player)
+        let board = Board::initial();
+        let problem = EdaxInterface::board_to_problem(&board);
+        // Player = side to move → X, always
+        assert!(problem.ends_with(" X;\n"));
+    }
+
+    #[test]
     fn test_board_to_fen_initial() {
         let board = Board::initial();
-        let fen = EdaxInterface::board_to_fen(&board, true);
+        let fen = board_to_fen(&board, true);
 
-        // 64 chars + space + side = 66 characters
         assert_eq!(fen.len(), 66);
         assert_eq!(&fen[64..65], " ");
 
         let (board_part, side) = split_fen(&fen);
-        assert_eq!(side, 'X'); // black to move
+        assert_eq!(side, 'X');
 
-        // 2 black discs (player), 2 white discs (opponent), 60 empty
         assert_eq!(board_part.chars().filter(|&c| c == 'X').count(), 2);
         assert_eq!(board_part.chars().filter(|&c| c == 'O').count(), 2);
         assert_eq!(board_part.chars().filter(|&c| c == '-').count(), 60);
@@ -230,13 +413,11 @@ mod tests {
 
     #[test]
     fn test_board_to_fen_white_to_move() {
-        // When Board::initial() is called with black_to_move=false,
-        // player bits (d5,e4=black discs) → O, opponent bits (d4,e5=white discs) → X.
         let board = Board::initial();
-        let fen = EdaxInterface::board_to_fen(&board, false);
+        let fen = board_to_fen(&board, false);
         let (board_part, side) = split_fen(&fen);
 
-        assert_eq!(side, 'O'); // white to move
+        assert_eq!(side, 'O');
         assert_eq!(board_part.chars().filter(|&c| c == 'X').count(), 2);
         assert_eq!(board_part.chars().filter(|&c| c == 'O').count(), 2);
         assert_eq!(board_part.chars().filter(|&c| c == '-').count(), 60);
@@ -245,7 +426,7 @@ mod tests {
     #[test]
     fn test_board_to_fen_empty() {
         let board = Board::new();
-        let fen = EdaxInterface::board_to_fen(&board, true);
+        let fen = board_to_fen(&board, true);
         let (board_part, side) = split_fen(&fen);
 
         assert_eq!(side, 'X');
@@ -256,46 +437,48 @@ mod tests {
 
     #[test]
     fn test_fen_board_order() {
-        // Verify A1..H1 are the first 8 characters, A2..H2 are next, etc.
-        // A1=0 is the first char in Edax FEN format.
         let board = Board::new();
-        let fen = EdaxInterface::board_to_fen(&board, true);
+        let fen = board_to_fen(&board, true);
         assert_eq!(fen.len(), 66);
-        // All dashes means the ordering is just positional — trust it.
     }
 
     #[test]
-    fn test_parse_eval_line_positive() {
-        assert_eq!(EdaxInterface::parse_eval_line("+12.34"), Some(12));
-        assert_eq!(EdaxInterface::parse_eval_line("  +10.0"), Some(10));
-        assert_eq!(EdaxInterface::parse_eval_line("+0.00"), Some(0));
-    }
-
-    #[test]
-    fn test_parse_eval_line_negative() {
-        assert_eq!(EdaxInterface::parse_eval_line("-5.67"), Some(-6));
-        assert_eq!(EdaxInterface::parse_eval_line("  -3.0"), Some(-3));
-    }
-
-    #[test]
-    fn test_parse_eval_line_labelled() {
+    fn test_parse_solve_line_positive() {
         assert_eq!(
-            EdaxInterface::parse_eval_line("score: +12.34"),
+            EdaxInterface::parse_solve_line(" 10@100%  +12  f5  g6  d6"),
             Some(12)
         );
-        assert_eq!(EdaxInterface::parse_eval_line("eval = -5"), Some(-5));
+        assert_eq!(
+            EdaxInterface::parse_solve_line("  5@73%   -3  d3  c4"),
+            Some(-3)
+        );
     }
 
     #[test]
-    fn test_parse_eval_line_non_score() {
-        assert_eq!(EdaxInterface::parse_eval_line(""), None);
-        assert_eq!(EdaxInterface::parse_eval_line("  A B C D E F G H"), None);
-        assert_eq!(EdaxInterface::parse_eval_line("Edax version 4.4"), None);
+    fn test_parse_solve_line_exact() {
+        // Exact scores may be wrapped in angle brackets
+        assert_eq!(
+            EdaxInterface::parse_solve_line(" 24@100%  <+10>  c4  d3"),
+            Some(10)
+        );
+        assert_eq!(
+            EdaxInterface::parse_solve_line(" 60@100%  <-64>  a1"),
+            Some(-64)
+        );
+    }
+
+    #[test]
+    fn test_parse_solve_line_non_score() {
+        assert_eq!(EdaxInterface::parse_solve_line(""), None);
+        assert_eq!(EdaxInterface::parse_solve_line("  A B C D E F G H"), None);
+        assert_eq!(
+            EdaxInterface::parse_solve_line("Edax version 4.4"),
+            None
+        );
     }
 
     #[test]
     fn test_edax_available() {
-        // Just check the function compiles and returns a bool
         let _available = edax_available();
     }
 }
