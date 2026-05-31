@@ -53,7 +53,7 @@ impl Features {
             Feature::new("line_row7", vec![48, 49, 50, 51, 52, 53, 54, 55]),        // A7-H7
             Feature::new("line_col_b", vec![1, 9, 17, 25, 33, 41, 49, 57]),         // B1-B8
             Feature::new("line_col_g", vec![6, 14, 22, 30, 38, 46, 54, 62]),        // G1-G8
-            
+
             // 4 more lines (8 cells each) - rows 3,6 and cols C,F
             Feature::new("line_row3", vec![16, 17, 18, 19, 20, 21, 22, 23]),        // A3-H3
             Feature::new("line_row6", vec![40, 41, 42, 43, 44, 45, 46, 47]),        // A6-H6
@@ -93,7 +93,7 @@ impl Features {
             Feature::new("diag_4_2", vec![24, 33, 42, 51]),                         // A4-D7
             Feature::new("diag_4_3", vec![28, 21, 14, 7]),                          // E1-H4
             Feature::new("diag_4_4", vec![35, 44, 53, 62]),                         // D5-G8
-            
+
             // 1 additional feature for completeness (parity or mobility hint)
             Feature::new("edge_parity", vec![0, 7, 56, 63]),                        // 4 corners as compacted feature
         ];

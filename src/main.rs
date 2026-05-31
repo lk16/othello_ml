@@ -1,26 +1,147 @@
-use othello_eval::{Board, Features, Weights};
+use othello_eval::{
+    extract_positions, load_games, Board, Features, Trainer, TrainingExample, Weights,
+};
+use std::env;
 
 fn main() {
-    println!("Othello Evaluator - Weight Training System");
+    let args: Vec<String> = env::args().collect();
 
-    // Test basic board operations
-    let board = Board::initial();
-    println!("Initial board - Player: {}, Opponent: {}, Empties: {}",
-        board.player_discs(),
-        board.opponent_discs(),
-        board.empties()
+    // Parse arguments
+    // Usage: othello_eval [--max-empties N] <path1> [path2 ...]
+    //   paths can be .wtb, .pgn, .txt files or directories (scanned recursively)
+
+    let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--max-empties" || args[i] == "-n" {
+            i += 1;
+            if i < args.len() {
+                max_empties = args[i].parse::<u32>().unwrap_or(60);
+            }
+        } else if args[i] == "--help" || args[i] == "-h" {
+            print_usage(&args[0]);
+            return;
+        } else {
+            paths.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    if paths.is_empty() {
+        eprintln!("Error: No input files or directories specified.\n");
+        print_usage(&args[0]);
+        return;
+    }
+
+    println!("=== Othello ML Training ===");
+    println!("Max empties: {}", max_empties);
+    println!("Input paths: {:?}", paths);
+
+    // Load games from all specified paths
+    eprintln!("\n--- Loading games ---");
+    let games = match load_games(&paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {}", e);
+            return;
+        }
+    };
+
+    // Extract positions with empties <= max_empties
+    eprintln!(
+        "\n--- Extracting positions (empties <= {}) ---",
+        max_empties
     );
+    let positions = extract_positions(&games, max_empties);
+    eprintln!("Extracted {} positions", positions.len());
 
-    // Test features
+    if positions.is_empty() {
+        eprintln!("No positions match the criteria. Exiting.");
+        return;
+    }
+
+    // Initialize features and weights
     let features = Features::edax();
-    println!("Loaded {} Edax features", features.count());
+    eprintln!("Features: {}", features.count());
 
-    // Test weights
-    let weights = Weights::new(features);
-    println!("Created weight table with {} features and {} empty ranges",
+    let mut weights = Weights::new(features.clone());
+    eprintln!(
+        "Weight table: {} features x {} empty ranges",
         weights.feature_count(),
         weights.empty_range_count()
     );
 
-    println!("Ready for training!");
+    // Create training examples (positions with no ground truth yet — use Edax if available)
+    let examples: Vec<TrainingExample> = positions
+        .iter()
+        .map(|pos| {
+            // For now use a simple heuristic target: disc difference
+            // (Black discs - White discs) if black to move, else (White - Black)
+            let board = &pos.board;
+            let disc_diff: i32 = if pos.black_to_move {
+                board.player.count_ones() as i32 - board.opponent.count_ones() as i32
+            } else {
+                board.opponent.count_ones() as i32 - board.player.count_ones() as i32
+            };
+
+            TrainingExample {
+                board: pos.board,
+                target_score: disc_diff,
+            }
+        })
+        .collect();
+
+    eprintln!("Training examples: {}", examples.len());
+
+    // Train
+    eprintln!("\n--- Training ---");
+    let trainer = Trainer::new(0.01, 32);
+    trainer.train_epochs(&mut weights, &examples, 50);
+
+    // Show some learned weights for corner features
+    eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
+    let board = Board::initial();
+    let feature_indices = features.extract(&board);
+    for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(10) {
+        let w = weights.get_weight(feat_idx, pattern_idx, 60);
+        if w != 0 {
+            eprintln!(
+                "  Feature {} pattern {}: weight = {}",
+                feat_idx, pattern_idx, w
+            );
+        }
+    }
+
+    // Save weights
+    eprintln!("\n--- Saving weights ---");
+    match othello_eval::io::WeightIO::save(&weights, "trained_weights.bin") {
+        Ok(()) => eprintln!("Weights saved to trained_weights.bin"),
+        Err(e) => eprintln!("Error saving weights: {}", e),
+    }
+
+    eprintln!("\nDone!");
+}
+
+fn print_usage(program: &str) {
+    eprintln!("Usage: {} [OPTIONS] <path>...", program);
+    eprintln!();
+    eprintln!("Train Othello evaluation weights from game files.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!(
+        "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
+    );
+    eprintln!("  -h, --help            Show this help message");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  One or more paths to:");
+    eprintln!("    - .wtb files (WTHOR binary format)");
+    eprintln!("    - .pgn / .txt files (PGN text format, PlayOK variant)");
+    eprintln!("    - directories (scanned recursively for game files)");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {} training_data/wthor/", program);
+    eprintln!("  {} --max-empties 20 game.txt training_data/", program);
+    eprintln!("  {} -n 30 ~/Downloads/lk16.txt", program);
 }

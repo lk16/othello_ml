@@ -1,10 +1,13 @@
 pub mod board;
-pub mod features;
-pub mod weights;
 pub mod edax;
-pub mod training;
+pub mod features;
 pub mod io;
+pub mod positions;
+pub mod training;
+pub mod weights;
 
 pub use board::Board;
 pub use features::Features;
+pub use positions::{extract_positions, load_games, Game, Position};
+pub use training::{Trainer, TrainingExample};
 pub use weights::Weights;
