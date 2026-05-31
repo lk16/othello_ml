@@ -1,5 +1,6 @@
 use crate::board::Board;
 use crate::weights::Weights;
+use std::time::Instant;
 
 /// Training data point: a board position paired with its ground truth evaluation.
 #[derive(Debug, Clone)]
@@ -29,14 +30,16 @@ impl Trainer {
         }
     }
 
-    /// Train weights on a batch of examples
-    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample]) {
+    /// Train weights on a batch of examples, returning the accumulated squared error.
+    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample]) -> f64 {
         let features = weights.features().clone();
+        let mut loss: f64 = 0.0;
 
         for example in examples {
             // Forward pass: compute prediction
             let predicted = weights.evaluate(&example.board, &features) as i32;
             let error = example.target_score - predicted;
+            loss += (error as f64) * (error as f64);
 
             // Backward pass: update each feature weight
             let feature_indices = features.extract(&example.board);
@@ -55,35 +58,80 @@ impl Trainer {
                 );
             }
         }
+        loss
     }
 
-    /// Train for multiple epochs
+    /// Train for multiple epochs with progress logging.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
         examples: &[TrainingExample],
         epochs: usize,
     ) {
+        use std::io::{self, Write};
+
+        let n_examples = examples.len();
+        let n_batches = (n_examples + self.batch_size - 1) / self.batch_size;
+        let total_updates = n_examples * weights.feature_count() * epochs;
+
+        eprintln!(
+            "Training: {} epochs × {} examples ({} batches/epoch, batch_size={})",
+            epochs, n_examples, n_batches, self.batch_size
+        );
+        eprintln!(
+            "  weight updates: {} examples × {} features × {} epochs ≈ {:.1}M total",
+            n_examples,
+            weights.feature_count(),
+            epochs,
+            total_updates as f64 / 1_000_000.0
+        );
+        eprintln!();
+
+        let total_start = Instant::now();
+
         for epoch in 0..epochs {
-            let mut loss = 0.0;
+            let epoch_start = Instant::now();
+            let mut loss: f64 = 0.0;
 
             // Process in mini-batches
-            for chunk in examples.chunks(self.batch_size) {
-                self.train_batch(weights, chunk);
+            for (batch_idx, chunk) in examples.chunks(self.batch_size).enumerate() {
+                loss += self.train_batch(weights, chunk);
 
-                // Compute loss for this batch
-                let features = weights.features();
-                for example in chunk {
-                    let predicted = weights.evaluate(&example.board, features) as i32;
-                    let error = example.target_score - predicted;
-                    loss += (error * error) as f32;
+                // Intra-epoch progress: show every 10% of batches
+                let progress_pct = (batch_idx + 1) * 100 / n_batches;
+                if progress_pct % 10 == 0 || batch_idx == n_batches - 1 {
+                    let elapsed = epoch_start.elapsed();
+                    let done = (batch_idx + 1) * self.batch_size;
+                    let throughput = done as f64 / elapsed.as_secs_f64().max(0.001);
+                    eprint!(
+                        "\r  [{:3}%] batch {}/{} ({:.0} ex/s)          ",
+                        progress_pct, batch_idx + 1, n_batches, throughput
+                    );
+                    let _ = io::stderr().flush();
                 }
             }
 
-            if epoch % 10 == 0 {
-                eprintln!("Epoch {}: loss = {}", epoch, loss / examples.len() as f32);
-            }
+            let epoch_elapsed = epoch_start.elapsed();
+            let total_elapsed = total_start.elapsed();
+            let avg_loss = loss / n_examples as f64;
+            let throughput = n_examples as f64 / epoch_elapsed.as_secs_f64().max(0.001);
+
+            // Estimate time remaining
+            let avg_epoch_secs = total_elapsed.as_secs_f64() / (epoch + 1) as f64;
+            let remaining_secs = avg_epoch_secs * (epochs - epoch - 1) as f64;
+
+            eprintln!(
+                "\rEpoch {}/{} | loss: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
+                epoch + 1, epochs, avg_loss, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
+            );
         }
+
+        let total_secs = total_start.elapsed().as_secs_f64();
+        eprintln!(
+            "Training complete: {:.1}s total ({:.1}M ex/s overall)",
+            total_secs,
+            (n_examples * epochs) as f64 / total_secs.max(0.001) / 1_000_000.0
+        );
     }
 }
 
