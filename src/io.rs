@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write, BufReader, BufWriter, Seek, SeekFrom};
+use std::io::{Read, Write, BufReader, BufWriter};
 use crate::weights::Weights;
 use crate::features::Features;
 
