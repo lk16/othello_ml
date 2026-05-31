@@ -7,11 +7,13 @@ use crate::features::Features;
 /// - Empty count range: which of the 30 disc-count tables (indices 0-29 for empties 2,4,6,...,60)
 /// - Pattern index: which pattern configuration within that feature (0 to 3^cells-1)
 ///
-/// Each weight is an i16 representing the evaluation contribution of that feature configuration.
+/// Weights are stored as f32 internally for precise SGD updates.
+/// They are rounded to i16 only at serialization time.
+///
 /// Position evaluation = sum of all feature weights for the current board state.
 pub struct Weights {
-    // Feature scores: [feature][empty_range][pattern] = score
-    feature_weights: Vec<Vec<Vec<i16>>>,
+    // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
+    feature_weights: Vec<Vec<Vec<f32>>>,
     empty_ranges: Vec<u32>, // 2, 4, 6, 8, ... 60
     features: Features,
 }
@@ -35,8 +37,8 @@ impl Weights {
             let mut feature_scores = Vec::with_capacity(n_empty_ranges);
 
             for _ in 0..n_empty_ranges {
-                // Initialize all weights to 0
-                feature_scores.push(vec![0i16; max_pattern]);
+                // Initialize all weights to 0.0
+                feature_scores.push(vec![0.0f32; max_pattern]);
             }
 
             feature_weights.push(feature_scores);
@@ -66,29 +68,28 @@ impl Weights {
     }
 
     /// Evaluate a board position by summing contributions from all features
-    pub fn evaluate(&self, board: &crate::board::Board, features: &Features) -> i16 {
+    pub fn evaluate(&self, board: &crate::board::Board, features: &Features) -> f32 {
         let empties = board.empties();
         let range_idx = self.empty_range_index(empties);
         let feature_indices = features.extract(board);
 
-        let mut score = 0i32;
+        let mut score = 0.0f32;
         for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
             if feat_idx < self.feature_weights.len() {
                 let pattern_idx = pattern_idx as usize;
                 if pattern_idx < self.feature_weights[feat_idx][range_idx].len() {
-                    score += self.feature_weights[feat_idx][range_idx][pattern_idx] as i32;
+                    score += self.feature_weights[feat_idx][range_idx][pattern_idx];
                 }
             }
         }
 
-        // Clamp to i16 range
-        score.max(i16::MIN as i32).min(i16::MAX as i32) as i16
+        score
     }
 
     /// Get weight for a specific feature, pattern, and empty range
-    pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> i16 {
+    pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> f32 {
         if feature_idx >= self.feature_weights.len() {
-            return 0;
+            return 0.0;
         }
 
         let range_idx = self.empty_range_index(empties);
@@ -97,12 +98,12 @@ impl Weights {
         if pattern_idx < self.feature_weights[feature_idx][range_idx].len() {
             self.feature_weights[feature_idx][range_idx][pattern_idx]
         } else {
-            0
+            0.0
         }
     }
 
     /// Set weight for a specific feature, pattern, and empty range
-    pub fn set_weight(&mut self, feature_idx: usize, pattern_idx: u32, empties: u32, weight: i16) {
+    pub fn set_weight(&mut self, feature_idx: usize, pattern_idx: u32, empties: u32, weight: f32) {
         if feature_idx >= self.feature_weights.len() {
             return;
         }
@@ -117,6 +118,7 @@ impl Weights {
 
     /// Update weight using SGD
     /// weight += learning_rate * gradient
+    /// Weights are clipped to [-MAX_WEIGHT, MAX_WEIGHT] to prevent explosion.
     pub fn update_weight_sgd(
         &mut self,
         feature_idx: usize,
@@ -125,11 +127,9 @@ impl Weights {
         learning_rate: f32,
         gradient: f32,
     ) {
+        const MAX_WEIGHT: f32 = 100.0;
         let current = self.get_weight(feature_idx, pattern_idx, empties);
-        let delta = (learning_rate * gradient) as i16;
-        let new_weight = (current as i32 + delta as i32)
-            .max(i16::MIN as i32)
-            .min(i16::MAX as i32) as i16;
+        let new_weight = (current + learning_rate * gradient).clamp(-MAX_WEIGHT, MAX_WEIGHT);
         self.set_weight(feature_idx, pattern_idx, empties, new_weight);
     }
 
@@ -148,13 +148,13 @@ impl Weights {
         self.empty_ranges.len()
     }
 
-    /// Get all weights (for serialization)
-    pub fn get_all_weights(&self) -> &Vec<Vec<Vec<i16>>> {
+    /// Get all weights as f32 (for serialization: round to i16 when writing)
+    pub fn get_all_weights(&self) -> &Vec<Vec<Vec<f32>>> {
         &self.feature_weights
     }
 
-    /// Set all weights (for deserialization)
-    pub fn set_all_weights(&mut self, weights: Vec<Vec<Vec<i16>>>) {
+    /// Set all weights from f32 (for deserialization)
+    pub fn set_all_weights(&mut self, weights: Vec<Vec<Vec<f32>>>) {
         self.feature_weights = weights;
     }
 }
@@ -187,8 +187,8 @@ mod tests {
         let features = Features::edax();
         let mut weights = Weights::new(features);
 
-        weights.set_weight(0, 0, 30, 42);
-        assert_eq!(weights.get_weight(0, 0, 30), 42);
+        weights.set_weight(0, 0, 30, 42.0);
+        assert!((weights.get_weight(0, 0, 30) - 42.0).abs() < 0.001);
     }
 
     #[test]
@@ -196,9 +196,10 @@ mod tests {
         let features = Features::edax();
         let mut weights = Weights::new(features);
 
-        weights.set_weight(0, 0, 30, 0);
-        weights.update_weight_sgd(0, 0, 30, 0.1, 100.0);
+        weights.set_weight(0, 0, 30, 0.0);
+        weights.update_weight_sgd(0, 0, 30, 0.01, 100.0);
         let w = weights.get_weight(0, 0, 30);
-        assert!(w > 0); // weight should increase
+        assert!(w > 0.0); // weight should increase
+        assert!((w - 1.0).abs() < 0.001); // 0.01 * 100 = 1.0 (was truncated to 0 as i16!)
     }
 }

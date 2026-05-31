@@ -37,24 +37,24 @@ impl Trainer {
 
         for example in examples {
             // Forward pass: compute prediction
-            let predicted = weights.evaluate(&example.board, &features) as i32;
-            let error = example.target_score - predicted;
+            let predicted = weights.evaluate(&example.board, &features);
+            let error = example.target_score as f32 - predicted;
             loss += (error as f64) * (error as f64);
 
             // Backward pass: update each feature weight
             let feature_indices = features.extract(&example.board);
             for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
-                // Simple SGD: gradient is the error
-                // We want to minimize (predicted - target)^2
-                // So dL/dw = 2 * (predicted - target) * 1 = 2 * error
-                let gradient = 2.0 * error as f32;
+                // MSE loss: L = (target - predicted)²
+                // dL/dw = dL/dp × dp/dw = -2×(target-predicted) × 1 = -2×error
+                // Gradient descent: w_new = w_old - lr × dL/dw = w_old + 2×lr×error
+                let gradient = 2.0 * error;
 
                 weights.update_weight_sgd(
                     feat_idx,
                     pattern_idx,
                     example.board.empties(),
                     self.learning_rate,
-                    -gradient, // Negative because we want to reduce error
+                    gradient, // w += lr × 2 × error → moves prediction toward target
                 );
             }
         }

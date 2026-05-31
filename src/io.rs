@@ -57,12 +57,13 @@ impl WeightIO {
             }
         }
 
-        // Write weight data
+        // Write weight data (f32 → i16 with rounding)
         let all_weights = weights.get_all_weights();
         for feature_weights in all_weights {
             for empty_range_weights in feature_weights {
                 for &weight in empty_range_weights {
-                    file.write_all(&weight.to_le_bytes())
+                    let clamped = weight.round().max(i16::MIN as f32).min(i16::MAX as f32) as i16;
+                    file.write_all(&clamped.to_le_bytes())
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -150,7 +151,7 @@ impl WeightIO {
                     let mut weight_bytes = [0u8; 2];
                     file.read_exact(&mut weight_bytes)
                         .map_err(|e| e.to_string())?;
-                    empty_range_weights.push(i16::from_le_bytes(weight_bytes));
+                    empty_range_weights.push(i16::from_le_bytes(weight_bytes) as f32);
                 }
                 feature_weights.push(empty_range_weights);
             }
@@ -173,8 +174,8 @@ mod tests {
         let mut weights = Weights::new(features);
         
         // Set some test weights
-        weights.set_weight(0, 0, 2, 42);
-        weights.set_weight(1, 5, 10, 99);
+        weights.set_weight(0, 0, 2, 42.0);
+        weights.set_weight(1, 5, 10, 99.0);
 
         let path = "/tmp/test_weights.bin";
 
@@ -189,8 +190,8 @@ mod tests {
         assert!(loaded.is_ok());
         
         let loaded_weights = loaded.unwrap();
-        assert_eq!(loaded_weights.get_weight(0, 0, 2), 42);
-        assert_eq!(loaded_weights.get_weight(1, 5, 10), 99);
+        assert!((loaded_weights.get_weight(0, 0, 2) - 42.0).abs() < 0.001);
+        assert!((loaded_weights.get_weight(1, 5, 10) - 99.0).abs() < 0.001);
 
         // Clean up
         let _ = fs::remove_file(path);

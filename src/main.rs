@@ -105,7 +105,7 @@ fn main() {
     let feature_indices = features.extract(&board);
     for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(10) {
         let w = weights.get_weight(feat_idx, pattern_idx, 60);
-        if w != 0 {
+        if w != 0.0 {
             eprintln!(
                 "  Feature {} pattern {}: weight = {}",
                 feat_idx, pattern_idx, w
