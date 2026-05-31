@@ -1,5 +1,6 @@
 .env
 .envrc
+.claude-user/
 
 /target
 training_data/
