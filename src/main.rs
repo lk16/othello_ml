@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -280,8 +282,18 @@ fn main() {
 
     // Train
     eprintln!("\n--- Training ---");
+    eprintln!("(press Ctrl+C to stop early and save weights)");
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || {
+            eprintln!("\nInterrupt received — finishing current epoch...");
+            interrupted.store(true, Ordering::Relaxed);
+        })
+        .expect("Failed to set Ctrl+C handler");
+    }
     let trainer = Trainer::new(0.01, 32);
-    trainer.train_epochs(&mut weights, &examples, epochs);
+    trainer.train_epochs(&mut weights, &examples, epochs, Some(&interrupted));
 
     // Show some learned weights for corner features
     eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");

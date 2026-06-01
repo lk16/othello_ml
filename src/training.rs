@@ -1,5 +1,6 @@
 use crate::board::Board;
 use crate::weights::Weights;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Training data point: a board position paired with its ground truth evaluation.
@@ -62,11 +63,16 @@ impl Trainer {
     }
 
     /// Train for multiple epochs with progress logging.
+    ///
+    /// If `interrupt` is provided, the loop checks the flag at the start of
+    /// each epoch and returns early when it is set, preserving weights from
+    /// the last fully completed epoch.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
         examples: &[TrainingExample],
         epochs: usize,
+        interrupt: Option<&AtomicBool>,
     ) {
         use std::io::{self, Write};
 
@@ -90,6 +96,16 @@ impl Trainer {
         let total_start = Instant::now();
 
         for epoch in 0..epochs {
+            if let Some(flag) = interrupt {
+                if flag.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "\nInterrupted after {} epochs — keeping weights from last completed epoch.",
+                        epoch
+                    );
+                    break;
+                }
+            }
+
             let epoch_start = Instant::now();
             let mut loss: f64 = 0.0;
 
