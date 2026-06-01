@@ -121,11 +121,19 @@ fn main() {
         w
     };
 
-    // Create training examples with ground truth evaluations.
-    // --eval-file acts as a cache: load if present, otherwise compute & save.
+    // Require Edax — all evaluations use it for ground truth.
+    if !edax_available() {
+        eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
+        std::process::exit(1);
+    }
+    let edax_path =
+        env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
+
+    // Create training examples.
+    // --eval-file acts as a cache: load if present, compute+append missing, create if not.
     let examples: Vec<TrainingExample> = if let Some(ref eval_path) = eval_file {
         if std::path::Path::new(eval_path).exists() {
-            // Cache hit — load pre-computed evaluations
+            // Cache hit — load, compute missing with Edax, append to file
             eprintln!("\n--- Loading evaluations from {} ---", eval_path);
             let eval_map = load_eval_file(eval_path).unwrap_or_else(|e| {
                 eprintln!("Error loading eval file: {}", e);
@@ -134,7 +142,7 @@ fn main() {
             eprintln!("Loaded {} evaluations", eval_map.len());
 
             let mut examples = Vec::with_capacity(positions.len());
-            let mut missing = 0u32;
+            let mut missing_positions: Vec<&othello_eval::Position> = Vec::new();
             for pos in &positions {
                 let fen = board_to_fen(&pos.board, pos.black_to_move);
                 match eval_map.get(&fen) {
@@ -145,154 +153,114 @@ fn main() {
                         });
                     }
                     None => {
-                        missing += 1;
-                        let disc_diff: i32 = if pos.black_to_move {
-                            pos.board.player.count_ones() as i32 - pos.board.opponent.count_ones() as i32
-                        } else {
-                            pos.board.opponent.count_ones() as i32 - pos.board.player.count_ones() as i32
-                        };
-                        examples.push(TrainingExample {
-                            board: pos.board,
-                            target_score: disc_diff,
-                        });
+                        missing_positions.push(pos);
                     }
                 }
             }
-            if missing > 0 {
+
+            if !missing_positions.is_empty() {
+                let n_missing = missing_positions.len();
                 eprintln!(
-                    "Warning: {} positions not found in eval file (used heuristic)",
-                    missing
+                    "Computing {} missing positions with Edax (level {})...",
+                    n_missing, edax_level
                 );
+                let missing_boards: Vec<Board> =
+                    missing_positions.iter().map(|p| p.board).collect();
+                let scores = EdaxInterface::batch_evaluate(
+                    &missing_boards,
+                    edax_level,
+                    &edax_path,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Edax evaluation failed: {}", e);
+                    std::process::exit(1);
+                });
+
+                append_eval_file(eval_path, &missing_positions, &scores)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error appending to eval file: {}", e);
+                        std::process::exit(1);
+                    });
+                eprintln!("Appended {} new evaluations to {}", n_missing, eval_path);
+
+                for (pos, &score) in missing_positions.iter().zip(scores.iter()) {
+                    examples.push(TrainingExample {
+                        board: pos.board,
+                        target_score: score,
+                    });
+                }
             }
             examples
-        } else if edax_available() {
-            // Cache miss — compute with Edax and save for next time
+        } else {
+            // Cache miss — compute everything and save
             eprintln!(
                 "\n--- Evaluating positions with Edax (level {}) → saving to {} ---",
                 edax_level, eval_path
             );
-            let edax_path =
-                env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
             let n = positions.len();
             eprintln!("Submitting {} positions to Edax...", n);
 
             let eval_start = std::time::Instant::now();
             let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
+            let scores =
+                EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path).unwrap_or_else(
+                    |e| {
+                        eprintln!("Edax evaluation failed: {}", e);
+                        std::process::exit(1);
+                    },
+                );
 
-            match EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path) {
-                Ok(scores) => {
-                    let elapsed = eval_start.elapsed();
-                    eprintln!(
-                        "  Done in {:.1}s ({:.0} pos/s)",
-                        elapsed.as_secs_f64(),
-                        n as f64 / elapsed.as_secs_f64().max(0.001)
-                    );
-
-                    let examples: Vec<TrainingExample> = positions
-                        .iter()
-                        .zip(scores.iter())
-                        .map(|(pos, &score)| TrainingExample {
-                            board: pos.board,
-                            target_score: score,
-                        })
-                        .collect();
-
-                    eprintln!("Saving evaluations to {} ...", eval_path);
-                    match save_eval_from_positions(eval_path, &positions, &examples) {
-                        Ok(()) => eprintln!("Saved {} evaluations", examples.len()),
-                        Err(e) => eprintln!("Error saving eval file: {}", e),
-                    }
-
-                    examples
-                }
-                Err(e) => {
-                    eprintln!("Edax batch evaluation failed: {}", e);
-                    eprintln!("Falling back to disc-difference heuristic.");
-                    positions
-                        .iter()
-                        .map(|pos| {
-                            let disc_diff: i32 = if pos.black_to_move {
-                                pos.board.player.count_ones() as i32 - pos.board.opponent.count_ones() as i32
-                            } else {
-                                pos.board.opponent.count_ones() as i32 - pos.board.player.count_ones() as i32
-                            };
-                            TrainingExample {
-                                board: pos.board,
-                                target_score: disc_diff,
-                            }
-                        })
-                        .collect()
-                }
-            }
-        } else {
+            let elapsed = eval_start.elapsed();
             eprintln!(
-                "Error: eval file '{}' not found and Edax is not available to generate it.",
-                eval_path
+                "  Done in {:.1}s ({:.0} pos/s)",
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64().max(0.001)
             );
-            eprintln!("Set EDAX_PATH to generate evaluations, or remove --eval-file to use the heuristic.");
-            std::process::exit(1);
+
+            let examples: Vec<TrainingExample> = positions
+                .iter()
+                .zip(scores.iter())
+                .map(|(pos, &score)| TrainingExample {
+                    board: pos.board,
+                    target_score: score,
+                })
+                .collect();
+
+            eprintln!("Saving evaluations to {} ...", eval_path);
+            save_eval_from_positions(eval_path, &positions, &examples).unwrap_or_else(|e| {
+                eprintln!("Error saving eval file: {}", e);
+                std::process::exit(1);
+            });
+            eprintln!("Saved {} evaluations", examples.len());
+            examples
         }
-    } else if edax_available() {
+    } else {
+        // No eval file — compute with Edax (no caching)
         eprintln!("\n--- Evaluating positions with Edax (level {}) ---", edax_level);
-        let edax_path =
-            env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
         let n = positions.len();
         eprintln!("Submitting {} positions to Edax...", n);
 
         let eval_start = std::time::Instant::now();
         let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
+        let scores =
+            EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path).unwrap_or_else(|e| {
+                eprintln!("Edax evaluation failed: {}", e);
+                std::process::exit(1);
+            });
 
-        match EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path) {
-            Ok(scores) => {
-                let elapsed = eval_start.elapsed();
-                eprintln!(
-                    "  Done in {:.1}s ({:.0} pos/s)",
-                    elapsed.as_secs_f64(),
-                    n as f64 / elapsed.as_secs_f64().max(0.001)
-                );
+        let elapsed = eval_start.elapsed();
+        eprintln!(
+            "  Done in {:.1}s ({:.0} pos/s)",
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64().max(0.001)
+        );
 
-                positions
-                    .iter()
-                    .zip(scores.iter())
-                    .map(|(pos, &score)| TrainingExample {
-                        board: pos.board,
-                        target_score: score,
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                eprintln!("Edax batch evaluation failed: {}", e);
-                eprintln!("Falling back to disc-difference heuristic.");
-                positions
-                    .iter()
-                    .map(|pos| {
-                        let disc_diff: i32 = if pos.black_to_move {
-                            pos.board.player.count_ones() as i32 - pos.board.opponent.count_ones() as i32
-                        } else {
-                            pos.board.opponent.count_ones() as i32 - pos.board.player.count_ones() as i32
-                        };
-                        TrainingExample {
-                            board: pos.board,
-                            target_score: disc_diff,
-                        }
-                    })
-                    .collect()
-            }
-        }
-    } else {
-        eprintln!("\n--- Using disc-difference heuristic (set EDAX_PATH to use Edax) ---");
         positions
             .iter()
-            .map(|pos| {
-                let disc_diff: i32 = if pos.black_to_move {
-                    pos.board.player.count_ones() as i32 - pos.board.opponent.count_ones() as i32
-                } else {
-                    pos.board.opponent.count_ones() as i32 - pos.board.player.count_ones() as i32
-                };
-                TrainingExample {
-                    board: pos.board,
-                    target_score: disc_diff,
-                }
+            .zip(scores.iter())
+            .map(|(pos, &score)| TrainingExample {
+                board: pos.board,
+                target_score: score,
             })
             .collect()
     };
@@ -343,6 +311,8 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Train Othello evaluation weights from game files.");
     eprintln!();
+    eprintln!("Requires Edax (set EDAX_PATH) for ground truth evaluations.");
+    eprintln!();
     eprintln!("OPTIONS:");
     eprintln!(
         "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
@@ -354,7 +324,7 @@ fn print_usage(program: &str) {
         "  -l, --level N         Edax search level, 0-60 even (default: 10)"
     );
     eprintln!(
-        "  -f, --eval-file PATH  Cache file for evaluations (load if exists, compute+save if not)"
+        "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
     );
     eprintln!(
         "  -w, --weights PATH    Weights output file (default: trained_weights.bin)"
@@ -372,14 +342,16 @@ fn print_usage(program: &str) {
     eprintln!("    - directories (scanned recursively for game files)");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  {} training_data/wthor/", program);
-    eprintln!("  {} --max-empties 20 --epochs 50 game.txt training_data/", program);
     eprintln!(
-        "  {} --eval-file evals.txt --epochs 30 training_data/",
+        "  EDAX_PATH=../edax {} training_data/",
         program
     );
     eprintln!(
-        "  EDAX_PATH=/path/to/edax {} --eval-file evals.txt training_data/",
+        "  EDAX_PATH=../edax {} --max-empties 20 --epochs 50 training_data/",
+        program
+    );
+    eprintln!(
+        "  EDAX_PATH=../edax {} --eval-file ignored/evals.txt --epochs 30 training_data/",
         program
     );
 }
@@ -426,6 +398,24 @@ fn load_eval_file(path: &str) -> Result<HashMap<String, i32>, String> {
     }
 
     Ok(map)
+}
+
+/// Append evaluations for a subset of positions to an existing eval file.
+fn append_eval_file(
+    path: &str,
+    positions: &[&othello_eval::Position],
+    scores: &[i32],
+) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("Failed to open {} for appending: {}", path, e))?;
+    for (pos, &score) in positions.iter().zip(scores.iter()) {
+        let fen = board_to_fen(&pos.board, pos.black_to_move);
+        writeln!(file, "{} {}", fen, score)
+            .map_err(|e| format!("Failed to write eval file: {}", e))?;
+    }
+    Ok(())
 }
 
 /// Save evaluations to a file from positions and examples.
