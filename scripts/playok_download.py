@@ -22,7 +22,7 @@ import requests
 BASE_URL = "https://www.playok.com/p/"
 CHUNK_SIZE = 1000
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(REPO_ROOT, "ignored")
+OUTPUT_DIR = os.path.join(REPO_ROOT, "training_data")
 REQUEST_TIMEOUT = 30  # seconds
 RETRY_DELAY = 2  # seconds between retries
 MAX_RETRIES = 3
