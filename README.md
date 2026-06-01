@@ -20,5 +20,5 @@ cargo run
 
 ## Documentation
 
-- [Implementation summary](docs/implementation-summary.md) — phases, architecture, file format, next steps
+- [Reference](docs/reference.md) — architecture, file formats, building & running
 - [Claude Code setup](docs/claude-code-setup.md) — project-isolated Claude Code with a custom backend
