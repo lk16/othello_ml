@@ -1,6 +1,7 @@
 use crate::board::Board;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::thread;
 
 /// Interface to the Edax engine for obtaining ground truth position evaluations.
 ///
@@ -42,6 +43,7 @@ impl EdaxInterface {
         positions: &[Board],
         level: u32,
         edax_path: &str,
+        edax_threads: usize,
     ) -> Result<Vec<i32>, String> {
         let n = positions.len();
         if n == 0 {
@@ -79,8 +81,53 @@ impl EdaxInterface {
 
         let edax_scores = if edax_boards.is_empty() {
             Vec::new()
-        } else {
+        } else if edax_threads <= 1 || edax_boards.len() < edax_threads * 2 {
             Self::run_edax_solve(&edax_boards, level, edax_path)?
+        } else {
+            // Split boards across threads, each with its own Edax processes
+            let chunk_size = (edax_boards.len() + edax_threads - 1) / edax_threads;
+            let edax_path = edax_path.to_string();
+            let mut handles = Vec::with_capacity(edax_threads);
+
+            for thread_idx in 0..edax_threads {
+                let start = thread_idx * chunk_size;
+                if start >= edax_boards.len() {
+                    break;
+                }
+                let end = usize::min(start + chunk_size, edax_boards.len());
+                let subset: Vec<Board> = edax_boards[start..end].to_vec();
+                let path = edax_path.clone();
+
+                handles.push((
+                    thread_idx,
+                    thread::spawn(move || {
+                        EdaxInterface::run_edax_solve(&subset, level, &path)
+                    }),
+                ));
+            }
+
+            eprintln!(
+                "  {} Edax threads processing {} positions ({} chunks/thread)",
+                handles.len(),
+                edax_boards.len(),
+                (chunk_size + EdaxInterface::CHUNK_SIZE - 1) / EdaxInterface::CHUNK_SIZE,
+            );
+
+            let n_threads = handles.len();
+            let mut results: Vec<Option<Vec<i32>>> = vec![None; n_threads];
+            for (idx, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(scores)) => results[idx] = Some(scores),
+                    Ok(Err(e)) => {
+                        return Err(format!("Edax thread {} failed: {}", idx, e));
+                    }
+                    Err(_) => {
+                        return Err(format!("Edax thread {} panicked", idx));
+                    }
+                }
+            }
+
+            results.into_iter().flatten().flatten().collect()
         };
 
         // Map scores back to the original order

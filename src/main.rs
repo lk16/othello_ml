@@ -17,6 +17,7 @@ fn main() {
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
     let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
+    let mut edax_threads: usize = 1; // default: single Edax process
     let mut paths: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -39,6 +40,11 @@ fn main() {
             i += 1;
             if i < args.len() {
                 edax_level = args[i].parse::<u32>().unwrap_or(10);
+            }
+        } else if args[i] == "--edax-threads" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                edax_threads = args[i].parse::<usize>().unwrap_or(1);
             }
         } else if args[i] == "--weights" || args[i] == "-w" {
             i += 1;
@@ -170,6 +176,7 @@ fn main() {
                     &missing_boards,
                     edax_level,
                     &edax_path,
+                    edax_threads,
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("Edax evaluation failed: {}", e);
@@ -203,7 +210,7 @@ fn main() {
             let eval_start = std::time::Instant::now();
             let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
             let scores =
-                EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path).unwrap_or_else(
+                EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads).unwrap_or_else(
                     |e| {
                         eprintln!("Edax evaluation failed: {}", e);
                         std::process::exit(1);
@@ -243,7 +250,7 @@ fn main() {
         let eval_start = std::time::Instant::now();
         let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
         let scores =
-            EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path).unwrap_or_else(|e| {
+            EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads).unwrap_or_else(|e| {
                 eprintln!("Edax evaluation failed: {}", e);
                 std::process::exit(1);
             });
@@ -322,6 +329,9 @@ fn print_usage(program: &str) {
     );
     eprintln!(
         "  -l, --level N         Edax search level, 0-60 even (default: 10)"
+    );
+    eprintln!(
+        "  -t, --edax-threads N  Parallel Edax processes (default: 1)"
     );
     eprintln!(
         "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
