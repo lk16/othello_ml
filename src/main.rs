@@ -91,16 +91,35 @@ fn main() {
         return;
     }
 
-    // Initialize features and weights
+    // Initialize features and weights (load from file if present)
     let features = Features::edax();
     eprintln!("Features: {}", features.count());
 
-    let mut weights = Weights::new(features.clone());
-    eprintln!(
-        "Weight table: {} features x {} empty ranges",
-        weights.feature_count(),
-        weights.empty_range_count()
-    );
+    let mut weights = if std::path::Path::new(&weights_file).exists() {
+        eprintln!("Loading weights from {} ...", weights_file);
+        match othello_eval::io::WeightIO::load(&weights_file) {
+            Ok(w) => {
+                eprintln!(
+                    "Loaded weights: {} features x {} empty ranges",
+                    w.feature_count(),
+                    w.empty_range_count()
+                );
+                w
+            }
+            Err(e) => {
+                eprintln!("Error loading weights (starting fresh): {}", e);
+                Weights::new(features.clone())
+            }
+        }
+    } else {
+        let w = Weights::new(features.clone());
+        eprintln!(
+            "Weight table: {} features x {} empty ranges",
+            w.feature_count(),
+            w.empty_range_count()
+        );
+        w
+    };
 
     // Create training examples with ground truth evaluations.
     // --eval-file acts as a cache: load if present, otherwise compute & save.
