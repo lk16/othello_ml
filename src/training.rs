@@ -95,12 +95,15 @@ impl Trainer {
 
         let total_start = Instant::now();
 
+        let mut completed: usize = 0;
+        let mut last_loss: f64 = 0.0;
+
         for epoch in 0..epochs {
             if let Some(flag) = interrupt {
                 if flag.load(Ordering::Relaxed) {
                     eprintln!(
                         "\nInterrupted after {} epochs — keeping weights from last completed epoch.",
-                        epoch
+                        completed
                     );
                     break;
                 }
@@ -140,13 +143,16 @@ impl Trainer {
                 "\rEpoch {}/{} | loss: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
                 epoch + 1, epochs, avg_loss, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
             );
+
+            last_loss = avg_loss;
+            completed = epoch + 1;
         }
 
         let total_secs = total_start.elapsed().as_secs_f64();
+        let overall_throughput = (n_examples * completed) as f64 / total_secs.max(0.001);
         eprintln!(
-            "Training complete: {:.1}s total ({:.1}M ex/s overall)",
-            total_secs,
-            (n_examples * epochs) as f64 / total_secs.max(0.001) / 1_000_000.0
+            "\rComplete        | loss: {:.4} | time: {:.1}s | {:.0} ex/s   ",
+            last_loss, total_secs, overall_throughput
         );
     }
 }
