@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Download Othello/Reversi PGN games from playok.com.
 
-URL pattern: https://www.playok.com/p/?g={prefix}{id}.txt
+URL pattern: https://www.playok.com/p/?g=rv{id}.txt
 IDs are sequential integers. Files are created in aligned 1000-game chunks
 with names like playok_pgn_75268000.pgn (start ID always divisible by 1000).
 
 Usage:
   python3 scripts/playok_download.py --start 75268000 --end 75269999
-  python3 scripts/playok_download.py --start 75268000 --end 75269999 --prefix rv
+  python3 scripts/playok_download.py --start 75268000 --end 75269999 --threads 8
 """
 
 import argparse
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 BASE_URL = "https://www.playok.com/p/"
-DEFAULT_PREFIX = "rv"
 CHUNK_SIZE = 1000
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(REPO_ROOT, "ignored")
@@ -26,27 +27,24 @@ REQUEST_TIMEOUT = 30  # seconds
 RETRY_DELAY = 2  # seconds between retries
 MAX_RETRIES = 3
 
+_progress_lock = threading.Lock()
 
-def download_game(session: requests.Session, game_id: int, prefix: str) -> str | None:
-    """Download a single game, returning its text or None on failure."""
-    url = f"{BASE_URL}?g={prefix}{game_id}.txt"
+
+def download_game(game_id: int) -> tuple[int, str | None]:
+    """Download a single game, returning (game_id, text_or_None)."""
+    url = f"{BASE_URL}?g=rv{game_id}.txt"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 text = resp.text.strip()
-                if text:
-                    return text
-                return None  # empty response, likely invalid ID
+                return (game_id, text if text else None)
             elif resp.status_code == 404:
-                return None  # game doesn't exist
-            else:
-                print(f"  HTTP {resp.status_code} for {prefix}{game_id} (attempt {attempt})")
-        except requests.RequestException as e:
-            print(f"  Request error for {prefix}{game_id}: {e} (attempt {attempt})")
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY)
-    return None
+                return (game_id, None)
+        except requests.RequestException:
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+    return (game_id, None)
 
 
 def ensure_output_dir() -> None:
@@ -69,12 +67,11 @@ def validate_alignment(start: int, end: int) -> None:
 
 
 def download_chunk(
-    session: requests.Session,
     chunk_start: int,
     chunk_end: int,
-    prefix: str,
+    threads: int,
 ) -> tuple[int, int]:
-    """Download all games in [chunk_start, chunk_end] to a single file.
+    """Download all games in [chunk_start, chunk_end] in parallel, write to file.
 
     Returns (downloaded, total).
     """
@@ -83,36 +80,48 @@ def download_chunk(
 
     if os.path.exists(filepath):
         print(f"  {filename} already exists, skipping")
-        total = chunk_end - chunk_start + 1
+        return 0, chunk_end - chunk_start + 1
+
+    total = chunk_end - chunk_start + 1
+    game_ids = list(range(chunk_start, chunk_end + 1))
+    print(f"  Downloading {total} games → {filename} ({threads} thread(s)) ...")
+
+    results: dict[int, str | None] = {}
+    downloaded = 0
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = {executor.submit(download_game, gid): gid for gid in game_ids}
+
+        for future in as_completed(futures):
+            gid, text = future.result()
+            results[gid] = text
+            if text:
+                downloaded += 1
+            done += 1
+
+            # Progress every 100 games (thread-safe)
+            if done % 100 == 0 or done == total:
+                pct = done * 100 // total
+                with _progress_lock:
+                    print(f"    [{pct:3d}%] {done}/{total} ({downloaded} found)")
+
+    if downloaded == 0:
+        print(f"    No games found in range, skipping {filename}")
         return 0, total
 
-    downloaded = 0
-    total = chunk_end - chunk_start + 1
-    print(f"  Downloading {total} games → {filename} ...")
-
+    # Write in order
     with open(filepath, "w") as f:
-        for game_id in range(chunk_start, chunk_end + 1):
-            text = download_game(session, game_id, prefix)
+        for gid in game_ids:
+            text = results.get(gid)
             if text:
                 f.write(text)
                 if not text.endswith("\n"):
                     f.write("\n")
-                # Ensure blank line between games (PGN convention)
                 if not text.endswith("\n\n"):
                     f.write("\n")
-                downloaded += 1
 
-            # Progress every 100 games
-            if (game_id - chunk_start + 1) % 100 == 0:
-                pct = (game_id - chunk_start + 1) * 100 // total
-                print(f"    [{pct:3d}%] {game_id - chunk_start + 1}/{total} ({downloaded} found)")
-
-    if downloaded == 0:
-        os.remove(filepath)
-        print(f"    No games found in range, removed {filename}")
-    else:
-        print(f"    Saved {downloaded}/{total} games to {filename}")
-
+    print(f"    Saved {downloaded}/{total} games to {filename}")
     return downloaded, total
 
 
@@ -129,35 +138,33 @@ def main() -> None:
         help="Last game ID to download (inclusive, e.g. 75269999)"
     )
     parser.add_argument(
-        "--prefix", type=str, default=DEFAULT_PREFIX,
-        help=f"Game ID prefix (default: {DEFAULT_PREFIX})"
+        "--threads", type=int, default=1,
+        help="Number of parallel download threads (default: 1)"
     )
     args = parser.parse_args()
 
     if args.start > args.end:
         print("Error: --start must be <= --end")
         sys.exit(1)
+    if args.threads < 1:
+        print("Error: --threads must be >= 1")
+        sys.exit(1)
 
     validate_alignment(args.start, args.end)
     ensure_output_dir()
 
     n_files = (args.end - args.start + 1) // CHUNK_SIZE
-    print(f"Range: {args.prefix}{args.start} → {args.prefix}{args.end}")
+    print(f"Range: rv{args.start} → rv{args.end}")
     print(f"Total IDs: {args.end - args.start + 1} across {n_files} file(s)")
     print(f"Output dir: {OUTPUT_DIR}")
     print()
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "playok-downloader/1.0 (othello training data collector)"
-    })
 
     total_downloaded = 0
     total_attempted = 0
 
     for chunk_start in range(args.start, args.end + 1, CHUNK_SIZE):
         chunk_end = chunk_start + CHUNK_SIZE - 1
-        downloaded, attempted = download_chunk(session, chunk_start, chunk_end, args.prefix)
+        downloaded, attempted = download_chunk(chunk_start, chunk_end, args.threads)
         total_downloaded += downloaded
         total_attempted += attempted
 
