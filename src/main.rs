@@ -13,6 +13,7 @@ fn main() {
     let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
     let mut epochs: usize = 10; // default: 10 training epochs
     let mut eval_file: Option<String> = None;
+    let mut weights_file: String = String::from("trained_weights.bin");
     let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
     let mut paths: Vec<String> = Vec::new();
     let mut i = 1;
@@ -36,6 +37,11 @@ fn main() {
             i += 1;
             if i < args.len() {
                 edax_level = args[i].parse::<u32>().unwrap_or(10);
+            }
+        } else if args[i] == "--weights" || args[i] == "-w" {
+            i += 1;
+            if i < args.len() {
+                weights_file = args[i].clone();
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
@@ -293,8 +299,8 @@ fn main() {
 
     // Save weights
     eprintln!("\n--- Saving weights ---");
-    match othello_eval::io::WeightIO::save(&weights, "trained_weights.bin") {
-        Ok(()) => eprintln!("Weights saved to trained_weights.bin"),
+    match othello_eval::io::WeightIO::save(&weights, &weights_file) {
+        Ok(()) => eprintln!("Weights saved to {}", weights_file),
         Err(e) => eprintln!("Error saving weights: {}", e),
     }
 
@@ -318,6 +324,9 @@ fn print_usage(program: &str) {
     );
     eprintln!(
         "  -f, --eval-file PATH  Cache file for evaluations (load if exists, compute+save if not)"
+    );
+    eprintln!(
+        "  -w, --weights PATH    Weights output file (default: trained_weights.bin)"
     );
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
