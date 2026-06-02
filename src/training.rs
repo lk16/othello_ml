@@ -12,14 +12,18 @@ pub struct TrainingExample {
 
 /// SGD (Stochastic Gradient Descent) trainer for optimizing Othello position weights.
 ///
+/// Uses inverse-time learning rate decay:
+///   effective_lr = learning_rate / (1.0 + lr_decay × epoch)
+///
 /// Training process:
 /// 1. Forward pass: evaluate board with current weights
 /// 2. Compute error: target_score - predicted_score
 /// 3. Backward pass: for each feature contributing to the prediction,
-///    update its weight: w = w - learning_rate * gradient
+///    update its weight: w = w - effective_lr × gradient
 /// 4. Repeat for multiple epochs over training data
 pub struct Trainer {
-    learning_rate: f32,  // Step size for weight updates
+    learning_rate: f32,  // Initial step size (before decay)
+    lr_decay: f32,       // Inverse-time decay factor (0 = no decay)
     batch_size: usize,   // Number of examples per training batch
 }
 
@@ -55,15 +59,21 @@ fn shuffle<T>(slice: &mut [T], rng: &mut XorShift32) {
 }
 
 impl Trainer {
-    pub fn new(learning_rate: f32, batch_size: usize) -> Self {
+    pub fn new(learning_rate: f32, batch_size: usize, lr_decay: f32) -> Self {
         Trainer {
             learning_rate,
+            lr_decay,
             batch_size,
         }
     }
 
+    /// Effective learning rate for a given epoch using inverse-time decay.
+    fn effective_lr(&self, epoch: usize) -> f32 {
+        self.learning_rate / (1.0 + self.lr_decay * epoch as f32)
+    }
+
     /// Train weights on a batch of examples, returning the accumulated squared error.
-    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample]) -> f64 {
+    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample], effective_lr: f32) -> f64 {
         let features = weights.features().clone();
         let n_features = features.count() as f32;
         let mut loss: f64 = 0.0;
@@ -92,7 +102,7 @@ impl Trainer {
                     feat_idx,
                     pattern_idx,
                     example.board.empties(),
-                    self.learning_rate,
+                    effective_lr,
                     gradient,
                 );
             }
@@ -130,6 +140,12 @@ impl Trainer {
             epochs,
             total_updates as f64 / 1_000_000.0
         );
+        eprintln!(
+            "  lr schedule: {:.4} → {:.4} (decay={})",
+            self.effective_lr(0),
+            self.effective_lr(epochs.saturating_sub(1)),
+            self.lr_decay
+        );
         eprintln!();
 
         let total_start = Instant::now();
@@ -153,12 +169,14 @@ impl Trainer {
             let mut rng = XorShift32::new(epoch as u32);
             shuffle(examples, &mut rng);
 
+            let current_lr = self.effective_lr(epoch);
+
             let epoch_start = Instant::now();
             let mut loss: f64 = 0.0;
 
             // Process in mini-batches
             for (batch_idx, chunk) in examples.chunks(self.batch_size).enumerate() {
-                loss += self.train_batch(weights, chunk);
+                loss += self.train_batch(weights, chunk, current_lr);
 
                 // Intra-epoch progress: show every 10% of batches
                 let progress_pct = (batch_idx + 1) * 100 / n_batches;
@@ -184,8 +202,8 @@ impl Trainer {
             let remaining_secs = avg_epoch_secs * (epochs - epoch - 1) as f64;
 
             eprintln!(
-                "\rEpoch {}/{} | loss: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
-                epoch + 1, epochs, avg_loss, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
+                "\rEpoch {}/{} | loss: {:.4} | lr: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
+                epoch + 1, epochs, avg_loss, current_lr, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
             );
 
             last_loss = avg_loss;
@@ -207,9 +225,29 @@ mod tests {
 
     #[test]
     fn test_trainer_creation() {
-        let trainer = Trainer::new(0.01, 32);
-        assert_eq!(trainer.learning_rate, 0.01);
+        let trainer = Trainer::new(0.1, 32, 0.01);
+        assert!((trainer.learning_rate - 0.1).abs() < 0.001);
         assert_eq!(trainer.batch_size, 32);
+        assert!((trainer.lr_decay - 0.01).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_lr_no_decay() {
+        let trainer = Trainer::new(0.1, 32, 0.0);
+        assert!((trainer.effective_lr(0) - 0.1).abs() < 0.001);
+        assert!((trainer.effective_lr(100) - 0.1).abs() < 0.001);
+        assert!((trainer.effective_lr(1000) - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_lr_with_decay() {
+        let trainer = Trainer::new(0.1, 32, 0.01);
+        // epoch 0: 0.1 / 1.0 = 0.1
+        assert!((trainer.effective_lr(0) - 0.1).abs() < 0.001);
+        // epoch 100: 0.1 / 2.0 = 0.05
+        assert!((trainer.effective_lr(100) - 0.05).abs() < 0.001);
+        // epoch 900: 0.1 / 10.0 = 0.01
+        assert!((trainer.effective_lr(900) - 0.01).abs() < 0.001);
     }
 
     #[test]

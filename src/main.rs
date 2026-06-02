@@ -14,6 +14,7 @@ fn main() {
 
     let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
     let mut epochs: usize = 10; // default: 10 training epochs
+    let mut lr_decay: f32 = 0.01; // default: inverse-time decay (0 = no decay)
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
     let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
@@ -50,6 +51,11 @@ fn main() {
             i += 1;
             if i < args.len() {
                 weights_file = args[i].clone();
+            }
+        } else if args[i] == "--lr-decay" || args[i] == "-d" {
+            i += 1;
+            if i < args.len() {
+                lr_decay = args[i].parse::<f32>().unwrap_or(0.01);
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
@@ -287,9 +293,9 @@ fn main() {
         .expect("Failed to set Ctrl+C handler");
     }
     // Learning rate = 0.1 with gradient normalization (gradient / N_features).
-    // Effective per-example prediction correction ≈ lr × 2 = 20%, which is
-    // aggressive enough for fast convergence without causing oscillation.
-    let trainer = Trainer::new(0.1, 32);
+    // Effective per-example prediction correction ≈ lr × 2 = 20%.
+    // Inverse-time decay: effective_lr = lr / (1 + decay × epoch).
+    let trainer = Trainer::new(0.1, 32, lr_decay);
     trainer.train_epochs(&mut weights, &mut examples, epochs, Some(&interrupted));
 
     // Show some learned weights for corner features
@@ -342,6 +348,9 @@ fn print_usage(program: &str) {
     eprintln!(
         "  -w, --weights PATH    Weights output file (default: trained_weights.bin)"
     );
+    eprintln!(
+        "  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)"
+    );
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
@@ -365,6 +374,10 @@ fn print_usage(program: &str) {
     );
     eprintln!(
         "  EDAX_PATH=../edax {} --eval-file ignored/evals.txt --epochs 30 training_data/",
+        program
+    );
+    eprintln!(
+        "  EDAX_PATH=../edax {} -e 1000 -d 0.001 -f evals.txt training_data/",
         program
     );
 }
