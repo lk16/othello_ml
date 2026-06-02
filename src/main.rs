@@ -15,6 +15,7 @@ fn main() {
     let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
     let mut epochs: usize = 10; // default: 10 training epochs
     let mut lr_decay: f32 = 0.01; // default: inverse-time decay (0 = no decay)
+    let mut resume_epoch: usize = 0; // default: start from epoch 0 for LR schedule
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
     let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
@@ -57,6 +58,11 @@ fn main() {
             if i < args.len() {
                 lr_decay = args[i].parse::<f32>().unwrap_or(0.01);
             }
+        } else if args[i] == "--resume-epoch" || args[i] == "-r" {
+            i += 1;
+            if i < args.len() {
+                resume_epoch = args[i].parse::<usize>().unwrap_or(0);
+            }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
             return;
@@ -75,6 +81,9 @@ fn main() {
     println!("=== Othello ML Training ===");
     println!("Max empties: {}", max_empties);
     println!("Epochs: {}", epochs);
+    if resume_epoch > 0 {
+        println!("Resume epoch: {} (LR schedule continues from here)", resume_epoch);
+    }
     if edax_available() || eval_file.is_some() {
         println!("Edax level: {}", edax_level);
     }
@@ -296,7 +305,7 @@ fn main() {
     // Effective per-example prediction correction ≈ lr × 2 = 20%.
     // Inverse-time decay: effective_lr = lr / (1 + decay × epoch).
     let trainer = Trainer::new(0.1, 32, lr_decay);
-    trainer.train_epochs(&mut weights, &mut examples, epochs, Some(&interrupted));
+    trainer.train_epochs(&mut weights, &mut examples, epochs, resume_epoch, Some(&interrupted));
 
     // Show some learned weights for corner features
     eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
@@ -351,6 +360,9 @@ fn print_usage(program: &str) {
     eprintln!(
         "  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)"
     );
+    eprintln!(
+        "  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)"
+    );
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
@@ -380,6 +392,11 @@ fn print_usage(program: &str) {
         "  EDAX_PATH=../edax {} -e 1000 -d 0.001 -f evals.txt training_data/",
         program
     );
+    eprintln!(
+        "  EDAX_PATH=../edax {} -e 500 -r 1000 -w trained_weights.bin training_data/",
+        program
+    );
+    eprintln!("    (resume from epoch 1000, LR schedule continues from there)");
 }
 
 // ─── Eval file load / save ──────────────────────────────────────────

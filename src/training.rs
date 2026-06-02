@@ -112,6 +112,10 @@ impl Trainer {
 
     /// Train for multiple epochs with progress logging.
     ///
+    /// `epoch_offset` is added to the epoch number for the LR decay schedule,
+    /// so that resuming from a checkpoint continues the decay where it left off.
+    /// Pass 0 for a fresh training run.
+    ///
     /// Examples are shuffled at the start of each epoch to avoid systematic
     /// ordering biases.  If `interrupt` is provided, the loop checks the flag
     /// at the start of each epoch and returns early when it is set, preserving
@@ -121,6 +125,7 @@ impl Trainer {
         weights: &mut Weights,
         examples: &mut [TrainingExample],
         epochs: usize,
+        epoch_offset: usize,
         interrupt: Option<&AtomicBool>,
     ) {
         use std::io::{self, Write};
@@ -141,9 +146,11 @@ impl Trainer {
             total_updates as f64 / 1_000_000.0
         );
         eprintln!(
-            "  lr schedule: {:.4} → {:.4} (decay={})",
-            self.effective_lr(0),
-            self.effective_lr(epochs.saturating_sub(1)),
+            "  lr schedule: {:.4} (epoch {}) → {:.4} (epoch {}) | decay={}",
+            self.effective_lr(epoch_offset),
+            epoch_offset,
+            self.effective_lr(epoch_offset + epochs.saturating_sub(1)),
+            epoch_offset + epochs.saturating_sub(1),
             self.lr_decay
         );
         eprintln!();
@@ -157,8 +164,8 @@ impl Trainer {
             if let Some(flag) = interrupt {
                 if flag.load(Ordering::Relaxed) {
                     eprintln!(
-                        "\nInterrupted after {} epochs — keeping weights from last completed epoch.",
-                        completed
+                        "\nInterrupted after {} epochs (global epoch {}) — keeping weights from last completed epoch.",
+                        completed, epoch_offset + completed
                     );
                     break;
                 }
@@ -166,10 +173,11 @@ impl Trainer {
 
             // Shuffle examples at the start of each epoch to break ordering
             // biases.  Use a deterministic seed per epoch so runs are reproducible.
-            let mut rng = XorShift32::new(epoch as u32);
+            let global_epoch = epoch_offset + epoch;
+            let mut rng = XorShift32::new(global_epoch as u32);
             shuffle(examples, &mut rng);
 
-            let current_lr = self.effective_lr(epoch);
+            let current_lr = self.effective_lr(global_epoch);
 
             let epoch_start = Instant::now();
             let mut loss: f64 = 0.0;
@@ -202,8 +210,8 @@ impl Trainer {
             let remaining_secs = avg_epoch_secs * (epochs - epoch - 1) as f64;
 
             eprintln!(
-                "\rEpoch {}/{} | loss: {:.4} | lr: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
-                epoch + 1, epochs, avg_loss, current_lr, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
+                "\rEpoch {}/{} (global {}) | loss: {:.4} | lr: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
+                epoch + 1, epochs, global_epoch + 1, avg_loss, current_lr, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
             );
 
             last_loss = avg_loss;
