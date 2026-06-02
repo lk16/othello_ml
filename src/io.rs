@@ -8,21 +8,22 @@ use crate::features::Features;
 /// File format:
 /// - Header (12 bytes):
 ///   - Magic number: 0xDEADBEEF (4 bytes) - file validation
-///   - Format version: 1 (4 bytes) - compatibility checking
+///   - Format version: 2 (4 bytes) - compatibility checking
 ///   - Number of features: N (4 bytes)
 /// - Feature metadata (variable):
 ///   - For each feature: name_length + name + cells_count + cell_indices
 /// - Weight data (variable):
 ///   - All weights in row-major order: [feature][empty_range][pattern]
+///   - Weights are stored as f32 (little-endian) for lossless precision.
 ///
 /// The single file contains everything needed to reconstruct weights from disk.
 const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 pub struct WeightIO;
 
 impl WeightIO {
-    /// Save weights to a file
+    /// Save weights to a file as f32 (lossless).
     pub fn save(weights: &Weights, path: &str) -> Result<(), String> {
         let mut file = BufWriter::new(
             File::create(path).map_err(|e| format!("Failed to create file: {}", e))?,
@@ -57,13 +58,12 @@ impl WeightIO {
             }
         }
 
-        // Write weight data (f32 → i16 with rounding)
+        // Write weight data as f32 (lossless, no rounding)
         let all_weights = weights.get_all_weights();
         for feature_weights in all_weights {
             for empty_range_weights in feature_weights {
                 for &weight in empty_range_weights {
-                    let clamped = weight.round().max(i16::MIN as f32).min(i16::MAX as f32) as i16;
-                    file.write_all(&clamped.to_le_bytes())
+                    file.write_all(&weight.to_le_bytes())
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -73,7 +73,11 @@ impl WeightIO {
         Ok(())
     }
 
-    /// Load weights from a file
+    /// Load weights from a file.
+    ///
+    /// Supports both format versions:
+    /// - Version 2: weights stored as f32 (4 bytes each)
+    /// - Version 1: weights stored as i16 (2 bytes each) — for backward compatibility
     pub fn load(path: &str) -> Result<Weights, String> {
         let mut file = BufReader::new(
             File::open(path).map_err(|e| format!("Failed to open file: {}", e))?,
@@ -90,7 +94,8 @@ impl WeightIO {
         }
 
         let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if version != FORMAT_VERSION {
+        let is_v1 = version == 1;
+        if version != FORMAT_VERSION && !is_v1 {
             return Err(format!("Unsupported format version: {}", version));
         }
 
@@ -148,10 +153,19 @@ impl WeightIO {
             for _ in 0..n_empty_ranges {
                 let mut empty_range_weights = Vec::new();
                 for _ in 0..max_pattern {
-                    let mut weight_bytes = [0u8; 2];
-                    file.read_exact(&mut weight_bytes)
-                        .map_err(|e| e.to_string())?;
-                    empty_range_weights.push(i16::from_le_bytes(weight_bytes) as f32);
+                    if is_v1 {
+                        // Version 1: i16 (2 bytes)
+                        let mut weight_bytes = [0u8; 2];
+                        file.read_exact(&mut weight_bytes)
+                            .map_err(|e| e.to_string())?;
+                        empty_range_weights.push(i16::from_le_bytes(weight_bytes) as f32);
+                    } else {
+                        // Version 2: f32 (4 bytes)
+                        let mut weight_bytes = [0u8; 4];
+                        file.read_exact(&mut weight_bytes)
+                            .map_err(|e| e.to_string())?;
+                        empty_range_weights.push(f32::from_le_bytes(weight_bytes));
+                    }
                 }
                 feature_weights.push(empty_range_weights);
             }
@@ -172,10 +186,10 @@ mod tests {
     fn test_save_and_load() {
         let features = Features::edax();
         let mut weights = Weights::new(features);
-        
-        // Set some test weights
-        weights.set_weight(0, 0, 2, 42.0);
-        weights.set_weight(1, 5, 10, 99.0);
+
+        // Set some test weights with fractional parts
+        weights.set_weight(0, 0, 2, 42.7);
+        weights.set_weight(1, 5, 10, 99.3);
 
         let path = "/tmp/test_weights.bin";
 
@@ -184,14 +198,15 @@ mod tests {
 
         // Verify file exists and has content
         assert!(fs::metadata(path).is_ok());
-        
+
         // Load
         let loaded = WeightIO::load(path);
         assert!(loaded.is_ok());
-        
+
         let loaded_weights = loaded.unwrap();
-        assert!((loaded_weights.get_weight(0, 0, 2) - 42.0).abs() < 0.001);
-        assert!((loaded_weights.get_weight(1, 5, 10) - 99.0).abs() < 0.001);
+        // Fractional parts should be preserved exactly with f32 storage
+        assert!((loaded_weights.get_weight(0, 0, 2) - 42.7).abs() < 0.001);
+        assert!((loaded_weights.get_weight(1, 5, 10) - 99.3).abs() < 0.001);
 
         // Clean up
         let _ = fs::remove_file(path);
