@@ -23,6 +23,37 @@ pub struct Trainer {
     batch_size: usize,   // Number of examples per training batch
 }
 
+/// Simple xorshift32 PRNG for deterministic shuffling (no external crates needed).
+struct XorShift32(u32);
+
+impl XorShift32 {
+    fn new(seed: u32) -> Self {
+        XorShift32(seed.wrapping_add(1)) // seed of 0 would break the generator
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    /// Random usize in [0, n)
+    fn gen_range(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+}
+
+/// Fisher-Yates shuffle using the given PRNG.
+fn shuffle<T>(slice: &mut [T], rng: &mut XorShift32) {
+    for i in (1..slice.len()).rev() {
+        let j = rng.gen_range(i + 1);
+        slice.swap(i, j);
+    }
+}
+
 impl Trainer {
     pub fn new(learning_rate: f32, batch_size: usize) -> Self {
         Trainer {
@@ -34,6 +65,7 @@ impl Trainer {
     /// Train weights on a batch of examples, returning the accumulated squared error.
     pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample]) -> f64 {
         let features = weights.features().clone();
+        let n_features = features.count() as f32;
         let mut loss: f64 = 0.0;
 
         for example in examples {
@@ -42,20 +74,26 @@ impl Trainer {
             let error = example.target_score as f32 - predicted;
             loss += (error as f64) * (error as f64);
 
-            // Backward pass: update each feature weight
+            // Backward pass: update each feature weight.
+            //
+            // Model: prediction = sum of N feature weights (all features active, coef = 1).
+            // MSE loss: L = (target - predicted)²
+            // dL/dw = dL/dp × dp/dw = -2×(target-predicted) × 1 = -2×error
+            //
+            // Without normalization, the effective prediction correction per example is
+            // N × lr × 2 × error, which with N=47 and lr=0.01 is 0.94×error — far too
+            // aggressive and causes oscillatory divergence.  Dividing by N keeps each
+            // weight's contribution sensible and prevents overshoot.
+            let gradient = 2.0 * error / n_features;
+
             let feature_indices = features.extract(&example.board);
             for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
-                // MSE loss: L = (target - predicted)²
-                // dL/dw = dL/dp × dp/dw = -2×(target-predicted) × 1 = -2×error
-                // Gradient descent: w_new = w_old - lr × dL/dw = w_old + 2×lr×error
-                let gradient = 2.0 * error;
-
                 weights.update_weight_sgd(
                     feat_idx,
                     pattern_idx,
                     example.board.empties(),
                     self.learning_rate,
-                    gradient, // w += lr × 2 × error → moves prediction toward target
+                    gradient,
                 );
             }
         }
@@ -64,13 +102,14 @@ impl Trainer {
 
     /// Train for multiple epochs with progress logging.
     ///
-    /// If `interrupt` is provided, the loop checks the flag at the start of
-    /// each epoch and returns early when it is set, preserving weights from
-    /// the last fully completed epoch.
+    /// Examples are shuffled at the start of each epoch to avoid systematic
+    /// ordering biases.  If `interrupt` is provided, the loop checks the flag
+    /// at the start of each epoch and returns early when it is set, preserving
+    /// weights from the last fully completed epoch.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
-        examples: &[TrainingExample],
+        examples: &mut [TrainingExample],
         epochs: usize,
         interrupt: Option<&AtomicBool>,
     ) {
@@ -108,6 +147,11 @@ impl Trainer {
                     break;
                 }
             }
+
+            // Shuffle examples at the start of each epoch to break ordering
+            // biases.  Use a deterministic seed per epoch so runs are reproducible.
+            let mut rng = XorShift32::new(epoch as u32);
+            shuffle(examples, &mut rng);
 
             let epoch_start = Instant::now();
             let mut loss: f64 = 0.0;

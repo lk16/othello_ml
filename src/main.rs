@@ -137,7 +137,7 @@ fn main() {
 
     // Create training examples.
     // --eval-file acts as a cache: load if present, compute+append missing, create if not.
-    let examples: Vec<TrainingExample> = if let Some(ref eval_path) = eval_file {
+    let mut examples: Vec<TrainingExample> = if let Some(ref eval_path) = eval_file {
         if std::path::Path::new(eval_path).exists() {
             // Cache hit — load, compute missing with Edax, append to file
             eprintln!("\n--- Loading evaluations from {} ---", eval_path);
@@ -286,8 +286,11 @@ fn main() {
         })
         .expect("Failed to set Ctrl+C handler");
     }
-    let trainer = Trainer::new(0.01, 32);
-    trainer.train_epochs(&mut weights, &examples, epochs, Some(&interrupted));
+    // Learning rate = 0.1 with gradient normalization (gradient / N_features).
+    // Effective per-example prediction correction ≈ lr × 2 = 20%, which is
+    // aggressive enough for fast convergence without causing oscillation.
+    let trainer = Trainer::new(0.1, 32);
+    trainer.train_epochs(&mut weights, &mut examples, epochs, Some(&interrupted));
 
     // Show some learned weights for corner features
     eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
