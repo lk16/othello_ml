@@ -227,3 +227,47 @@ impl EvalCache {
         examples
     }
 }
+
+/// Build training examples from positions, either via an eval-file cache or
+/// by evaluating all positions with Edax directly.
+///
+/// When `eval_file` is `Some`, positions are looked up in the cache (computing
+/// and appending any missing ones). When `None`, all positions are evaluated
+/// in one batch with no caching.
+pub fn build_examples(
+    eval_file: &Option<String>,
+    positions: &[Board],
+    edax_level: u32,
+    edax_path: &str,
+    edax_threads: usize,
+) -> Vec<TrainingExample> {
+    if let Some(ref path) = eval_file {
+        let cache = EvalCache::new(path.clone());
+        cache.build_examples(positions, edax_level, edax_path, edax_threads)
+    } else {
+        eprintln!("\n--- Evaluating positions with Edax (level {edax_level}) ---");
+        let n = positions.len();
+        eprintln!("Submitting {n} positions to Edax...");
+        let eval_start = std::time::Instant::now();
+        let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
+        let scores = EdaxInterface::batch_evaluate(&boards, edax_level, edax_path, edax_threads)
+            .unwrap_or_else(|e| {
+                eprintln!("Edax evaluation failed: {e}");
+                std::process::exit(1);
+            });
+        let elapsed = eval_start.elapsed();
+        eprintln!(
+            "  Done in {:.1}s ({:.0} pos/s)",
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64().max(0.001)
+        );
+        positions
+            .iter()
+            .zip(scores.iter())
+            .map(|(pos, &score)| TrainingExample {
+                position: pos.position,
+                target_score: score,
+            })
+            .collect()
+    }
+}

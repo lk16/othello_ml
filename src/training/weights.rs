@@ -141,6 +141,51 @@ impl Weights {
         self.empty_ranges.len()
     }
 
+    /// Load weights from `path` or create a fresh table if the file doesn't exist
+    /// or fails to load. Logs progress to stderr.
+    pub fn load_or_create(path: &str, features: &Features) -> Self {
+        if std::path::Path::new(path).exists() {
+            eprintln!("Loading weights from {path} ...");
+            match Weights::load(path) {
+                Ok(w) => {
+                    eprintln!(
+                        "Loaded weights: {} features x {} empty ranges",
+                        w.feature_count(),
+                        w.empty_range_count()
+                    );
+                    w
+                }
+                Err(e) => {
+                    eprintln!("Error loading weights (starting fresh): {e}");
+                    Weights::new(features.clone())
+                }
+            }
+        } else {
+            let w = Weights::new(features.clone());
+            eprintln!(
+                "Weight table: {} features x {} empty ranges",
+                w.feature_count(),
+                w.empty_range_count()
+            );
+            w
+        }
+    }
+
+    /// Print a sample of learned weights to stderr for diagnostics.
+    pub fn print_sample(&self, features: &Features, n: usize) {
+        use crate::othello::position::Position;
+
+        eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
+        let board = Position::initial();
+        let feature_indices = features.extract(&board);
+        for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(n) {
+            let w = self.get_weight(feat_idx, pattern_idx, 60);
+            if w != 0.0 {
+                eprintln!("  Feature {feat_idx} pattern {pattern_idx}: weight = {w}");
+            }
+        }
+    }
+
     /// Get all weights as f32.
     pub fn get_all_weights(&self) -> &Vec<Vec<Vec<f32>>> {
         &self.feature_weights

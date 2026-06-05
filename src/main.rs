@@ -1,22 +1,35 @@
 use othello_eval::{
-    edax_available, extract_positions, load_games, EdaxInterface, EvalCache, Features, Position,
-    Trainer, TrainingConfig, TrainingExample, Weights,
+    build_examples, edax_available, extract_positions, load_games, Features, Trainer,
+    TrainingConfig, Weights,
 };
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-fn main() {
+/// Parsed command-line arguments.
+struct CliArgs {
+    max_empties: u32,
+    epochs: usize,
+    lr_decay: f32,
+    resume_epoch: usize,
+    eval_file: Option<String>,
+    weights_file: String,
+    edax_level: u32,
+    edax_threads: usize,
+    paths: Vec<String>,
+}
+
+fn parse_args() -> CliArgs {
     let args: Vec<String> = env::args().collect();
 
-    let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
-    let mut epochs: usize = 10; // default: 10 training epochs
-    let mut lr_decay: f32 = 0.01; // default: inverse-time decay (0 = no decay)
-    let mut resume_epoch: usize = 0; // default: start from epoch 0 for LR schedule
+    let mut max_empties: u32 = 60;
+    let mut epochs: usize = 10;
+    let mut lr_decay: f32 = 0.01;
+    let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
-    let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
-    let mut edax_threads: usize = 1; // default: single Edax process
+    let mut edax_level: u32 = 10;
+    let mut edax_threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -62,33 +75,52 @@ fn main() {
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
-            return;
+            std::process::exit(0);
         } else {
             paths.push(args[i].clone());
         }
         i += 1;
     }
 
-    if paths.is_empty() {
+    CliArgs {
+        max_empties,
+        epochs,
+        lr_decay,
+        resume_epoch,
+        eval_file,
+        weights_file,
+        edax_level,
+        edax_threads,
+        paths,
+    }
+}
+
+fn main() {
+    let args = parse_args();
+
+    if args.paths.is_empty() {
         eprintln!("Error: No input files or directories specified.\n");
-        print_usage(&args[0]);
+        print_usage(&env::args().collect::<Vec<_>>()[0]);
         return;
     }
 
-    println!("=== Othello ML Training ===");
-    println!("Max empties: {max_empties}");
-    println!("Epochs: {epochs}");
-    if resume_epoch > 0 {
-        println!("Resume epoch: {resume_epoch} (LR schedule continues from here)");
+    eprintln!("=== Othello ML Training ===");
+    eprintln!("Max empties: {}", args.max_empties);
+    eprintln!("Epochs: {}", args.epochs);
+    if args.resume_epoch > 0 {
+        eprintln!(
+            "Resume epoch: {} (LR schedule continues from here)",
+            args.resume_epoch
+        );
     }
-    if edax_available() || eval_file.is_some() {
-        println!("Edax level: {edax_level}");
+    if edax_available() || args.eval_file.is_some() {
+        eprintln!("Edax level: {}", args.edax_level);
     }
-    println!("Input paths: {paths:?}");
+    eprintln!("Input paths: {:?}", args.paths);
 
-    // Load games from all specified paths
+    // Load games
     eprintln!("\n--- Loading games ---");
-    let games = match load_games(&paths) {
+    let games = match load_games(&args.paths) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Error loading games: {e}");
@@ -96,9 +128,12 @@ fn main() {
         }
     };
 
-    // Extract positions with empties <= max_empties
-    eprintln!("\n--- Extracting positions (empties <= {max_empties}) ---");
-    let positions = extract_positions(&games, max_empties);
+    // Extract positions
+    eprintln!(
+        "\n--- Extracting positions (empties <= {}) ---",
+        args.max_empties
+    );
+    let positions = extract_positions(&games, args.max_empties);
     eprintln!("Extracted {} positions", positions.len());
 
     if positions.is_empty() {
@@ -106,37 +141,13 @@ fn main() {
         return;
     }
 
-    // Initialize features and weights (load from file if present)
+    // Initialize features and weights
     let features = Features::edax();
     eprintln!("Features: {}", features.count());
 
-    let mut weights = if std::path::Path::new(&weights_file).exists() {
-        eprintln!("Loading weights from {weights_file} ...");
-        match othello_eval::Weights::load(&weights_file) {
-            Ok(w) => {
-                eprintln!(
-                    "Loaded weights: {} features x {} empty ranges",
-                    w.feature_count(),
-                    w.empty_range_count()
-                );
-                w
-            }
-            Err(e) => {
-                eprintln!("Error loading weights (starting fresh): {e}");
-                Weights::new(features.clone())
-            }
-        }
-    } else {
-        let w = Weights::new(features.clone());
-        eprintln!(
-            "Weight table: {} features x {} empty ranges",
-            w.feature_count(),
-            w.empty_range_count()
-        );
-        w
-    };
+    let mut weights = Weights::load_or_create(&args.weights_file, &features);
 
-    // Require Edax — all evaluations use it for ground truth.
+    // Require Edax for ground truth
     if !edax_available() {
         eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
         std::process::exit(1);
@@ -144,36 +155,13 @@ fn main() {
     let edax_path =
         env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
 
-    let mut examples = if let Some(ref path) = eval_file {
-        let cache = EvalCache::new(path.clone());
-        cache.build_examples(&positions, edax_level, &edax_path, edax_threads)
-    } else {
-        eprintln!("\n--- Evaluating positions with Edax (level {edax_level}) ---");
-        let n = positions.len();
-        eprintln!("Submitting {n} positions to Edax...");
-        let eval_start = std::time::Instant::now();
-        let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads)
-            .unwrap_or_else(|e| {
-                eprintln!("Edax evaluation failed: {e}");
-                std::process::exit(1);
-            });
-        let elapsed = eval_start.elapsed();
-        eprintln!(
-            "  Done in {:.1}s ({:.0} pos/s)",
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64().max(0.001)
-        );
-        positions
-            .iter()
-            .zip(scores.iter())
-            .map(|(pos, &score)| TrainingExample {
-                position: pos.position,
-                target_score: score,
-            })
-            .collect()
-    };
-
+    let mut examples = build_examples(
+        &args.eval_file,
+        &positions,
+        args.edax_level,
+        &edax_path,
+        args.edax_threads,
+    );
     eprintln!("Training examples: {}", examples.len());
 
     // Train
@@ -188,32 +176,21 @@ fn main() {
         })
         .expect("Failed to set Ctrl+C handler");
     }
-    // Learning rate = 0.1 with gradient normalization (gradient / N_features).
-    // Effective per-example prediction correction ≈ lr × 2 = 20%.
-    // Inverse-time decay: effective_lr = lr / (1 + decay × epoch).
-    let trainer = Trainer::new(0.1, 32, lr_decay);
+
+    let trainer = Trainer::new(0.1, 32, args.lr_decay);
     let train_config = TrainingConfig {
-        epochs,
-        epoch_offset: resume_epoch,
+        epochs: args.epochs,
+        epoch_offset: args.resume_epoch,
         interrupt: Some(interrupted),
     };
     trainer.train_epochs(&mut weights, &mut examples, &train_config);
 
-    // Show some learned weights for corner features
-    eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
-    let board = Position::initial();
-    let feature_indices = features.extract(&board);
-    for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(10) {
-        let w = weights.get_weight(feat_idx, pattern_idx, 60);
-        if w != 0.0 {
-            eprintln!("  Feature {feat_idx} pattern {pattern_idx}: weight = {w}");
-        }
-    }
+    // Show sample weights and save
+    weights.print_sample(&features, 10);
 
-    // Save weights
     eprintln!("\n--- Saving weights ---");
-    match weights.save(&weights_file) {
-        Ok(()) => eprintln!("Weights saved to {weights_file}"),
+    match weights.save(&args.weights_file) {
+        Ok(()) => eprintln!("Weights saved to {}", args.weights_file),
         Err(e) => eprintln!("Error saving weights: {e}"),
     }
 
