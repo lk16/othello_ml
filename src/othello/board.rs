@@ -1,6 +1,5 @@
 // Board type for Othello board positions extracted from games.
 
-use crate::othello::game::Game;
 use crate::othello::position::Position;
 
 /// A single board position extracted from a game, with side-to-move information.
@@ -16,22 +15,6 @@ impl Board {
     pub fn empties(&self) -> u32 {
         self.position.empties()
     }
-}
-
-/// Extract all positions from loaded games, filtered to those with empties <= max_empties.
-pub fn extract_positions(games: &[Game], max_empties: u32) -> Vec<Board> {
-    let mut positions = Vec::new();
-
-    for game in games {
-        for pos in &game.positions {
-            let empties = pos.empties();
-            if empties <= max_empties {
-                positions.push(pos.clone());
-            }
-        }
-    }
-
-    positions
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
 use othello_eval::{
-    build_examples, edax_available, extract_positions, load_games, Features, Trainer,
-    TrainingConfig, Weights,
+    build_examples, edax_available, load_games, Features, Trainer, TrainingConfig, Weights,
 };
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,7 +132,12 @@ fn main() {
         "\n--- Extracting positions (empties <= {}) ---",
         args.max_empties
     );
-    let positions = extract_positions(&games, args.max_empties);
+    let positions: Vec<othello_eval::Board> = games
+        .iter()
+        .flat_map(|game| game.positions.iter())
+        .filter(|pos| pos.empties() <= args.max_empties)
+        .cloned()
+        .collect();
     eprintln!("Extracted {} positions", positions.len());
 
     if positions.is_empty() {
