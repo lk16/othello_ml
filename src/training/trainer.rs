@@ -1,12 +1,13 @@
-use crate::board::Board;
-use crate::weights::Weights;
+use crate::othello::position::Position;
+use crate::training::weights::Weights;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Training data point: a board position paired with its ground truth evaluation.
 #[derive(Debug, Clone)]
 pub struct TrainingExample {
-    pub board: Board,
+    pub position: Position,
     pub target_score: i32, // Ground truth score from Edax
 }
 
@@ -22,9 +23,9 @@ pub struct TrainingExample {
 ///    update its weight: w = w - effective_lr × gradient
 /// 4. Repeat for multiple epochs over training data
 pub struct Trainer {
-    learning_rate: f32,  // Initial step size (before decay)
-    lr_decay: f32,       // Inverse-time decay factor (0 = no decay)
-    batch_size: usize,   // Number of examples per training batch
+    learning_rate: f32, // Initial step size (before decay)
+    lr_decay: f32,      // Inverse-time decay factor (0 = no decay)
+    batch_size: usize,  // Number of examples per training batch
 }
 
 /// Simple xorshift32 PRNG for deterministic shuffling (no external crates needed).
@@ -58,6 +59,16 @@ fn shuffle<T>(slice: &mut [T], rng: &mut XorShift32) {
     }
 }
 
+/// Configuration for a training run.
+pub struct TrainingConfig {
+    /// Number of epochs to train.
+    pub epochs: usize,
+    /// Offset added to epoch number for LR decay schedule (0 for fresh start).
+    pub epoch_offset: usize,
+    /// Optional interrupt flag for graceful early stopping.
+    pub interrupt: Option<Arc<AtomicBool>>,
+}
+
 impl Trainer {
     pub fn new(learning_rate: f32, batch_size: usize, lr_decay: f32) -> Self {
         Trainer {
@@ -73,14 +84,19 @@ impl Trainer {
     }
 
     /// Train weights on a batch of examples, returning the accumulated squared error.
-    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample], effective_lr: f32) -> f64 {
+    pub fn train_batch(
+        &self,
+        weights: &mut Weights,
+        examples: &[TrainingExample],
+        effective_lr: f32,
+    ) -> f64 {
         let features = weights.features().clone();
         let n_features = features.count() as f32;
         let mut loss: f64 = 0.0;
 
         for example in examples {
             // Forward pass: compute prediction
-            let predicted = weights.evaluate(&example.board, &features);
+            let predicted = weights.evaluate(&example.position, &features);
             let error = example.target_score as f32 - predicted;
             loss += (error as f64) * (error as f64);
 
@@ -96,12 +112,12 @@ impl Trainer {
             // weight's contribution sensible and prevents overshoot.
             let gradient = 2.0 * error / n_features;
 
-            let feature_indices = features.extract(&example.board);
+            let feature_indices = features.extract(&example.position);
             for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
                 weights.update_weight_sgd(
                     feat_idx,
                     pattern_idx,
-                    example.board.empties(),
+                    example.position.empties(),
                     effective_lr,
                     gradient,
                 );
@@ -112,26 +128,20 @@ impl Trainer {
 
     /// Train for multiple epochs with progress logging.
     ///
-    /// `epoch_offset` is added to the epoch number for the LR decay schedule,
-    /// so that resuming from a checkpoint continues the decay where it left off.
-    /// Pass 0 for a fresh training run.
-    ///
-    /// Examples are shuffled at the start of each epoch to avoid systematic
-    /// ordering biases.  If `interrupt` is provided, the loop checks the flag
-    /// at the start of each epoch and returns early when it is set, preserving
-    /// weights from the last fully completed epoch.
+    /// Uses [`TrainingConfig`] to control epochs, LR schedule offset, and
+    /// optional early stopping via an interrupt flag.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
         examples: &mut [TrainingExample],
-        epochs: usize,
-        epoch_offset: usize,
-        interrupt: Option<&AtomicBool>,
+        config: &TrainingConfig,
     ) {
         use std::io::{self, Write};
 
+        let epochs = config.epochs;
+        let epoch_offset = config.epoch_offset;
         let n_examples = examples.len();
-        let n_batches = (n_examples + self.batch_size - 1) / self.batch_size;
+        let n_batches = n_examples.div_ceil(self.batch_size);
         let total_updates = n_examples * weights.feature_count() * epochs;
 
         eprintln!(
@@ -161,7 +171,7 @@ impl Trainer {
         let mut last_loss: f64 = 0.0;
 
         for epoch in 0..epochs {
-            if let Some(flag) = interrupt {
+            if let Some(ref flag) = config.interrupt {
                 if flag.load(Ordering::Relaxed) {
                     eprintln!(
                         "\nInterrupted after {} epochs (global epoch {}) — keeping weights from last completed epoch.",
@@ -194,7 +204,10 @@ impl Trainer {
                     let throughput = done as f64 / elapsed.as_secs_f64().max(0.001);
                     eprint!(
                         "\r  [{:3}%] batch {}/{} ({:.0} ex/s)          ",
-                        progress_pct, batch_idx + 1, n_batches, throughput
+                        progress_pct,
+                        batch_idx + 1,
+                        n_batches,
+                        throughput
                     );
                     let _ = io::stderr().flush();
                 }
@@ -221,8 +234,7 @@ impl Trainer {
         let total_secs = total_start.elapsed().as_secs_f64();
         let overall_throughput = (n_examples * completed) as f64 / total_secs.max(0.001);
         eprintln!(
-            "\rComplete        | loss: {:.4} | time: {:.1}s | {:.0} ex/s   ",
-            last_loss, total_secs, overall_throughput
+            "\rComplete        | loss: {last_loss:.4} | time: {total_secs:.1}s | {overall_throughput:.0} ex/s   "
         );
     }
 }
@@ -260,9 +272,9 @@ mod tests {
 
     #[test]
     fn test_training_example() {
-        let board = Board::initial();
+        let position = Position::initial();
         let example = TrainingExample {
-            board,
+            position,
             target_score: 10,
         };
         assert_eq!(example.target_score, 10);

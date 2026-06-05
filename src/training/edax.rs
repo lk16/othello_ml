@@ -1,6 +1,7 @@
-use crate::board::Board;
+use crate::othello::position::Position;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 /// Interface to the Edax engine for obtaining ground truth position evaluations.
@@ -21,9 +22,28 @@ use std::thread;
 /// and `-` for empty cells. The side to move is always normalized to `X`.
 /// This means evaluations are always from the side-to-move perspective,
 /// matching the training target convention.
-pub struct EdaxInterface;
+pub struct EdaxInterface {
+    pub path: String,
+    pub level: u32,
+    pub threads: usize,
+}
+
+/// Progress update sent from an Edax solver thread to the parent.
+struct Progress {
+    thread_id: usize,
+    done: usize,
+}
 
 impl EdaxInterface {
+    /// Create a new Edax interface.
+    pub fn new(path: String, level: u32, threads: usize) -> Self {
+        EdaxInterface {
+            path,
+            level,
+            threads,
+        }
+    }
+
     /// Evaluate a batch of positions.
     ///
     /// Each board's `player` bitboard is the side to move.
@@ -34,17 +54,11 @@ impl EdaxInterface {
     ///      evaluate the passed position, negate the result
     ///   3. **Normal** → send to Edax as-is
     ///
-    /// `edax_path` is the path to the Edax binary.
     /// `level` is the search level (0–60, must be even).
     ///
     /// Returns a `Vec<i32>` of scores, one per position, in the same order.
     /// Scores are from the side-to-move perspective.
-    pub fn batch_evaluate(
-        positions: &[Board],
-        level: u32,
-        edax_path: &str,
-        edax_threads: usize,
-    ) -> Result<Vec<i32>, String> {
+    pub fn batch_evaluate(&self, positions: &[Position]) -> Result<Vec<i32>, String> {
         let n = positions.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -52,9 +66,9 @@ impl EdaxInterface {
 
         // Classify each position: game-end, pass, or normal
         enum Action {
-            Normal(Board),
-            Pass(Board),    // passed board (swapped sides)
-            GameEnd(i32),   // exact final score
+            Normal(Position),
+            Pass(Position),
+            GameEnd(i32),
         }
 
         let actions: Vec<Action> = positions
@@ -71,7 +85,7 @@ impl EdaxInterface {
             .collect();
 
         // Collect only the positions that need Edax evaluation
-        let edax_boards: Vec<Board> = actions
+        let edax_boards: Vec<Position> = actions
             .iter()
             .filter_map(|a| match a {
                 Action::Normal(b) | Action::Pass(b) => Some(*b),
@@ -81,67 +95,98 @@ impl EdaxInterface {
 
         let edax_scores = if edax_boards.is_empty() {
             Vec::new()
-        } else if edax_threads <= 1 || edax_boards.len() < edax_threads * 2 {
-            Self::run_edax_solve(&edax_boards, level, edax_path)?
         } else {
-            // Split boards across threads, each with its own Edax processes
-            let chunk_size = (edax_boards.len() + edax_threads - 1) / edax_threads;
-            let edax_path = edax_path.to_string();
-            let mut handles = Vec::with_capacity(edax_threads);
-
-            for thread_idx in 0..edax_threads {
-                let start = thread_idx * chunk_size;
-                if start >= edax_boards.len() {
-                    break;
-                }
-                let end = usize::min(start + chunk_size, edax_boards.len());
-                let subset: Vec<Board> = edax_boards[start..end].to_vec();
-                let path = edax_path.clone();
-
-                handles.push((
-                    thread_idx,
-                    thread::spawn(move || {
-                        EdaxInterface::run_edax_solve(&subset, level, &path)
-                    }),
-                ));
-            }
-
-            eprintln!(
-                "  {} Edax threads processing {} positions ({} chunks/thread)",
-                handles.len(),
-                edax_boards.len(),
-                (chunk_size + EdaxInterface::CHUNK_SIZE - 1) / EdaxInterface::CHUNK_SIZE,
-            );
-
-            let n_threads = handles.len();
-            let mut results: Vec<Option<Vec<i32>>> = vec![None; n_threads];
-            for (idx, handle) in handles {
-                match handle.join() {
-                    Ok(Ok(scores)) => results[idx] = Some(scores),
-                    Ok(Err(e)) => {
-                        return Err(format!("Edax thread {} failed: {}", idx, e));
-                    }
-                    Err(_) => {
-                        return Err(format!("Edax thread {} panicked", idx));
-                    }
-                }
-            }
-
-            results.into_iter().flatten().flatten().collect()
+            self.run_with_progress(&edax_boards)?
         };
 
         // Map scores back to the original order
         let mut score_iter = edax_scores.into_iter();
-        let scores: Vec<i32> = actions
-            .iter()
-            .map(|action| match action {
-                Action::GameEnd(score) => *score,
-                Action::Normal(_) => score_iter.next().expect("score count mismatch"),
-                Action::Pass(_) => -score_iter.next().expect("score count mismatch"),
-            })
-            .collect();
+        let mut scores = Vec::with_capacity(actions.len());
+        for action in &actions {
+            let score = match action {
+                Action::GameEnd(s) => *s,
+                Action::Normal(_) | Action::Pass(_) => {
+                    let s = score_iter
+                        .next()
+                        .ok_or_else(|| "score count mismatch".to_string())?;
+                    if let Action::Pass(_) = action {
+                        -s
+                    } else {
+                        s
+                    }
+                }
+            };
+            scores.push(score);
+        }
 
         Ok(scores)
+    }
+
+    /// Run Edax solvers in background threads, printing progress from the parent.
+    fn run_with_progress(&self, boards: &[Position]) -> Result<Vec<i32>, String> {
+        let n = boards.len();
+        let effective_threads = if self.threads <= 1 || n < self.threads * 2 {
+            1
+        } else {
+            self.threads
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let chunk_size = n.div_ceil(effective_threads);
+        let path_owned = self.path.clone();
+        let level = self.level;
+        let mut handles = Vec::with_capacity(effective_threads);
+
+        for thread_id in 0..effective_threads {
+            let start = thread_id * chunk_size;
+            if start >= n {
+                break;
+            }
+            let end = usize::min(start + chunk_size, n);
+            let subset = boards[start..end].to_vec();
+            let path = path_owned.clone();
+            let tx = tx.clone();
+
+            handles.push(thread::spawn(move || {
+                Self::run_edax_solve(&subset, level, &path, thread_id, &tx)
+            }));
+        }
+
+        drop(tx);
+
+        if handles.len() > 1 {
+            eprintln!(
+                "  {} Edax threads processing {} positions ({} chunks/thread)",
+                handles.len(),
+                n,
+                chunk_size.div_ceil(Self::CHUNK_SIZE),
+            );
+        }
+
+        // Aggregate progress from all threads
+        let mut per_thread_done = vec![0usize; handles.len()];
+        for p in rx {
+            per_thread_done[p.thread_id] = p.done;
+            let total_done: usize = per_thread_done.iter().sum();
+            let pct = total_done * 100 / n;
+            eprint!("\r  Edax: [{pct:3}%] {total_done}/{n} pos          ");
+            let _ = std::io::stderr().flush();
+        }
+        if n > Self::CHUNK_SIZE {
+            eprintln!();
+        }
+
+        // Collect results
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(scores)) => results.push(scores),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("Edax thread panicked".to_string()),
+            }
+        }
+
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Default number of positions per Edax process chunk.
@@ -151,50 +196,49 @@ impl EdaxInterface {
     /// buffers on large datasets (2M+ positions).
     const CHUNK_SIZE: usize = 100;
 
-    /// Run Edax -solve on a list of boards, chunking into separate processes.
+    /// Run Edax -solve on a list of boards, sending progress via `tx`.
     ///
     /// All boards must have legal moves for the side to move — game-ends and
     /// passes must be handled by the caller before reaching this function.
     fn run_edax_solve(
-        boards: &[Board],
+        boards: &[Position],
         level: u32,
         edax_path: &str,
+        thread_id: usize,
+        tx: &Sender<Progress>,
     ) -> Result<Vec<i32>, String> {
         let n = boards.len();
         if n == 0 {
             return Ok(Vec::new());
         }
 
-        let num_chunks = (n + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE;
+        let num_chunks = n.div_ceil(Self::CHUNK_SIZE);
         let mut all_scores = Vec::with_capacity(n);
-        let chunk_start = std::time::Instant::now();
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * Self::CHUNK_SIZE;
             let end = usize::min(start + Self::CHUNK_SIZE, n);
             let chunk = &boards[start..end];
 
-            let scores = Self::run_edax_solve_chunk(chunk, level, edax_path)
-                .map_err(|e| format!("Chunk {}/{} (positions {}-{}): {}", chunk_idx + 1, num_chunks, start + 1, end, e))?;
+            let scores = Self::run_edax_solve_chunk(chunk, level, edax_path).map_err(|e| {
+                format!(
+                    "Chunk {}/{} (positions {}-{}): {}",
+                    chunk_idx + 1,
+                    num_chunks,
+                    start + 1,
+                    end,
+                    e
+                )
+            })?;
 
             all_scores.extend(scores);
 
-            // Progress with ETA
             if num_chunks > 1 {
-                let done = chunk_idx + 1;
-                let elapsed = chunk_start.elapsed().as_secs_f64().max(0.001);
-                let avg_per_chunk = elapsed / done as f64;
-                let remaining = avg_per_chunk * (num_chunks - done) as f64;
-                eprint!(
-                    "\r  [{:3}%] chunk {}/{} | {}/{} pos | ETA: {:.0}s          ",
-                    done * 100 / num_chunks, done, num_chunks, end, n, remaining
-                );
-                let _ = std::io::stderr().flush();
+                let _ = tx.send(Progress {
+                    thread_id,
+                    done: end,
+                });
             }
-        }
-
-        if num_chunks > 1 {
-            eprintln!();
         }
 
         Ok(all_scores)
@@ -202,7 +246,7 @@ impl EdaxInterface {
 
     /// Run a single Edax -solve process on a small chunk of boards.
     fn run_edax_solve_chunk(
-        boards: &[Board],
+        boards: &[Position],
         level: u32,
         edax_path: &str,
     ) -> Result<Vec<i32>, String> {
@@ -229,7 +273,7 @@ impl EdaxInterface {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to start Edax '{}': {}", edax_path, e))?;
+            .map_err(|e| format!("Failed to start Edax '{edax_path}': {e}"))?;
 
         {
             let stdin = child
@@ -243,19 +287,20 @@ impl EdaxInterface {
             }
             stdin
                 .write_all(input.as_bytes())
-                .map_err(|e| format!("Error writing to Edax: {}", e))?;
+                .map_err(|e| format!("Error writing to Edax: {e}"))?;
             // stdin is dropped here → closed, signalling EOF to Edax
         }
 
         let output = child
             .wait_with_output()
-            .map_err(|e| format!("Failed to wait for Edax: {}", e))?;
+            .map_err(|e| format!("Failed to wait for Edax: {e}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
                 "Edax exited with error (status: {}): {}",
-                output.status, stderr.trim()
+                output.status,
+                stderr.trim()
             ));
         }
 
@@ -263,12 +308,11 @@ impl EdaxInterface {
         Self::parse_solve_output(&stdout, boards.len())
     }
 
-    /// Convert a board to Edax problem format.
+    /// Convert a position to Edax problem format.
     ///
-    /// Always normalizes so `X` is the side to move, `O` is the opponent.
-    /// `board.player` = side to move → `X`, `board.opponent` → `O`.
-    fn board_to_problem(board: &Board) -> String {
-        let mut squares = String::with_capacity(70); // 64 squares + " X;\n" + margin
+    /// Normalizes so `X` always represents the side to move and `O` the opponent.
+    fn board_to_problem(board: &Position) -> String {
+        let mut squares = String::with_capacity(70);
         for i in 0..64 {
             let bit = 1u64 << i;
             if board.player & bit != 0 {
@@ -293,8 +337,6 @@ impl EdaxInterface {
     fn parse_solve_output(stdout: &str, expected_count: usize) -> Result<Vec<i32>, String> {
         let mut scores = Vec::with_capacity(expected_count);
 
-        // Split on "*** problem" markers — each block is one position.
-        // The first element is text before the first marker (banner or empty).
         let blocks: Vec<&str> = stdout.split("*** problem").collect();
         let problems = if blocks.len() > 1 { &blocks[1..] } else { &[] };
 
@@ -316,15 +358,14 @@ impl EdaxInterface {
                 }
             }
 
-            match last_score {
-                Some(score) => scores.push(score),
-                None => {
-                    return Err(format!(
-                        "No score found in problem block {}. Block content:\n{}",
-                        scores.len() + 1,
-                        &block[..block.len().min(500)]
-                    ));
-                }
+            if let Some(score) = last_score {
+                scores.push(score);
+            } else {
+                return Err(format!(
+                    "No score found in problem block {}. Block content:\n{}",
+                    scores.len() + 1,
+                    &block[..block.len().min(500)]
+                ));
             }
         }
 
@@ -351,53 +392,18 @@ impl EdaxInterface {
             return None;
         }
 
-        // First column must be depth[@confidence%]
-        if !columns[0].contains('@') && !columns[0].ends_with('%') {
-            // Could be just a depth number, but -verbose 3 includes @confidence
-        }
-
-        // Check that the first column looks like "N@M%" or "N"
         let first = columns[0];
         let has_at = first.contains('@');
         let has_pct = first.ends_with('%') || first.contains('%');
 
         if !has_at && !has_pct && first.parse::<u32>().is_err() {
-            return None; // Not a depth column — not a score line
+            return None;
         }
 
-        // Second column is the score: +12, -5, etc.
         let score_str = columns[1];
-        // Strip angle brackets sometimes used for exact scores: <+10>
         let score_str = score_str.trim_matches(|c: char| c == '<' || c == '>');
         score_str.parse::<i32>().ok()
     }
-}
-
-/// Convert a board to an Edax FEN string (used for eval file persistence).
-///
-/// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
-///   `X` = black disc, `O` = white disc, `-` = empty
-/// Followed by a space and the side to move (`X` for black, `O` for white).
-pub fn board_to_fen(board: &Board, black_to_move: bool) -> String {
-    let mut fen = String::with_capacity(66);
-    for i in 0..64 {
-        let bit = 1u64 << i;
-        let (is_black, is_white) = if black_to_move {
-            (board.player & bit != 0, board.opponent & bit != 0)
-        } else {
-            (board.opponent & bit != 0, board.player & bit != 0)
-        };
-        fen.push(if is_black {
-            'X'
-        } else if is_white {
-            'O'
-        } else {
-            '-'
-        });
-    }
-    fen.push(' ');
-    fen.push(if black_to_move { 'X' } else { 'O' });
-    fen
 }
 
 /// Check whether Edax is available (EDAX_PATH is set).
@@ -418,12 +424,10 @@ mod tests {
 
     #[test]
     fn test_board_to_problem_initial() {
-        let board = Board::initial();
+        let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
 
-        // Should end with " X;\n"
         assert!(problem.ends_with(" X;\n"));
-        // 64 squares + " X;\n" = 68 chars
         assert_eq!(problem.len(), 68);
 
         let squares = &problem[..64];
@@ -434,18 +438,15 @@ mod tests {
 
     #[test]
     fn test_board_to_problem_normalizes_to_x() {
-        // Even with black_to_move=false, board_to_problem always uses X
-        // for the side to move (player)
-        let board = Board::initial();
+        let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
-        // Player = side to move → X, always
         assert!(problem.ends_with(" X;\n"));
     }
 
     #[test]
-    fn test_board_to_fen_initial() {
-        let board = Board::initial();
-        let fen = board_to_fen(&board, true);
+    fn test_position_to_fen_initial() {
+        let board = Position::initial();
+        let fen = board.to_fen(true);
 
         assert_eq!(fen.len(), 66);
         assert_eq!(&fen[64..65], " ");
@@ -459,9 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn test_board_to_fen_white_to_move() {
-        let board = Board::initial();
-        let fen = board_to_fen(&board, false);
+    fn test_position_to_fen_white_to_move() {
+        let board = Position::initial();
+        let fen = board.to_fen(false);
         let (board_part, side) = split_fen(&fen);
 
         assert_eq!(side, 'O');
@@ -471,9 +472,9 @@ mod tests {
     }
 
     #[test]
-    fn test_board_to_fen_empty() {
-        let board = Board::new();
-        let fen = board_to_fen(&board, true);
+    fn test_position_to_fen_empty() {
+        let board = Position::new();
+        let fen = board.to_fen(true);
         let (board_part, side) = split_fen(&fen);
 
         assert_eq!(side, 'X');
@@ -484,44 +485,29 @@ mod tests {
 
     #[test]
     fn test_fen_board_order() {
-        let board = Board::new();
-        let fen = board_to_fen(&board, true);
+        let board = Position::new();
+        let fen = board.to_fen(true);
         assert_eq!(fen.len(), 66);
     }
 
     #[test]
-    fn test_parse_solve_line_positive() {
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 10@100%  +12  f5  g6  d6"),
-            Some(12)
-        );
-        assert_eq!(
-            EdaxInterface::parse_solve_line("  5@73%   -3  d3  c4"),
-            Some(-3)
-        );
-    }
-
-    #[test]
-    fn test_parse_solve_line_exact() {
-        // Exact scores may be wrapped in angle brackets
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 24@100%  <+10>  c4  d3"),
-            Some(10)
-        );
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 60@100%  <-64>  a1"),
-            Some(-64)
-        );
-    }
-
-    #[test]
-    fn test_parse_solve_line_non_score() {
-        assert_eq!(EdaxInterface::parse_solve_line(""), None);
-        assert_eq!(EdaxInterface::parse_solve_line("  A B C D E F G H"), None);
-        assert_eq!(
-            EdaxInterface::parse_solve_line("Edax version 4.4"),
-            None
-        );
+    fn test_parse_solve_line() {
+        let cases = [
+            (" 10@100%  +12  f5  g6  d6", Some(12)),
+            ("  5@73%   -3  d3  c4", Some(-3)),
+            (" 24@100%  <+10>  c4  d3", Some(10)),
+            (" 60@100%  <-64>  a1", Some(-64)),
+            ("", None),
+            ("  A B C D E F G H", None),
+            ("Edax version 4.4", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                EdaxInterface::parse_solve_line(input),
+                expected,
+                "parse_solve_line({input:?})"
+            );
+        }
     }
 
     #[test]

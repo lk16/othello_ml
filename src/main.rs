@@ -1,25 +1,36 @@
 use othello_eval::{
-    board_to_fen, edax_available, extract_positions, load_games, Board, EdaxInterface, Features,
-    Trainer, TrainingExample, Weights,
+    build_examples, edax_available, load_games, EdaxInterface, Features, Trainer, TrainingConfig,
+    Weights,
 };
-use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-fn main() {
+/// Parsed command-line arguments.
+struct CliArgs {
+    max_empties: u32,
+    epochs: usize,
+    lr_decay: f32,
+    resume_epoch: usize,
+    eval_file: Option<String>,
+    weights_file: String,
+    edax_level: u32,
+    edax_threads: usize,
+    paths: Vec<String>,
+}
+
+/// Parse CLI arguments. Returns `None` if `--help` was shown.
+fn parse_args() -> Option<CliArgs> {
     let args: Vec<String> = env::args().collect();
 
-    let mut max_empties: u32 = 60; // default: train on all positions (up to 60 empties)
-    let mut epochs: usize = 10; // default: 10 training epochs
-    let mut lr_decay: f32 = 0.01; // default: inverse-time decay (0 = no decay)
-    let mut resume_epoch: usize = 0; // default: start from epoch 0 for LR schedule
+    let mut max_empties: u32 = 60;
+    let mut epochs: usize = 10;
+    let mut lr_decay: f32 = 0.01;
+    let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
-    let mut edax_level: u32 = 10; // default: Edax search level (0-60, even)
-    let mut edax_threads: usize = 1; // default: single Edax process
+    let mut edax_level: u32 = 10;
+    let mut edax_threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -65,46 +76,74 @@ fn main() {
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
-            return;
+            return None;
         } else {
             paths.push(args[i].clone());
         }
         i += 1;
     }
 
-    if paths.is_empty() {
+    Some(CliArgs {
+        max_empties,
+        epochs,
+        lr_decay,
+        resume_epoch,
+        eval_file,
+        weights_file,
+        edax_level,
+        edax_threads,
+        paths,
+    })
+}
+
+fn main() {
+    let args = if let Some(a) = parse_args() {
+        a
+    } else {
+        return;
+    };
+
+    if args.paths.is_empty() {
         eprintln!("Error: No input files or directories specified.\n");
-        print_usage(&args[0]);
+        print_usage(&env::args().collect::<Vec<_>>()[0]);
         return;
     }
 
-    println!("=== Othello ML Training ===");
-    println!("Max empties: {}", max_empties);
-    println!("Epochs: {}", epochs);
-    if resume_epoch > 0 {
-        println!("Resume epoch: {} (LR schedule continues from here)", resume_epoch);
+    eprintln!("=== Othello ML Training ===");
+    eprintln!("Max empties: {}", args.max_empties);
+    eprintln!("Epochs: {}", args.epochs);
+    if args.resume_epoch > 0 {
+        eprintln!(
+            "Resume epoch: {} (LR schedule continues from here)",
+            args.resume_epoch
+        );
     }
-    if edax_available() || eval_file.is_some() {
-        println!("Edax level: {}", edax_level);
+    if edax_available() || args.eval_file.is_some() {
+        eprintln!("Edax level: {}", args.edax_level);
     }
-    println!("Input paths: {:?}", paths);
+    eprintln!("Input paths: {:?}", args.paths);
 
-    // Load games from all specified paths
+    // Load games
     eprintln!("\n--- Loading games ---");
-    let games = match load_games(&paths) {
+    let games = match load_games(&args.paths) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("Error loading games: {}", e);
+            eprintln!("Error loading games: {e}");
             return;
         }
     };
 
-    // Extract positions with empties <= max_empties
+    // Extract positions
     eprintln!(
         "\n--- Extracting positions (empties <= {}) ---",
-        max_empties
+        args.max_empties
     );
-    let positions = extract_positions(&games, max_empties);
+    let positions: Vec<othello_eval::Board> = games
+        .iter()
+        .flat_map(|game| game.positions.iter())
+        .filter(|pos| pos.empties() <= args.max_empties)
+        .cloned()
+        .collect();
     eprintln!("Extracted {} positions", positions.len());
 
     if positions.is_empty() {
@@ -112,181 +151,29 @@ fn main() {
         return;
     }
 
-    // Initialize features and weights (load from file if present)
+    // Initialize features and weights
     let features = Features::edax();
     eprintln!("Features: {}", features.count());
 
-    let mut weights = if std::path::Path::new(&weights_file).exists() {
-        eprintln!("Loading weights from {} ...", weights_file);
-        match othello_eval::io::WeightIO::load(&weights_file) {
-            Ok(w) => {
-                eprintln!(
-                    "Loaded weights: {} features x {} empty ranges",
-                    w.feature_count(),
-                    w.empty_range_count()
-                );
-                w
-            }
-            Err(e) => {
-                eprintln!("Error loading weights (starting fresh): {}", e);
-                Weights::new(features.clone())
-            }
+    let mut weights = Weights::load_or_create(&args.weights_file, &features);
+
+    // Require Edax for ground truth
+    let edax_path = match env::var("EDAX_PATH") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
+            return;
         }
-    } else {
-        let w = Weights::new(features.clone());
-        eprintln!(
-            "Weight table: {} features x {} empty ranges",
-            w.feature_count(),
-            w.empty_range_count()
-        );
-        w
     };
+    let edax = EdaxInterface::new(edax_path, args.edax_level, args.edax_threads);
 
-    // Require Edax — all evaluations use it for ground truth.
-    if !edax_available() {
-        eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
-        std::process::exit(1);
-    }
-    let edax_path =
-        env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
-
-    // Create training examples.
-    // --eval-file acts as a cache: load if present, compute+append missing, create if not.
-    let mut examples: Vec<TrainingExample> = if let Some(ref eval_path) = eval_file {
-        if std::path::Path::new(eval_path).exists() {
-            // Cache hit — load, compute missing with Edax, append to file
-            eprintln!("\n--- Loading evaluations from {} ---", eval_path);
-            let eval_map = load_eval_file(eval_path).unwrap_or_else(|e| {
-                eprintln!("Error loading eval file: {}", e);
-                std::process::exit(1);
-            });
-            eprintln!("Loaded {} evaluations", eval_map.len());
-
-            let mut examples = Vec::with_capacity(positions.len());
-            let mut missing_positions: Vec<&othello_eval::Position> = Vec::new();
-            for pos in &positions {
-                let fen = board_to_fen(&pos.board, pos.black_to_move);
-                match eval_map.get(&fen) {
-                    Some(&score) => {
-                        examples.push(TrainingExample {
-                            board: pos.board,
-                            target_score: score,
-                        });
-                    }
-                    None => {
-                        missing_positions.push(pos);
-                    }
-                }
-            }
-
-            if !missing_positions.is_empty() {
-                let n_missing = missing_positions.len();
-                eprintln!(
-                    "Computing {} missing positions with Edax (level {})...",
-                    n_missing, edax_level
-                );
-                let missing_boards: Vec<Board> =
-                    missing_positions.iter().map(|p| p.board).collect();
-                let scores = EdaxInterface::batch_evaluate(
-                    &missing_boards,
-                    edax_level,
-                    &edax_path,
-                    edax_threads,
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("Edax evaluation failed: {}", e);
-                    std::process::exit(1);
-                });
-
-                append_eval_file(eval_path, &missing_positions, &scores)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Error appending to eval file: {}", e);
-                        std::process::exit(1);
-                    });
-                eprintln!("Appended {} new evaluations to {}", n_missing, eval_path);
-
-                for (pos, &score) in missing_positions.iter().zip(scores.iter()) {
-                    examples.push(TrainingExample {
-                        board: pos.board,
-                        target_score: score,
-                    });
-                }
-            }
-            examples
-        } else {
-            // Cache miss — compute everything and save
-            eprintln!(
-                "\n--- Evaluating positions with Edax (level {}) → saving to {} ---",
-                edax_level, eval_path
-            );
-            let n = positions.len();
-            eprintln!("Submitting {} positions to Edax...", n);
-
-            let eval_start = std::time::Instant::now();
-            let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
-            let scores =
-                EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads).unwrap_or_else(
-                    |e| {
-                        eprintln!("Edax evaluation failed: {}", e);
-                        std::process::exit(1);
-                    },
-                );
-
-            let elapsed = eval_start.elapsed();
-            eprintln!(
-                "  Done in {:.1}s ({:.0} pos/s)",
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64().max(0.001)
-            );
-
-            let examples: Vec<TrainingExample> = positions
-                .iter()
-                .zip(scores.iter())
-                .map(|(pos, &score)| TrainingExample {
-                    board: pos.board,
-                    target_score: score,
-                })
-                .collect();
-
-            eprintln!("Saving evaluations to {} ...", eval_path);
-            save_eval_from_positions(eval_path, &positions, &examples).unwrap_or_else(|e| {
-                eprintln!("Error saving eval file: {}", e);
-                std::process::exit(1);
-            });
-            eprintln!("Saved {} evaluations", examples.len());
-            examples
+    let mut examples = match build_examples(&args.eval_file, &positions, &edax) {
+        Ok(ex) => ex,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return;
         }
-    } else {
-        // No eval file — compute with Edax (no caching)
-        eprintln!("\n--- Evaluating positions with Edax (level {}) ---", edax_level);
-        let n = positions.len();
-        eprintln!("Submitting {} positions to Edax...", n);
-
-        let eval_start = std::time::Instant::now();
-        let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
-        let scores =
-            EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads).unwrap_or_else(|e| {
-                eprintln!("Edax evaluation failed: {}", e);
-                std::process::exit(1);
-            });
-
-        let elapsed = eval_start.elapsed();
-        eprintln!(
-            "  Done in {:.1}s ({:.0} pos/s)",
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64().max(0.001)
-        );
-
-        positions
-            .iter()
-            .zip(scores.iter())
-            .map(|(pos, &score)| TrainingExample {
-                board: pos.board,
-                target_score: score,
-            })
-            .collect()
     };
-
     eprintln!("Training examples: {}", examples.len());
 
     // Train
@@ -295,44 +182,36 @@ fn main() {
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let interrupted = Arc::clone(&interrupted);
-        ctrlc::set_handler(move || {
+        if let Err(e) = ctrlc::set_handler(move || {
             eprintln!("\nInterrupt received — finishing current epoch...");
             interrupted.store(true, Ordering::Relaxed);
-        })
-        .expect("Failed to set Ctrl+C handler");
-    }
-    // Learning rate = 0.1 with gradient normalization (gradient / N_features).
-    // Effective per-example prediction correction ≈ lr × 2 = 20%.
-    // Inverse-time decay: effective_lr = lr / (1 + decay × epoch).
-    let trainer = Trainer::new(0.1, 32, lr_decay);
-    trainer.train_epochs(&mut weights, &mut examples, epochs, resume_epoch, Some(&interrupted));
-
-    // Show some learned weights for corner features
-    eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
-    let board = Board::initial();
-    let feature_indices = features.extract(&board);
-    for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(10) {
-        let w = weights.get_weight(feat_idx, pattern_idx, 60);
-        if w != 0.0 {
-            eprintln!(
-                "  Feature {} pattern {}: weight = {}",
-                feat_idx, pattern_idx, w
-            );
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
         }
     }
 
-    // Save weights
+    let trainer = Trainer::new(0.1, 32, args.lr_decay);
+    let train_config = TrainingConfig {
+        epochs: args.epochs,
+        epoch_offset: args.resume_epoch,
+        interrupt: Some(interrupted),
+    };
+    trainer.train_epochs(&mut weights, &mut examples, &train_config);
+
+    // Show sample weights and save
+    weights.print_sample(&features, 10);
+
     eprintln!("\n--- Saving weights ---");
-    match othello_eval::io::WeightIO::save(&weights, &weights_file) {
-        Ok(()) => eprintln!("Weights saved to {}", weights_file),
-        Err(e) => eprintln!("Error saving weights: {}", e),
+    match weights.save(&args.weights_file) {
+        Ok(()) => eprintln!("Weights saved to {}", args.weights_file),
+        Err(e) => eprintln!("Error saving weights: {e}"),
     }
 
     eprintln!("\nDone!");
 }
 
 fn print_usage(program: &str) {
-    eprintln!("Usage: {} [OPTIONS] <path>...", program);
+    eprintln!("Usage: {program} [OPTIONS] <path>...");
     eprintln!();
     eprintln!("Train Othello evaluation weights from game files.");
     eprintln!();
@@ -342,27 +221,15 @@ fn print_usage(program: &str) {
     eprintln!(
         "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
     );
-    eprintln!(
-        "  -e, --epochs N        Number of training epochs (default: 10)"
-    );
-    eprintln!(
-        "  -l, --level N         Edax search level, 0-60 even (default: 10)"
-    );
-    eprintln!(
-        "  -t, --edax-threads N  Parallel Edax processes (default: 1)"
-    );
+    eprintln!("  -e, --epochs N        Number of training epochs (default: 10)");
+    eprintln!("  -l, --level N         Edax search level, 0-60 even (default: 10)");
+    eprintln!("  -t, --edax-threads N  Parallel Edax processes (default: 1)");
     eprintln!(
         "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
     );
-    eprintln!(
-        "  -w, --weights PATH    Weights output file (default: trained_weights.bin)"
-    );
-    eprintln!(
-        "  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)"
-    );
-    eprintln!(
-        "  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)"
-    );
+    eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
+    eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)");
+    eprintln!("  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
@@ -376,106 +243,12 @@ fn print_usage(program: &str) {
     eprintln!("    - directories (scanned recursively for game files)");
     eprintln!();
     eprintln!("EXAMPLES:");
+    eprintln!("  EDAX_PATH=../edax {program} training_data/");
+    eprintln!("  EDAX_PATH=../edax {program} --max-empties 20 --epochs 50 training_data/");
     eprintln!(
-        "  EDAX_PATH=../edax {} training_data/",
-        program
+        "  EDAX_PATH=../edax {program} --eval-file ignored/evals.txt --epochs 30 training_data/"
     );
-    eprintln!(
-        "  EDAX_PATH=../edax {} --max-empties 20 --epochs 50 training_data/",
-        program
-    );
-    eprintln!(
-        "  EDAX_PATH=../edax {} --eval-file ignored/evals.txt --epochs 30 training_data/",
-        program
-    );
-    eprintln!(
-        "  EDAX_PATH=../edax {} -e 1000 -d 0.001 -f evals.txt training_data/",
-        program
-    );
-    eprintln!(
-        "  EDAX_PATH=../edax {} -e 500 -r 1000 -w trained_weights.bin training_data/",
-        program
-    );
+    eprintln!("  EDAX_PATH=../edax {program} -e 1000 -d 0.001 -f evals.txt training_data/");
+    eprintln!("  EDAX_PATH=../edax {program} -e 500 -r 1000 -w trained_weights.bin training_data/");
     eprintln!("    (resume from epoch 1000, LR schedule continues from there)");
 }
-
-// ─── Eval file load / save ──────────────────────────────────────────
-
-/// Load an eval file into a map from FEN string to score.
-///
-/// Format: one `<FEN> <score>` pair per line. The FEN is 66 characters
-/// (64 board + space + side to move), the score is a signed integer.
-fn load_eval_file(path: &str) -> Result<HashMap<String, i32>, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
-    let mut map = HashMap::new();
-
-    for (line_no, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // FEN is exactly 66 chars; score is the remainder
-        if line.len() < 68 {
-            return Err(format!(
-                "{}:{}: line too short (expected '<66-char FEN> <score>')",
-                path,
-                line_no + 1
-            ));
-        }
-        let fen = &line[..66];
-        let score_str = line[67..].trim();
-        let score = score_str
-            .parse::<i32>()
-            .map_err(|e| format!("{}:{}: invalid score '{}': {}", path, line_no + 1, score_str, e))?;
-
-        if fen.as_bytes()[64] != b' ' {
-            return Err(format!(
-                "{}:{}: FEN missing space at position 65",
-                path,
-                line_no + 1
-            ));
-        }
-
-        map.insert(fen.to_string(), score);
-    }
-
-    Ok(map)
-}
-
-/// Append evaluations for a subset of positions to an existing eval file.
-fn append_eval_file(
-    path: &str,
-    positions: &[&othello_eval::Position],
-    scores: &[i32],
-) -> Result<(), String> {
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("Failed to open {} for appending: {}", path, e))?;
-    for (pos, &score) in positions.iter().zip(scores.iter()) {
-        let fen = board_to_fen(&pos.board, pos.black_to_move);
-        writeln!(file, "{} {}", fen, score)
-            .map_err(|e| format!("Failed to write eval file: {}", e))?;
-    }
-    Ok(())
-}
-
-/// Save evaluations to a file from positions and examples.
-///
-/// Uses positions to recover the `black_to_move` flag needed for FEN generation.
-fn save_eval_from_positions(
-    path: &str,
-    positions: &[othello_eval::Position],
-    examples: &[TrainingExample],
-) -> Result<(), String> {
-    let mut file = fs::File::create(path)
-        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
-    for (pos, ex) in positions.iter().zip(examples.iter()) {
-        let fen = board_to_fen(&pos.board, pos.black_to_move);
-        writeln!(file, "{} {}", fen, ex.target_score)
-            .map_err(|e| format!("Failed to write eval file: {}", e))?;
-    }
-    Ok(())
-}
-

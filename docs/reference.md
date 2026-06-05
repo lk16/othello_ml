@@ -4,40 +4,46 @@
 
 ```
 othello_eval
-├── Board          - 64-bit bitboard representation
-├── Features       - 47 Edax pattern extraction
-├── Weights        - Weight storage & lookup
-├── Training       - SGD optimization
-├── EdaxInterface  - Subprocess communication
-└── IO             - Binary serialization
+├── othello/
+│   ├── Position       - bitboard pair (player + opponent discs)
+│   ├── Board          - Position + side to move
+│   └── Game           - WTHOR/PGN loading & game replay
+├── training/
+│   ├── Features       - 47 Edax pattern extraction
+│   ├── Weights        - weight storage, lookup, save/load
+│   ├── Trainer        - SGD optimization with inverse-time LR decay
+│   ├── EdaxInterface  - subprocess communication (channel-based progress)
+│   └── EvalCache      - persistent FEN→score cache for eval files
 ```
 
 ## Key Features
 
-- **No external dependencies** — pure Rust standard library
+- **Minimal dependencies** — only `ctrlc` for graceful SIGINT handling
 - **47 Edax features** — exact pattern set extracted from Edax eval.c
 - **Compact storage** — single binary file for all weights
-- **Full SGD training** — configurable learning rate, batch size, epochs
+- **Full SGD training** — configurable learning rate, batch size, epochs, LR decay
 - **Edax integration** — subprocess communication for ground truth evaluations
+- **Channel-based progress** — Edax solvers report progress via channels; parent thread prints
 - **Eval file caching** — `--eval-file` loads cached evaluations or computes & saves
 
 ## Binary Weight Format
 
 ```
 [Magic: 0xDEADBEEF (4 bytes)]
-[Version: 1 (4 bytes)]
+[Version: 2 (4 bytes)]          ← f32 weights (v1 = i16, still readable)
 [N Features: 47 (4 bytes)]
 [Feature 0: name_len + name + cells_count + cells...]
 ...
 [Feature 46: name_len + name + cells_count + cells...]
-[Weight data: all i16 weights in row-major order]
+[Weight data: all f32 weights in row-major order]
 ```
 
 ## Eval File Format
 
 Each line: `<FEN> <score>`
 
-The FEN is 66 characters (64 board cells + space + side to move). The score is a signed integer.
+The FEN is 66 characters (64 board cells + space + side to move).
+Uses `X` for black, `O` for white, `-` for empty. The score is a signed integer.
 
 ## Building & Running
 
@@ -52,7 +58,7 @@ cargo test
 EDAX_PATH=/path/to/edax cargo run --release -- training_data/
 
 # Train with eval file cache (avoids recomputing Edax evaluations)
-cargo run --release -- --eval-file evals.txt training_data/
+cargo run --release -- --eval-file ignored/evals.txt training_data/
 
 # Show all options
 cargo run --release -- --help

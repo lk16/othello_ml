@@ -1,22 +1,20 @@
-// Board representation for Othello (8x8 board)
-// Uses two 64-bit integers: one for each player's discs
-// This is a standard bitboard representation used in many game engines.
+//! Position representation for Othello — a pair of bitboards (player + opponent).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Board {
+pub struct Position {
     // Bitboards: bit position i represents cell i (0-63)
     // Cell mapping: a1=0, b1=1, ..., h1=7 (rank 1)
     //              a2=8, b2=9, ..., h2=15 (rank 2)
     //              ...
     //              a8=56, b8=57, ..., h8=63 (rank 8)
-    pub player: u64,    // Current player's discs
-    pub opponent: u64,  // Opponent's discs
+    pub player: u64,   // Current player's discs
+    pub opponent: u64, // Opponent's discs
 }
 
-impl Board {
-    /// Create an empty board
+impl Position {
+    /// Create an empty position.
     pub fn new() -> Self {
-        Board {
+        Position {
             player: 0,
             opponent: 0,
         }
@@ -27,7 +25,7 @@ impl Board {
         // d4=27, e4=28, d5=35, e5=36
         // Initially: player (black) at d5=35, e4=28
         // opponent (white) at e5=36, d4=27
-        Board {
+        Position {
             player: (1u64 << 35) | (1u64 << 28),
             opponent: (1u64 << 36) | (1u64 << 27),
         }
@@ -64,6 +62,53 @@ impl Board {
     pub fn place_disc(&mut self, cell: u32) {
         let bit = 1u64 << cell;
         self.player |= bit;
+    }
+
+    /// Flip opponent discs in all 8 directions after placing a disc at `cell`.
+    ///
+    /// Scans outward from `cell` in each direction. When it finds a run of
+    /// opponent discs followed by one of the current player's discs, it flips
+    /// the run. Does nothing if no flanks are found.
+    pub fn flip_discs(&mut self, cell: u32) {
+        let directions: [(i32, i32); 8] = [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+
+        let x = (cell % 8) as i32;
+        let y = (cell / 8) as i32;
+
+        for &(dx, dy) in &directions {
+            let mut flips: u64 = 0;
+            let mut nx = x + dx;
+            let mut ny = y + dy;
+
+            while (0..8).contains(&nx) && (0..8).contains(&ny) {
+                let idx = (ny * 8 + nx) as u32;
+                let bit = 1u64 << idx;
+
+                if self.opponent & bit != 0 {
+                    flips |= bit;
+                } else if self.player & bit != 0 {
+                    // Found our own disc - flip the captured pieces
+                    self.player |= flips;
+                    self.opponent &= !flips;
+                    break;
+                } else {
+                    // Empty cell - no capture in this direction
+                    break;
+                }
+
+                nx += dx;
+                ny += dy;
+            }
+        }
     }
 
     /// Get all occupied cells
@@ -112,7 +157,7 @@ impl Board {
         }
 
         // Only empty cells are legal moves, mask to 64 bits
-        moves & !(self.player | self.opponent) & 0xFFFFFFFFFFFFFFFF
+        moves & !(self.player | self.opponent)
     }
 
     /// Check whether the current player has any legal moves.
@@ -129,8 +174,8 @@ impl Board {
     ///
     /// The current player has no legal moves so they pass;
     /// the opponent becomes the new side to move.
-    pub fn pass_move(&self) -> Board {
-        Board {
+    pub fn pass_move(&self) -> Position {
+        Position {
             player: self.opponent,
             opponent: self.player,
         }
@@ -154,6 +199,33 @@ impl Board {
             0
         }
     }
+
+    /// Convert to an Edax FEN string.
+    ///
+    /// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
+    ///   `X` = black disc, `O` = white disc, `-` = empty
+    /// Followed by a space and the side to move (`X` for black, `O` for white).
+    pub fn to_fen(&self, black_to_move: bool) -> String {
+        let mut fen = String::with_capacity(66);
+        for i in 0..64 {
+            let bit = 1u64 << i;
+            let (is_black, is_white) = if black_to_move {
+                (self.player & bit != 0, self.opponent & bit != 0)
+            } else {
+                (self.opponent & bit != 0, self.player & bit != 0)
+            };
+            fen.push(if is_black {
+                'X'
+            } else if is_white {
+                'O'
+            } else {
+                '-'
+            });
+        }
+        fen.push(' ');
+        fen.push(if black_to_move { 'X' } else { 'O' });
+        fen
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,9 +235,9 @@ pub enum Cell {
     Empty,
 }
 
-impl Default for Board {
+impl Default for Position {
     fn default() -> Self {
-        Board::new()
+        Position::new()
     }
 }
 
@@ -175,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_initial_board() {
-        let board = Board::initial();
+        let board = Position::initial();
         assert_eq!(board.player_discs(), 2);
         assert_eq!(board.opponent_discs(), 2);
         assert_eq!(board.empties(), 60);
@@ -183,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_get_cell() {
-        let board = Board::initial();
+        let board = Position::initial();
         assert_eq!(board.get_cell(35), Cell::Player);
         assert_eq!(board.get_cell(28), Cell::Player);
         assert_eq!(board.get_cell(36), Cell::Opponent);
@@ -193,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_place_disc() {
-        let mut board = Board::new();
+        let mut board = Position::new();
         board.place_disc(0);
         assert_eq!(board.get_cell(0), Cell::Player);
         assert_eq!(board.player_discs(), 1);
@@ -201,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_initial_has_moves() {
-        let board = Board::initial();
+        let board = Position::initial();
         assert!(board.has_moves());
         // The initial position has exactly 4 legal moves for black
         assert_eq!(board.get_moves().count_ones(), 4);
@@ -209,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_pass_move() {
-        let board = Board::initial();
+        let board = Position::initial();
         let passed = board.pass_move();
         // After pass, former opponent becomes player
         assert_eq!(passed.player, board.opponent);
@@ -218,14 +290,14 @@ mod tests {
 
     #[test]
     fn test_is_not_game_end_initially() {
-        let board = Board::initial();
+        let board = Position::initial();
         assert!(!board.is_game_end());
     }
 
     #[test]
     fn test_game_end_and_final_score() {
         // Create a game-end position: black controls entire board
-        let board = Board {
+        let board = Position {
             player: 0xFFFFFFFFFFFFFFFF, // all discs
             opponent: 0,
         };
@@ -235,14 +307,14 @@ mod tests {
         assert_eq!(board.final_score(), 64);
 
         // Opponent wins
-        let board = Board {
+        let board = Position {
             player: 0,
             opponent: 0xFFFFFFFFFFFFFFFF,
         };
         assert_eq!(board.final_score(), -64);
 
         // Tie: 32 each
-        let board = Board {
+        let board = Position {
             player: 0x00000000FFFFFFFF,
             opponent: 0xFFFFFFFF00000000,
         };
@@ -252,7 +324,7 @@ mod tests {
     #[test]
     fn test_get_moves_empty_board() {
         // An empty board: no opponent discs to flip → no moves
-        let board = Board::new();
+        let board = Position::new();
         assert!(!board.has_moves());
         assert_eq!(board.get_moves(), 0);
     }
