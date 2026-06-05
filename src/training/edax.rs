@@ -102,14 +102,23 @@ impl EdaxInterface {
 
         // Map scores back to the original order
         let mut score_iter = edax_scores.into_iter();
-        let scores: Vec<i32> = actions
-            .iter()
-            .map(|action| match action {
-                Action::GameEnd(score) => *score,
-                Action::Normal(_) => score_iter.next().expect("score count mismatch"),
-                Action::Pass(_) => -score_iter.next().expect("score count mismatch"),
-            })
-            .collect();
+        let mut scores = Vec::with_capacity(actions.len());
+        for action in &actions {
+            let score = match action {
+                Action::GameEnd(s) => *s,
+                Action::Normal(_) | Action::Pass(_) => {
+                    let s = score_iter
+                        .next()
+                        .ok_or_else(|| "score count mismatch".to_string())?;
+                    if let Action::Pass(_) = action {
+                        -s
+                    } else {
+                        s
+                    }
+                }
+            };
+            scores.push(score);
+        }
 
         Ok(scores)
     }

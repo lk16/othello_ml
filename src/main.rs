@@ -19,7 +19,8 @@ struct CliArgs {
     paths: Vec<String>,
 }
 
-fn parse_args() -> CliArgs {
+/// Parse CLI arguments. Returns `None` if `--help` was shown.
+fn parse_args() -> Option<CliArgs> {
     let args: Vec<String> = env::args().collect();
 
     let mut max_empties: u32 = 60;
@@ -75,14 +76,14 @@ fn parse_args() -> CliArgs {
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_usage(&args[0]);
-            std::process::exit(0);
+            return None;
         } else {
             paths.push(args[i].clone());
         }
         i += 1;
     }
 
-    CliArgs {
+    Some(CliArgs {
         max_empties,
         epochs,
         lr_decay,
@@ -92,11 +93,15 @@ fn parse_args() -> CliArgs {
         edax_level,
         edax_threads,
         paths,
-    }
+    })
 }
 
 fn main() {
-    let args = parse_args();
+    let args = if let Some(a) = parse_args() {
+        a
+    } else {
+        return;
+    };
 
     if args.paths.is_empty() {
         eprintln!("Error: No input files or directories specified.\n");
@@ -153,15 +158,22 @@ fn main() {
     let mut weights = Weights::load_or_create(&args.weights_file, &features);
 
     // Require Edax for ground truth
-    if !edax_available() {
-        eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
-        std::process::exit(1);
-    }
-    let edax_path =
-        env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
+    let edax_path = match env::var("EDAX_PATH") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
+            return;
+        }
+    };
     let edax = EdaxInterface::new(edax_path, args.edax_level, args.edax_threads);
 
-    let mut examples = build_examples(&args.eval_file, &positions, &edax);
+    let mut examples = match build_examples(&args.eval_file, &positions, &edax) {
+        Ok(ex) => ex,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return;
+        }
+    };
     eprintln!("Training examples: {}", examples.len());
 
     // Train
@@ -170,11 +182,12 @@ fn main() {
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let interrupted = Arc::clone(&interrupted);
-        ctrlc::set_handler(move || {
+        if let Err(e) = ctrlc::set_handler(move || {
             eprintln!("\nInterrupt received — finishing current epoch...");
             interrupted.store(true, Ordering::Relaxed);
-        })
-        .expect("Failed to set Ctrl+C handler");
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
     }
 
     let trainer = Trainer::new(0.1, 32, args.lr_decay);

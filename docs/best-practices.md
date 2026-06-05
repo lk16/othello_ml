@@ -6,6 +6,7 @@ Each item should be descriptive enough that specific examples are unnecessary.
 ## Code quality
 
 - **Minimal dependencies.** Currently only `ctrlc`. Avoid pulling in crates for small tasks.
+- **Never panic.** Avoid `panic!()`, `expect()`, `unwrap()` (outside tests), and `std::process::exit()`. Return `Result` and let the caller handle errors.
 - **Concise docstrings** — specific to the function or module, not redundant with the name. Module-level docs cover cross-cutting concerns.
 - **Avoid long functions and deep nesting.** When a function exceeds ~60 lines or takes 5+ parameters, extract helpers or introduce a config struct.
 - **Prefer `if let Some(x) = opt { ... } else { return ... }`** over `match opt { Some(x) => ..., None => return ... }` when the `None` branch returns, breaks, or continues. This keeps the happy path indented and the early-exit visible. Same for `if let Ok(x)` vs `match` on `Result`.

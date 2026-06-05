@@ -114,7 +114,7 @@ impl EvalCache {
         &self,
         positions: &[Board],
         edax: &EdaxInterface,
-    ) -> Vec<TrainingExample> {
+    ) -> Result<Vec<TrainingExample>, String> {
         if self.exists() {
             self.build_from_existing(positions, edax)
         } else {
@@ -127,12 +127,9 @@ impl EvalCache {
         &self,
         positions: &[Board],
         edax: &EdaxInterface,
-    ) -> Vec<TrainingExample> {
+    ) -> Result<Vec<TrainingExample>, String> {
         eprintln!("\n--- Loading evaluations from {} ---", self.path);
-        let eval_map = self.load_map().unwrap_or_else(|e| {
-            eprintln!("Error loading eval file: {e}");
-            std::process::exit(1);
-        });
+        let eval_map = self.load_map()?;
         eprintln!("Loaded {} evaluations", eval_map.len());
 
         let mut examples = Vec::with_capacity(positions.len());
@@ -155,15 +152,9 @@ impl EvalCache {
                 edax.level
             );
             let boards: Vec<Position> = missing.iter().map(|p| p.position).collect();
-            let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
-                eprintln!("Edax evaluation failed: {e}");
-                std::process::exit(1);
-            });
+            let scores = edax.batch_evaluate(&boards)?;
 
-            self.append(&missing, &scores).unwrap_or_else(|e| {
-                eprintln!("Error appending to eval file: {e}");
-                std::process::exit(1);
-            });
+            self.append(&missing, &scores)?;
             eprintln!("Appended {n} new evaluations to {}", self.path);
 
             for (pos, &score) in missing.iter().zip(scores.iter()) {
@@ -173,11 +164,15 @@ impl EvalCache {
                 });
             }
         }
-        examples
+        Ok(examples)
     }
 
     /// Evaluate all positions with Edax and create a new cache file.
-    fn build_fresh(&self, positions: &[Board], edax: &EdaxInterface) -> Vec<TrainingExample> {
+    fn build_fresh(
+        &self,
+        positions: &[Board],
+        edax: &EdaxInterface,
+    ) -> Result<Vec<TrainingExample>, String> {
         eprintln!(
             "\n--- Evaluating positions with Edax (level {}) → saving to {} ---",
             edax.level, self.path
@@ -187,10 +182,7 @@ impl EvalCache {
 
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
-            eprintln!("Edax evaluation failed: {e}");
-            std::process::exit(1);
-        });
+        let scores = edax.batch_evaluate(&boards)?;
 
         let elapsed = eval_start.elapsed();
         eprintln!(
@@ -209,12 +201,9 @@ impl EvalCache {
             .collect();
 
         eprintln!("Saving evaluations to {} ...", self.path);
-        self.save_all(positions, &examples).unwrap_or_else(|e| {
-            eprintln!("Error saving eval file: {e}");
-            std::process::exit(1);
-        });
+        self.save_all(positions, &examples)?;
         eprintln!("Saved {} evaluations", examples.len());
-        examples
+        Ok(examples)
     }
 }
 
@@ -228,7 +217,7 @@ pub fn build_examples(
     eval_file: &Option<String>,
     positions: &[Board],
     edax: &EdaxInterface,
-) -> Vec<TrainingExample> {
+) -> Result<Vec<TrainingExample>, String> {
     if let Some(ref path) = eval_file {
         let cache = EvalCache::new(path.clone());
         cache.build_examples(positions, edax)
@@ -241,23 +230,21 @@ pub fn build_examples(
         eprintln!("Submitting {n} positions to Edax...");
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
-            eprintln!("Edax evaluation failed: {e}");
-            std::process::exit(1);
-        });
+        let scores = edax.batch_evaluate(&boards)?;
         let elapsed = eval_start.elapsed();
         eprintln!(
             "  Done in {:.1}s ({:.0} pos/s)",
             elapsed.as_secs_f64(),
             n as f64 / elapsed.as_secs_f64().max(0.001)
         );
-        positions
+        let examples = positions
             .iter()
             .zip(scores.iter())
             .map(|(pos, &score)| TrainingExample {
                 position: pos.position,
                 target_score: score,
             })
-            .collect()
+            .collect();
+        Ok(examples)
     }
 }
