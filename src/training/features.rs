@@ -105,17 +105,17 @@ impl Features {
             .collect()
     }
 
-    /// Get number of features
+    /// Number of features (normally 47 for the Edax set).
     pub fn count(&self) -> usize {
         self.features.len()
     }
 
-    /// Get feature by index
+    /// Look up a feature by index.
     pub fn get(&self, idx: usize) -> Option<&Feature> {
         self.features.get(idx)
     }
 
-    /// Get all features
+    /// All features.
     pub fn all(&self) -> &[Feature] {
         &self.features
     }

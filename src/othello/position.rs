@@ -1,6 +1,4 @@
-// Position representation for Othello (8x8 board)
-// Uses two 64-bit integers: one for each player's discs
-// This is a standard bitboard representation used in many game engines.
+//! Position representation for Othello — a pair of bitboards (player + opponent).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -14,7 +12,7 @@ pub struct Position {
 }
 
 impl Position {
-    /// Create an empty board
+    /// Create an empty position.
     pub fn new() -> Self {
         Position {
             player: 0,

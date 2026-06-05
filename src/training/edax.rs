@@ -275,10 +275,9 @@ impl EdaxInterface {
         Self::parse_solve_output(&stdout, boards.len())
     }
 
-    /// Convert a board to Edax problem format.
+    /// Convert a position to Edax problem format.
     ///
-    /// Always normalizes so `X` is the side to move, `O` is the opponent.
-    /// `board.player` = side to move → `X`, `board.opponent` → `O`.
+    /// Normalizes so `X` always represents the side to move and `O` the opponent.
     fn board_to_problem(board: &Position) -> String {
         let mut squares = String::with_capacity(70); // 64 squares + " X;\n" + margin
         for i in 0..64 {

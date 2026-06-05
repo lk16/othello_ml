@@ -27,10 +27,10 @@ pub struct Game {
 
 // ─── WTHOR (.wtb) reader ──────────────────────────────────────────
 
-/// Convert a WTHOR move byte (1-88 excluding row/col 0) to an Edax cell index (0-63).
-/// WTHOR encoding: board columns A-H = 1-8, rows 1-8 = 1-8
-/// Value = 10 * row + col + 1? Actually looking at edax code:
-/// move_from_wthor(x) = 8 * ((x - 11) / 10) + ((x - 11) % 10)
+/// Convert a WTHOR move byte to an Edax cell index (0-63).
+///
+/// WTHOR encodes moves as `10 * row + col + 1` with rows/cols 1-8.
+/// Edax expects a linear cell index: `8 * ((x - 11) / 10) + ((x - 11) % 10)`.
 /// This maps:
 ///   WTHOR 11 -> 0 (A1), WTHOR 18 -> 7 (H1)
 ///   WTHOR 21 -> 8 (A2), WTHOR 28 -> 15 (H2)

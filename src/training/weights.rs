@@ -9,7 +9,7 @@ use crate::training::features::Features;
 ///
 /// Weights are stored as f32 internally for precise SGD updates.
 ///
-/// Board evaluation = sum of all feature weights for the current board state.
+/// Position evaluation = sum of all feature weights for the current board state.
 pub struct Weights {
     // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
     feature_weights: Vec<Vec<Vec<f32>>>,
@@ -126,27 +126,27 @@ impl Weights {
         self.set_weight(feature_idx, pattern_idx, empties, new_weight);
     }
 
-    /// Get the features struct
+    /// The feature set used by this weight table.
     pub fn features(&self) -> &Features {
         &self.features
     }
 
-    /// Get feature count
+    /// Number of features in the weight table.
     pub fn feature_count(&self) -> usize {
         self.feature_weights.len()
     }
 
-    /// Get number of empty ranges
+    /// Number of empty-range buckets (30: empties 2, 4, 6, …, 60).
     pub fn empty_range_count(&self) -> usize {
         self.empty_ranges.len()
     }
 
-    /// Get all weights as f32 (for serialization: round to i16 when writing)
+    /// Get all weights as f32.
     pub fn get_all_weights(&self) -> &Vec<Vec<Vec<f32>>> {
         &self.feature_weights
     }
 
-    /// Set all weights from f32 (for deserialization)
+    /// Replace all weights (used during deserialization).
     pub fn set_all_weights(&mut self, weights: Vec<Vec<Vec<f32>>>) {
         self.feature_weights = weights;
     }
