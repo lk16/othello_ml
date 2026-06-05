@@ -54,13 +54,7 @@ impl Weights {
     /// Get the appropriate empty range index for a given number of empties
     /// Rounds down to nearest even number
     fn empty_range_index(&self, empties: u32) -> usize {
-        let clamped = if empties < 2 {
-            2
-        } else if empties > 60 {
-            60
-        } else {
-            empties
-        };
+        let clamped = empties.clamp(2, 60);
 
         // Round down to nearest even, then convert to index (0-29)
         let even = (clamped / 2) * 2;

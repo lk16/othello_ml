@@ -1,7 +1,7 @@
-use std::fs::File;
-use std::io::{Read, Write, BufReader, BufWriter};
-use crate::weights::Weights;
 use crate::features::Features;
+use crate::weights::Weights;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Binary serialization format for Othello position weights.
 ///
@@ -25,9 +25,8 @@ pub struct WeightIO;
 impl WeightIO {
     /// Save weights to a file as f32 (lossless).
     pub fn save(weights: &Weights, path: &str) -> Result<(), String> {
-        let mut file = BufWriter::new(
-            File::create(path).map_err(|e| format!("Failed to create file: {}", e))?,
-        );
+        let mut file =
+            BufWriter::new(File::create(path).map_err(|e| format!("Failed to create file: {e}"))?);
 
         // Write header
         file.write_all(&MAGIC_NUMBER.to_le_bytes())
@@ -46,8 +45,7 @@ impl WeightIO {
             let name_bytes = feature.name.as_bytes();
             file.write_all(&(name_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| e.to_string())?;
-            file.write_all(name_bytes)
-                .map_err(|e| e.to_string())?;
+            file.write_all(name_bytes).map_err(|e| e.to_string())?;
 
             // Write cells
             file.write_all(&(feature.cells.len() as u32).to_le_bytes())
@@ -79,14 +77,13 @@ impl WeightIO {
     /// - Version 2: weights stored as f32 (4 bytes each)
     /// - Version 1: weights stored as i16 (2 bytes each) — for backward compatibility
     pub fn load(path: &str) -> Result<Weights, String> {
-        let mut file = BufReader::new(
-            File::open(path).map_err(|e| format!("Failed to open file: {}", e))?,
-        );
+        let mut file =
+            BufReader::new(File::open(path).map_err(|e| format!("Failed to open file: {e}"))?);
 
         // Read header
         let mut header = [0u8; 12];
         file.read_exact(&mut header)
-            .map_err(|e| format!("Failed to read header: {}", e))?;
+            .map_err(|e| format!("Failed to read header: {e}"))?;
 
         let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         if magic != MAGIC_NUMBER {
@@ -96,10 +93,11 @@ impl WeightIO {
         let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let is_v1 = version == 1;
         if version != FORMAT_VERSION && !is_v1 {
-            return Err(format!("Unsupported format version: {}", version));
+            return Err(format!("Unsupported format version: {version}"));
         }
 
-        let n_features = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let n_features =
+            u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
 
         // Read features metadata
         let mut features_vec = Vec::new();
@@ -113,7 +111,7 @@ impl WeightIO {
             file.read_exact(&mut name_bytes)
                 .map_err(|e| e.to_string())?;
             let name = String::from_utf8(name_bytes)
-                .map_err(|e| format!("Invalid UTF-8 in feature name: {}", e))?;
+                .map_err(|e| format!("Invalid UTF-8 in feature name: {e}"))?;
 
             let mut n_cells_bytes = [0u8; 4];
             file.read_exact(&mut n_cells_bytes)
@@ -136,7 +134,11 @@ impl WeightIO {
 
         // Verify loaded features match expected
         if features.count() != n_features {
-            return Err(format!("Feature count mismatch: expected {}, got {}", n_features, features.count()));
+            return Err(format!(
+                "Feature count mismatch: expected {}, got {}",
+                n_features,
+                features.count()
+            ));
         }
 
         // Create weights structure
@@ -145,7 +147,10 @@ impl WeightIO {
         // Read weight data
         let mut all_weights = Vec::new();
         for feature_idx in 0..n_features {
-            let feature = weights.features().get(feature_idx).ok_or("Feature index out of range")?;
+            let feature = weights
+                .features()
+                .get(feature_idx)
+                .ok_or("Feature index out of range")?;
             let max_pattern = (feature.max_index() + 1) as usize;
             let n_empty_ranges = weights.empty_range_count();
 

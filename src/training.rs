@@ -22,9 +22,9 @@ pub struct TrainingExample {
 ///    update its weight: w = w - effective_lr × gradient
 /// 4. Repeat for multiple epochs over training data
 pub struct Trainer {
-    learning_rate: f32,  // Initial step size (before decay)
-    lr_decay: f32,       // Inverse-time decay factor (0 = no decay)
-    batch_size: usize,   // Number of examples per training batch
+    learning_rate: f32, // Initial step size (before decay)
+    lr_decay: f32,      // Inverse-time decay factor (0 = no decay)
+    batch_size: usize,  // Number of examples per training batch
 }
 
 /// Simple xorshift32 PRNG for deterministic shuffling (no external crates needed).
@@ -73,7 +73,12 @@ impl Trainer {
     }
 
     /// Train weights on a batch of examples, returning the accumulated squared error.
-    pub fn train_batch(&self, weights: &mut Weights, examples: &[TrainingExample], effective_lr: f32) -> f64 {
+    pub fn train_batch(
+        &self,
+        weights: &mut Weights,
+        examples: &[TrainingExample],
+        effective_lr: f32,
+    ) -> f64 {
         let features = weights.features().clone();
         let n_features = features.count() as f32;
         let mut loss: f64 = 0.0;
@@ -131,7 +136,7 @@ impl Trainer {
         use std::io::{self, Write};
 
         let n_examples = examples.len();
-        let n_batches = (n_examples + self.batch_size - 1) / self.batch_size;
+        let n_batches = n_examples.div_ceil(self.batch_size);
         let total_updates = n_examples * weights.feature_count() * epochs;
 
         eprintln!(
@@ -194,7 +199,10 @@ impl Trainer {
                     let throughput = done as f64 / elapsed.as_secs_f64().max(0.001);
                     eprint!(
                         "\r  [{:3}%] batch {}/{} ({:.0} ex/s)          ",
-                        progress_pct, batch_idx + 1, n_batches, throughput
+                        progress_pct,
+                        batch_idx + 1,
+                        n_batches,
+                        throughput
                     );
                     let _ = io::stderr().flush();
                 }
@@ -221,8 +229,7 @@ impl Trainer {
         let total_secs = total_start.elapsed().as_secs_f64();
         let overall_throughput = (n_examples * completed) as f64 / total_secs.max(0.001);
         eprintln!(
-            "\rComplete        | loss: {:.4} | time: {:.1}s | {:.0} ex/s   ",
-            last_loss, total_secs, overall_throughput
+            "\rComplete        | loss: {last_loss:.4} | time: {total_secs:.1}s | {overall_throughput:.0} ex/s   "
         );
     }
 }

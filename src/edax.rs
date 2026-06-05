@@ -53,8 +53,8 @@ impl EdaxInterface {
         // Classify each position: game-end, pass, or normal
         enum Action {
             Normal(Board),
-            Pass(Board),    // passed board (swapped sides)
-            GameEnd(i32),   // exact final score
+            Pass(Board),  // passed board (swapped sides)
+            GameEnd(i32), // exact final score
         }
 
         let actions: Vec<Action> = positions
@@ -85,7 +85,7 @@ impl EdaxInterface {
             Self::run_edax_solve(&edax_boards, level, edax_path)?
         } else {
             // Split boards across threads, each with its own Edax processes
-            let chunk_size = (edax_boards.len() + edax_threads - 1) / edax_threads;
+            let chunk_size = edax_boards.len().div_ceil(edax_threads);
             let edax_path = edax_path.to_string();
             let mut handles = Vec::with_capacity(edax_threads);
 
@@ -100,9 +100,7 @@ impl EdaxInterface {
 
                 handles.push((
                     thread_idx,
-                    thread::spawn(move || {
-                        EdaxInterface::run_edax_solve(&subset, level, &path)
-                    }),
+                    thread::spawn(move || EdaxInterface::run_edax_solve(&subset, level, &path)),
                 ));
             }
 
@@ -110,7 +108,7 @@ impl EdaxInterface {
                 "  {} Edax threads processing {} positions ({} chunks/thread)",
                 handles.len(),
                 edax_boards.len(),
-                (chunk_size + EdaxInterface::CHUNK_SIZE - 1) / EdaxInterface::CHUNK_SIZE,
+                chunk_size.div_ceil(EdaxInterface::CHUNK_SIZE),
             );
 
             let n_threads = handles.len();
@@ -119,10 +117,10 @@ impl EdaxInterface {
                 match handle.join() {
                     Ok(Ok(scores)) => results[idx] = Some(scores),
                     Ok(Err(e)) => {
-                        return Err(format!("Edax thread {} failed: {}", idx, e));
+                        return Err(format!("Edax thread {idx} failed: {e}"));
                     }
                     Err(_) => {
-                        return Err(format!("Edax thread {} panicked", idx));
+                        return Err(format!("Edax thread {idx} panicked"));
                     }
                 }
             }
@@ -155,17 +153,13 @@ impl EdaxInterface {
     ///
     /// All boards must have legal moves for the side to move — game-ends and
     /// passes must be handled by the caller before reaching this function.
-    fn run_edax_solve(
-        boards: &[Board],
-        level: u32,
-        edax_path: &str,
-    ) -> Result<Vec<i32>, String> {
+    fn run_edax_solve(boards: &[Board], level: u32, edax_path: &str) -> Result<Vec<i32>, String> {
         let n = boards.len();
         if n == 0 {
             return Ok(Vec::new());
         }
 
-        let num_chunks = (n + Self::CHUNK_SIZE - 1) / Self::CHUNK_SIZE;
+        let num_chunks = n.div_ceil(Self::CHUNK_SIZE);
         let mut all_scores = Vec::with_capacity(n);
         let chunk_start = std::time::Instant::now();
 
@@ -174,8 +168,16 @@ impl EdaxInterface {
             let end = usize::min(start + Self::CHUNK_SIZE, n);
             let chunk = &boards[start..end];
 
-            let scores = Self::run_edax_solve_chunk(chunk, level, edax_path)
-                .map_err(|e| format!("Chunk {}/{} (positions {}-{}): {}", chunk_idx + 1, num_chunks, start + 1, end, e))?;
+            let scores = Self::run_edax_solve_chunk(chunk, level, edax_path).map_err(|e| {
+                format!(
+                    "Chunk {}/{} (positions {}-{}): {}",
+                    chunk_idx + 1,
+                    num_chunks,
+                    start + 1,
+                    end,
+                    e
+                )
+            })?;
 
             all_scores.extend(scores);
 
@@ -187,7 +189,12 @@ impl EdaxInterface {
                 let remaining = avg_per_chunk * (num_chunks - done) as f64;
                 eprint!(
                     "\r  [{:3}%] chunk {}/{} | {}/{} pos | ETA: {:.0}s          ",
-                    done * 100 / num_chunks, done, num_chunks, end, n, remaining
+                    done * 100 / num_chunks,
+                    done,
+                    num_chunks,
+                    end,
+                    n,
+                    remaining
                 );
                 let _ = std::io::stderr().flush();
             }
@@ -229,7 +236,7 @@ impl EdaxInterface {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to start Edax '{}': {}", edax_path, e))?;
+            .map_err(|e| format!("Failed to start Edax '{edax_path}': {e}"))?;
 
         {
             let stdin = child
@@ -243,19 +250,20 @@ impl EdaxInterface {
             }
             stdin
                 .write_all(input.as_bytes())
-                .map_err(|e| format!("Error writing to Edax: {}", e))?;
+                .map_err(|e| format!("Error writing to Edax: {e}"))?;
             // stdin is dropped here → closed, signalling EOF to Edax
         }
 
         let output = child
             .wait_with_output()
-            .map_err(|e| format!("Failed to wait for Edax: {}", e))?;
+            .map_err(|e| format!("Failed to wait for Edax: {e}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
                 "Edax exited with error (status: {}): {}",
-                output.status, stderr.trim()
+                output.status,
+                stderr.trim()
             ));
         }
 
@@ -518,10 +526,7 @@ mod tests {
     fn test_parse_solve_line_non_score() {
         assert_eq!(EdaxInterface::parse_solve_line(""), None);
         assert_eq!(EdaxInterface::parse_solve_line("  A B C D E F G H"), None);
-        assert_eq!(
-            EdaxInterface::parse_solve_line("Edax version 4.4"),
-            None
-        );
+        assert_eq!(EdaxInterface::parse_solve_line("Edax version 4.4"), None);
     }
 
     #[test]

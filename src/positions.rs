@@ -44,7 +44,7 @@ pub struct Game {
 ///   ...
 ///   WTHOR 81 -> 56 (A8), WTHOR 88 -> 63 (H8)
 fn move_from_wthor(x: u8) -> u8 {
-    if x < 11 || x > 88 {
+    if !(11..=88).contains(&x) {
         return 255; // invalid/NOMOVE indicator
     }
     let adjusted = x - 11;
@@ -197,7 +197,7 @@ fn flip_discs(board: &mut Board, cell: u32) {
         let mut nx = x + dx;
         let mut ny = y + dy;
 
-        while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
+        while (0..8).contains(&nx) && (0..8).contains(&ny) {
             let idx = (ny * 8 + nx) as u32;
             let bit = 1u64 << idx;
 
@@ -230,7 +230,7 @@ fn field_to_index(field: &str) -> Option<u8> {
     let col = chars[0].to_ascii_lowercase() as i32 - 'a' as i32;
     let row = chars[1] as i32 - '1' as i32;
 
-    if col < 0 || col > 7 || row < 0 || row > 7 {
+    if !(0..=7).contains(&col) || !(0..=7).contains(&row) {
         return None;
     }
 
@@ -369,7 +369,7 @@ pub fn parse_pgn_multi(content: &str) -> Vec<Game> {
 
     loop {
         // Skip leading blank lines
-        while iter.peek().map_or(false, |l| l.trim().is_empty()) {
+        while iter.peek().is_some_and(|l| l.trim().is_empty()) {
             iter.next();
         }
 

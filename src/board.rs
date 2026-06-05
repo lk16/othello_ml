@@ -9,8 +9,8 @@ pub struct Board {
     //              a2=8, b2=9, ..., h2=15 (rank 2)
     //              ...
     //              a8=56, b8=57, ..., h8=63 (rank 8)
-    pub player: u64,    // Current player's discs
-    pub opponent: u64,  // Opponent's discs
+    pub player: u64,   // Current player's discs
+    pub opponent: u64, // Opponent's discs
 }
 
 impl Board {
@@ -112,7 +112,7 @@ impl Board {
         }
 
         // Only empty cells are legal moves, mask to 64 bits
-        moves & !(self.player | self.opponent) & 0xFFFFFFFFFFFFFFFF
+        moves & !(self.player | self.opponent)
     }
 
     /// Check whether the current player has any legal moves.
