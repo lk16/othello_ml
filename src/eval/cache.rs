@@ -1,9 +1,9 @@
-//! Persistent cache of Edax evaluations, stored as `<FEN> <score>` lines.
+//! Persistent cache of exact position evaluations, stored as `<FEN> <score>` lines.
 //!
 //! Avoids re-evaluating the same positions across training runs by
 //! loading known evaluations from disk and only computing missing ones.
 
-use crate::eval::edax::EdaxInterface;
+use crate::eval::alphabeta;
 use crate::othello::board::Board;
 use crate::othello::position::Position;
 use crate::training::trainer::TrainingExample;
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 
-/// Cached Edax evaluations backed by a text file.
+/// Cached exact evaluations backed by a text file.
 pub struct EvalCache {
     path: String,
 }
@@ -105,29 +105,21 @@ impl EvalCache {
     }
 
     /// Build training examples from positions, using cached evaluations when
-    /// available and computing the rest via Edax.
+    /// available and computing the rest via alpha-beta.
     ///
     /// If the cache file exists, known positions are loaded from it and only
-    /// missing ones are sent to Edax (appended after). If the cache doesn't
+    /// missing ones are computed (appended after). If the cache doesn't
     /// exist yet, all positions are evaluated and the result is saved.
-    pub fn build_examples(
-        &self,
-        positions: &[Board],
-        edax: &EdaxInterface,
-    ) -> Result<Vec<TrainingExample>, String> {
+    pub fn build_examples(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
         if self.exists() {
-            self.build_from_existing(positions, edax)
+            self.build_from_existing(positions)
         } else {
-            self.build_fresh(positions, edax)
+            self.build_fresh(positions)
         }
     }
 
     /// Load cached evaluations and compute only missing positions.
-    fn build_from_existing(
-        &self,
-        positions: &[Board],
-        edax: &EdaxInterface,
-    ) -> Result<Vec<TrainingExample>, String> {
+    fn build_from_existing(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
         eprintln!("\n--- Loading evaluations from {} ---", self.path);
         let eval_map = self.load_map()?;
         eprintln!("Loaded {} evaluations", eval_map.len());
@@ -147,12 +139,9 @@ impl EvalCache {
 
         if !missing.is_empty() {
             let n = missing.len();
-            eprintln!(
-                "Computing {n} missing positions with Edax (level {})...",
-                edax.level
-            );
+            eprintln!("Computing {n} missing positions with alpha-beta...");
             let boards: Vec<Position> = missing.iter().map(|p| p.position).collect();
-            let scores = edax.batch_evaluate(&boards)?;
+            let scores = alphabeta::batch_evaluate(&boards);
 
             self.append(&missing, &scores)?;
             eprintln!("Appended {n} new evaluations to {}", self.path);
@@ -167,22 +156,17 @@ impl EvalCache {
         Ok(examples)
     }
 
-    /// Evaluate all positions with Edax and create a new cache file.
-    fn build_fresh(
-        &self,
-        positions: &[Board],
-        edax: &EdaxInterface,
-    ) -> Result<Vec<TrainingExample>, String> {
-        eprintln!(
-            "\n--- Evaluating positions with Edax (level {}) → saving to {} ---",
-            edax.level, self.path
-        );
+    /// Evaluate all positions and create a new cache file.
+    fn build_fresh(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
         let n = positions.len();
-        eprintln!("Submitting {n} positions to Edax...");
+        eprintln!(
+            "\n--- Evaluating {n} positions with alpha-beta → saving to {} ---",
+            self.path
+        );
 
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = edax.batch_evaluate(&boards)?;
+        let scores = alphabeta::batch_evaluate(&boards);
 
         let elapsed = eval_start.elapsed();
         eprintln!(
@@ -208,7 +192,7 @@ impl EvalCache {
 }
 
 /// Build training examples from positions, either via an eval-file cache or
-/// by evaluating all positions with Edax directly.
+/// by evaluating all positions with alpha-beta directly.
 ///
 /// When `eval_file` is `Some`, positions are looked up in the cache (computing
 /// and appending any missing ones). When `None`, all positions are evaluated
@@ -216,21 +200,16 @@ impl EvalCache {
 pub fn build_examples(
     eval_file: &Option<String>,
     positions: &[Board],
-    edax: &EdaxInterface,
 ) -> Result<Vec<TrainingExample>, String> {
     if let Some(ref path) = eval_file {
         let cache = EvalCache::new(path.clone());
-        cache.build_examples(positions, edax)
+        cache.build_examples(positions)
     } else {
-        eprintln!(
-            "\n--- Evaluating positions with Edax (level {}) ---",
-            edax.level
-        );
         let n = positions.len();
-        eprintln!("Submitting {n} positions to Edax...");
+        eprintln!("\n--- Evaluating {n} positions with alpha-beta ---");
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = edax.batch_evaluate(&boards)?;
+        let scores = alphabeta::batch_evaluate(&boards);
         let elapsed = eval_start.elapsed();
         eprintln!(
             "  Done in {:.1}s ({:.0} pos/s)",

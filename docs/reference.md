@@ -8,22 +8,22 @@ othello_eval
 │   ├── Position       - bitboard pair (player + opponent discs)
 │   ├── Board          - Position + side to move
 │   └── Game           - WTHOR/PGN loading & game replay
+├── eval/
+│   ├── alphabeta      - exact endgame evaluation via alpha-beta search
+│   └── cache          - persistent FEN→score cache for eval files
 ├── training/
 │   ├── Features       - 47 Edax pattern extraction
 │   ├── Weights        - weight storage, lookup, save/load
-│   ├── Trainer        - SGD optimization with inverse-time LR decay
-│   ├── EdaxInterface  - subprocess communication (channel-based progress)
-│   └── EvalCache      - persistent FEN→score cache for eval files
+│   └── Trainer        - SGD optimization with inverse-time LR decay
 ```
 
 ## Key Features
 
 - **Minimal dependencies** — only `ctrlc` for graceful SIGINT handling
 - **47 Edax features** — exact pattern set extracted from Edax eval.c
+- **Alpha-beta evaluation** — exact endgame position scoring via negamax with pruning
 - **Compact storage** — single binary file for all weights
 - **Full SGD training** — configurable learning rate, batch size, epochs, LR decay
-- **Edax integration** — subprocess communication for ground truth evaluations
-- **Channel-based progress** — Edax solvers report progress via channels; parent thread prints
 - **Eval file caching** — `--eval-file` loads cached evaluations or computes & saves
 
 ## Binary Weight Format
@@ -54,10 +54,10 @@ cargo build --release
 # Test
 cargo test
 
-# Train with Edax ground truth
-EDAX_PATH=/path/to/edax cargo run --release -- training_data/
+# Train with exact alpha-beta evaluation
+cargo run --release -- training_data/
 
-# Train with eval file cache (avoids recomputing Edax evaluations)
+# Train with eval file cache (avoids recomputing evaluations)
 cargo run --release -- --eval-file ignored/evals.txt training_data/
 
 # Show all options
