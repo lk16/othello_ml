@@ -4,6 +4,7 @@
 // tags and scores like "50-14" as the Result.
 
 use crate::othello::board::Board;
+use crate::othello::game::GameResult;
 use crate::othello::position::{Cell, Position};
 use std::collections::HashMap;
 use std::fs;
@@ -145,7 +146,7 @@ where
         positions,
         black_name: metadata.get("Black").cloned(),
         white_name: metadata.get("White").cloned(),
-        result_score: metadata.get("Result").cloned(),
+        result: metadata.get("Result").and_then(|s| GameResult::parse(s)),
     })
 }
 
@@ -213,7 +214,7 @@ mod tests {
         assert!(!games.is_empty());
         assert_eq!(games[0].black_name.as_deref(), Some("hz36"));
         assert_eq!(games[0].white_name.as_deref(), Some("lk16"));
-        assert_eq!(games[0].result_score.as_deref(), Some("50-14"));
+        assert_eq!(games[0].result, Some(GameResult::BlackWin));
         assert!(!games[0].positions.is_empty());
     }
 

@@ -143,7 +143,7 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<super::Game>, String> {
                 positions,
                 black_name: None,
                 white_name: None,
-                result_score: None,
+                result: None,
             });
         }
     }
