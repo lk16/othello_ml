@@ -1,6 +1,7 @@
 use crate::othello::position::Position;
 use crate::training::weights::Weights;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Training data point: a board position paired with its ground truth evaluation.
@@ -56,6 +57,16 @@ fn shuffle<T>(slice: &mut [T], rng: &mut XorShift32) {
         let j = rng.gen_range(i + 1);
         slice.swap(i, j);
     }
+}
+
+/// Configuration for a training run.
+pub struct TrainingConfig {
+    /// Number of epochs to train.
+    pub epochs: usize,
+    /// Offset added to epoch number for LR decay schedule (0 for fresh start).
+    pub epoch_offset: usize,
+    /// Optional interrupt flag for graceful early stopping.
+    pub interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl Trainer {
@@ -117,24 +128,18 @@ impl Trainer {
 
     /// Train for multiple epochs with progress logging.
     ///
-    /// `epoch_offset` is added to the epoch number for the LR decay schedule,
-    /// so that resuming from a checkpoint continues the decay where it left off.
-    /// Pass 0 for a fresh training run.
-    ///
-    /// Examples are shuffled at the start of each epoch to avoid systematic
-    /// ordering biases.  If `interrupt` is provided, the loop checks the flag
-    /// at the start of each epoch and returns early when it is set, preserving
-    /// weights from the last fully completed epoch.
+    /// Uses [`TrainingConfig`] to control epochs, LR schedule offset, and
+    /// optional early stopping via an interrupt flag.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
         examples: &mut [TrainingExample],
-        epochs: usize,
-        epoch_offset: usize,
-        interrupt: Option<&AtomicBool>,
+        config: &TrainingConfig,
     ) {
         use std::io::{self, Write};
 
+        let epochs = config.epochs;
+        let epoch_offset = config.epoch_offset;
         let n_examples = examples.len();
         let n_batches = n_examples.div_ceil(self.batch_size);
         let total_updates = n_examples * weights.feature_count() * epochs;
@@ -166,7 +171,7 @@ impl Trainer {
         let mut last_loss: f64 = 0.0;
 
         for epoch in 0..epochs {
-            if let Some(flag) = interrupt {
+            if let Some(ref flag) = config.interrupt {
                 if flag.load(Ordering::Relaxed) {
                     eprintln!(
                         "\nInterrupted after {} epochs (global epoch {}) — keeping weights from last completed epoch.",
