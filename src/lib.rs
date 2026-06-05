@@ -2,6 +2,7 @@ pub mod eval;
 pub mod othello;
 pub mod training;
 
+pub use eval::alphabeta::{batch_evaluate, exact_score};
 pub use eval::cache::{build_examples, EvalCache};
 pub use eval::edax::{edax_available, EdaxInterface};
 pub use othello::board::Board;
