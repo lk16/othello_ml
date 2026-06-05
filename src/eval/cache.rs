@@ -3,9 +3,9 @@
 //! Avoids re-evaluating the same positions across training runs by
 //! loading known evaluations from disk and only computing missing ones.
 
+use crate::eval::edax::EdaxInterface;
 use crate::othello::board::Board;
 use crate::othello::position::Position;
-use crate::training::edax::EdaxInterface;
 use crate::training::trainer::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
