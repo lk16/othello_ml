@@ -32,7 +32,6 @@ pub struct EdaxInterface {
 struct Progress {
     thread_id: usize,
     done: usize,
-    total: usize,
 }
 
 impl EdaxInterface {
@@ -238,7 +237,6 @@ impl EdaxInterface {
                 let _ = tx.send(Progress {
                     thread_id,
                     done: end,
-                    total: n,
                 });
             }
         }
