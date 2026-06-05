@@ -1,4 +1,4 @@
-// Position loading from WTHOR (.wtb) and PGN (.pgn/.txt) game files.
+// Game loading from WTHOR (.wtb) and PGN (.pgn/.txt) game files.
 //
 // WTHOR format: Binary format with a 16-byte header followed by 68-byte
 // game records. Each record contains metadata and up to 60 moves.
@@ -11,17 +11,10 @@
 //
 // Supports loading individual files or recursively scanning directories.
 
-use crate::board::{Board, Cell};
+use crate::othello::board::{Board, Cell};
+use crate::othello::positions::Position;
 use std::fs;
 use std::path::Path;
-
-/// A single board position extracted from a game, with side-to-move information.
-#[derive(Debug, Clone)]
-pub struct Position {
-    pub board: Board,
-    /// Which player's turn it is (true = black/player side to move)
-    pub black_to_move: bool,
-}
 
 /// A complete game loaded from a file.
 #[derive(Debug, Clone)]
@@ -485,22 +478,6 @@ pub fn load_games(paths: &[String]) -> Result<Vec<Game>, String> {
     Ok(all_games)
 }
 
-/// Extract all positions from loaded games, filtered to those with empties <= max_empties.
-pub fn extract_positions(games: &[Game], max_empties: u32) -> Vec<Position> {
-    let mut positions = Vec::new();
-
-    for game in games {
-        for pos in &game.positions {
-            let empties = 64 - pos.board.player.count_ones() - pos.board.opponent.count_ones();
-            if empties <= max_empties {
-                positions.push(pos.clone());
-            }
-        }
-    }
-
-    positions
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,17 +523,5 @@ mod tests {
         let pgn = "";
         let games = parse_pgn_multi(pgn);
         assert!(games.is_empty());
-    }
-
-    #[test]
-    fn test_load_wthor_file() {
-        // Test with one of the project's WTHOR files
-        let path = Path::new("training_data/wthor/WTH_1977.wtb");
-        if path.exists() {
-            let games = read_wthor_file(path);
-            assert!(games.is_ok());
-            let games = games.unwrap();
-            assert!(!games.is_empty());
-        }
     }
 }

@@ -115,7 +115,7 @@ fn main() {
 
     let mut weights = if std::path::Path::new(&weights_file).exists() {
         eprintln!("Loading weights from {weights_file} ...");
-        match othello_eval::io::WeightIO::load(&weights_file) {
+        match othello_eval::Weights::load(&weights_file) {
             Ok(w) => {
                 eprintln!(
                     "Loaded weights: {} features x {} empty ranges",
@@ -319,7 +319,7 @@ fn main() {
 
     // Save weights
     eprintln!("\n--- Saving weights ---");
-    match othello_eval::io::WeightIO::save(&weights, &weights_file) {
+    match weights.save(&weights_file) {
         Ok(()) => eprintln!("Weights saved to {weights_file}"),
         Err(e) => eprintln!("Error saving weights: {e}"),
     }

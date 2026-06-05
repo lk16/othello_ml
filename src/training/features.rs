@@ -1,4 +1,4 @@
-use crate::board::Board;
+use crate::othello::board::Board;
 
 /// Represents the 47 Edax features used for position evaluation.
 /// Each feature is a subset of board cells that forms a pattern.
@@ -138,9 +138,9 @@ impl Feature {
 
         for &cell in &self.cells {
             let value = match board.get_cell(cell) {
-                crate::board::Cell::Empty => 0,
-                crate::board::Cell::Player => 1,
-                crate::board::Cell::Opponent => 2,
+                crate::othello::board::Cell::Empty => 0,
+                crate::othello::board::Cell::Player => 1,
+                crate::othello::board::Cell::Opponent => 2,
             };
             index += value * power;
             power *= 3;

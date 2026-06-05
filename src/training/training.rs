@@ -1,5 +1,5 @@
-use crate::board::Board;
-use crate::weights::Weights;
+use crate::othello::board::Board;
+use crate::training::weights::Weights;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
