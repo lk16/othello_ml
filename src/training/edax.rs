@@ -121,84 +121,61 @@ impl EdaxInterface {
             threads
         };
 
-        if effective_threads == 1 {
-            let (tx, rx) = mpsc::channel();
-            let boards_owned = boards.to_vec();
-            let path_owned = edax_path.to_string();
-            let handle = thread::spawn(move || {
-                Self::run_edax_solve(&boards_owned, level, &path_owned, 0, &tx)
-            });
-            // tx is owned by the thread and dropped when it finishes → rx terminates
-            for p in rx {
-                if p.total > 1 {
-                    let pct = p.done * 100 / p.total;
-                    eprint!(
-                        "\r  Edax: [{:3}%] {}/{} pos          ",
-                        pct, p.done, p.total
-                    );
-                    let _ = std::io::stderr().flush();
-                }
+        let (tx, rx) = mpsc::channel();
+        let chunk_size = n.div_ceil(effective_threads);
+        let path_owned = edax_path.to_string();
+        let mut handles = Vec::with_capacity(effective_threads);
+
+        for thread_id in 0..effective_threads {
+            let start = thread_id * chunk_size;
+            if start >= n {
+                break;
             }
-            if n > Self::CHUNK_SIZE {
-                eprintln!();
-            }
+            let end = usize::min(start + chunk_size, n);
+            let subset = boards[start..end].to_vec();
+            let path = path_owned.clone();
+            let tx = tx.clone();
 
-            handle
-                .join()
-                .map_err(|_| "Edax thread panicked".to_string())?
-        } else {
-            let (tx, rx) = mpsc::channel();
-            let chunk_size = n.div_ceil(effective_threads);
-            let path_owned = edax_path.to_string();
-            let mut handles = Vec::with_capacity(effective_threads);
+            handles.push(thread::spawn(move || {
+                Self::run_edax_solve(&subset, level, &path, thread_id, &tx)
+            }));
+        }
 
-            for thread_id in 0..effective_threads {
-                let start = thread_id * chunk_size;
-                if start >= n {
-                    break;
-                }
-                let end = usize::min(start + chunk_size, n);
-                let subset = boards[start..end].to_vec();
-                let path = path_owned.clone();
-                let tx = tx.clone();
+        drop(tx);
 
-                handles.push(thread::spawn(move || {
-                    Self::run_edax_solve(&subset, level, &path, thread_id, &tx)
-                }));
-            }
-
-            drop(tx);
-
+        if handles.len() > 1 {
             eprintln!(
                 "  {} Edax threads processing {} positions ({} chunks/thread)",
                 handles.len(),
                 n,
                 chunk_size.div_ceil(Self::CHUNK_SIZE),
             );
-
-            // Aggregate progress from all threads
-            let mut per_thread_done = vec![0usize; handles.len()];
-            for p in rx {
-                per_thread_done[p.thread_id] = p.done;
-                let total_done: usize = per_thread_done.iter().sum();
-                let pct = total_done * 100 / n;
-                eprint!("\r  Edax: [{pct:3}%] {total_done}/{n} pos          ");
-                let _ = std::io::stderr().flush();
-            }
-            eprintln!();
-
-            // Collect results
-            let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(scores)) => results.push(scores),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err("Edax thread panicked".to_string()),
-                }
-            }
-
-            Ok(results.into_iter().flatten().collect())
         }
+
+        // Aggregate progress from all threads
+        let mut per_thread_done = vec![0usize; handles.len()];
+        for p in rx {
+            per_thread_done[p.thread_id] = p.done;
+            let total_done: usize = per_thread_done.iter().sum();
+            let pct = total_done * 100 / n;
+            eprint!("\r  Edax: [{pct:3}%] {total_done}/{n} pos          ");
+            let _ = std::io::stderr().flush();
+        }
+        if n > Self::CHUNK_SIZE {
+            eprintln!();
+        }
+
+        // Collect results
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(scores)) => results.push(scores),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("Edax thread panicked".to_string()),
+            }
+        }
+
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Default number of positions per Edax process chunk.
