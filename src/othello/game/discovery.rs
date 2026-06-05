@@ -6,19 +6,19 @@ use std::path::Path;
 use super::pgn::read_pgn_file;
 use super::wthor::read_wthor_file;
 
-/// Determine file type from extension.
+/// Recognised game file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Wthor,
     Pgn,
-    Unknown,
 }
 
-fn file_type(path: &Path) -> FileType {
+/// Determine file type from extension. Returns `None` for unrecognised extensions.
+fn file_type(path: &Path) -> Option<FileType> {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("wtb") | Some("WTH") => FileType::Wthor,
-        Some("pgn") | Some("PGN") | Some("txt") | Some("TXT") => FileType::Pgn,
-        _ => FileType::Unknown,
+        Some("wtb") | Some("WTH") => Some(FileType::Wthor),
+        Some("pgn") | Some("PGN") | Some("txt") | Some("TXT") => Some(FileType::Pgn),
+        _ => None,
     }
 }
 
@@ -35,7 +35,7 @@ fn collect_game_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 
         if path.is_dir() {
             files.extend(collect_game_files(&path)?);
-        } else if matches!(file_type(&path), FileType::Wthor | FileType::Pgn) {
+        } else if file_type(&path).is_some() {
             files.push(path);
         }
     }
@@ -66,24 +66,23 @@ pub fn load_games(paths: &[String]) -> Result<Vec<super::Game>, String> {
 
     let mut all_games = Vec::new();
     for file_path in &all_file_paths {
-        let ft = file_type(file_path);
-        eprintln!("Loading {} ({:?})...", file_path.display(), ft);
+        if let Some(ft) = file_type(file_path) {
+            eprintln!("Loading {} ({:?})...", file_path.display(), ft);
 
-        let games = match ft {
-            FileType::Wthor => read_wthor_file(file_path)?,
-            FileType::Pgn => read_pgn_file(file_path)?,
-            FileType::Unknown => {
-                eprintln!("  Unknown file type, skipping");
-                continue;
-            }
-        };
+            let games = match ft {
+                FileType::Wthor => read_wthor_file(file_path)?,
+                FileType::Pgn => read_pgn_file(file_path)?,
+            };
 
-        eprintln!(
-            "  Loaded {} games, {} positions",
-            games.len(),
-            games.iter().map(|g| g.positions.len()).sum::<usize>()
-        );
-        all_games.extend(games);
+            eprintln!(
+                "  Loaded {} games, {} positions",
+                games.len(),
+                games.iter().map(|g| g.positions.len()).sum::<usize>()
+            );
+            all_games.extend(games);
+        } else {
+            eprintln!("  Unknown file type, skipping");
+        }
     }
 
     eprintln!(
