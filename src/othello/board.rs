@@ -11,15 +11,20 @@ pub struct Board {
     pub black_to_move: bool,
 }
 
+impl Board {
+    /// Count empty cells on this board.
+    pub fn empties(&self) -> u32 {
+        self.position.empties()
+    }
+}
+
 /// Extract all positions from loaded games, filtered to those with empties <= max_empties.
 pub fn extract_positions(games: &[Game], max_empties: u32) -> Vec<Board> {
     let mut positions = Vec::new();
 
     for game in games {
         for pos in &game.positions {
-            let empties = 64_u32
-                .saturating_sub(pos.position.player.count_ones())
-                .saturating_sub(pos.position.opponent.count_ones());
+            let empties = pos.empties();
             if empties <= max_empties {
                 positions.push(pos.clone());
             }
@@ -27,4 +32,41 @@ pub fn extract_positions(games: &[Game], max_empties: u32) -> Vec<Board> {
     }
 
     positions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_board_empties_initial() {
+        let board = Board {
+            position: Position::initial(),
+            black_to_move: true,
+        };
+        assert_eq!(board.empties(), 60);
+    }
+
+    #[test]
+    fn test_board_empties_empty_board() {
+        let board = Board {
+            position: Position::new(),
+            black_to_move: true,
+        };
+        assert_eq!(board.empties(), 64);
+    }
+
+    #[test]
+    fn test_board_empties_full_board() {
+        let mut pos = Position::new();
+        // Fill the board: place discs in all 64 cells (alternating sides just to fill)
+        for i in 0..64 {
+            pos.place_disc(i);
+        }
+        let board = Board {
+            position: pos,
+            black_to_move: true,
+        };
+        assert_eq!(board.empties(), 0);
+    }
 }

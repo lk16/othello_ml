@@ -8,7 +8,6 @@ Conventions established during the restructuring of this project.
 - **Concise docstrings** — specific to the function or module, not redundant with the name. Module-level docs cover cross-cutting concerns.
 - **Avoid long functions and deep nesting.** When a function exceeds ~60 lines or takes 5+ parameters, extract helpers or introduce a config struct.
 - **Avoid wrapper structs** that only delegate to another type (e.g. `WeightIO`). Put the functions directly on the owning struct.
-- **Table-driven tests** where a function has many input/output pairs.
 
 ## Commands
 
@@ -21,6 +20,8 @@ Conventions established during the restructuring of this project.
 
 ## Testing
 
+- **Add tests when adding or modifying functions.** Correctness is critical — every new `pub fn` or behavior change should have at least a basic test.
+- Use **Table-driven tests** where appropriate: a function has many input/output pairs.
 - **Self-contained tests** — don't rely on files outside the repo. Add small sample files to `test_data/` when needed.
 
 ## Documentation
