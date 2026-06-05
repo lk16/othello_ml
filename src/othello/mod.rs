@@ -1,7 +1,7 @@
 pub mod board;
 pub mod game;
-pub mod positions;
+pub mod position;
 
-pub use board::{Board, Cell};
+pub use board::{extract_positions, Board};
 pub use game::{load_games, Game};
-pub use positions::{extract_positions, Position};
+pub use position::{Cell, Position};

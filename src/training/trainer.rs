@@ -1,4 +1,4 @@
-use crate::othello::board::Board;
+use crate::othello::position::Position;
 use crate::training::weights::Weights;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -6,7 +6,7 @@ use std::time::Instant;
 /// Training data point: a board position paired with its ground truth evaluation.
 #[derive(Debug, Clone)]
 pub struct TrainingExample {
-    pub board: Board,
+    pub position: Position,
     pub target_score: i32, // Ground truth score from Edax
 }
 
@@ -85,7 +85,7 @@ impl Trainer {
 
         for example in examples {
             // Forward pass: compute prediction
-            let predicted = weights.evaluate(&example.board, &features);
+            let predicted = weights.evaluate(&example.position, &features);
             let error = example.target_score as f32 - predicted;
             loss += (error as f64) * (error as f64);
 
@@ -101,12 +101,12 @@ impl Trainer {
             // weight's contribution sensible and prevents overshoot.
             let gradient = 2.0 * error / n_features;
 
-            let feature_indices = features.extract(&example.board);
+            let feature_indices = features.extract(&example.position);
             for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
                 weights.update_weight_sgd(
                     feat_idx,
                     pattern_idx,
-                    example.board.empties(),
+                    example.position.empties(),
                     effective_lr,
                     gradient,
                 );
@@ -267,9 +267,9 @@ mod tests {
 
     #[test]
     fn test_training_example() {
-        let board = Board::initial();
+        let position = Position::initial();
         let example = TrainingExample {
-            board,
+            position,
             target_score: 10,
         };
         assert_eq!(example.target_score, 10);

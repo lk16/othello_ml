@@ -1,4 +1,4 @@
-use crate::othello::board::Board;
+use crate::othello::position::Position;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -40,7 +40,7 @@ impl EdaxInterface {
     /// Returns a `Vec<i32>` of scores, one per position, in the same order.
     /// Scores are from the side-to-move perspective.
     pub fn batch_evaluate(
-        positions: &[Board],
+        positions: &[Position],
         level: u32,
         edax_path: &str,
         edax_threads: usize,
@@ -52,9 +52,9 @@ impl EdaxInterface {
 
         // Classify each position: game-end, pass, or normal
         enum Action {
-            Normal(Board),
-            Pass(Board),  // passed board (swapped sides)
-            GameEnd(i32), // exact final score
+            Normal(Position),
+            Pass(Position), // passed board (swapped sides)
+            GameEnd(i32),   // exact final score
         }
 
         let actions: Vec<Action> = positions
@@ -71,7 +71,7 @@ impl EdaxInterface {
             .collect();
 
         // Collect only the positions that need Edax evaluation
-        let edax_boards: Vec<Board> = actions
+        let edax_boards: Vec<Position> = actions
             .iter()
             .filter_map(|a| match a {
                 Action::Normal(b) | Action::Pass(b) => Some(*b),
@@ -95,7 +95,7 @@ impl EdaxInterface {
                     break;
                 }
                 let end = usize::min(start + chunk_size, edax_boards.len());
-                let subset: Vec<Board> = edax_boards[start..end].to_vec();
+                let subset: Vec<Position> = edax_boards[start..end].to_vec();
                 let path = edax_path.clone();
 
                 handles.push((
@@ -153,7 +153,11 @@ impl EdaxInterface {
     ///
     /// All boards must have legal moves for the side to move — game-ends and
     /// passes must be handled by the caller before reaching this function.
-    fn run_edax_solve(boards: &[Board], level: u32, edax_path: &str) -> Result<Vec<i32>, String> {
+    fn run_edax_solve(
+        boards: &[Position],
+        level: u32,
+        edax_path: &str,
+    ) -> Result<Vec<i32>, String> {
         let n = boards.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -209,7 +213,7 @@ impl EdaxInterface {
 
     /// Run a single Edax -solve process on a small chunk of boards.
     fn run_edax_solve_chunk(
-        boards: &[Board],
+        boards: &[Position],
         level: u32,
         edax_path: &str,
     ) -> Result<Vec<i32>, String> {
@@ -275,7 +279,7 @@ impl EdaxInterface {
     ///
     /// Always normalizes so `X` is the side to move, `O` is the opponent.
     /// `board.player` = side to move → `X`, `board.opponent` → `O`.
-    fn board_to_problem(board: &Board) -> String {
+    fn board_to_problem(board: &Position) -> String {
         let mut squares = String::with_capacity(70); // 64 squares + " X;\n" + margin
         for i in 0..64 {
             let bit = 1u64 << i;
@@ -386,7 +390,7 @@ impl EdaxInterface {
 /// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
 ///   `X` = black disc, `O` = white disc, `-` = empty
 /// Followed by a space and the side to move (`X` for black, `O` for white).
-pub fn board_to_fen(board: &Board, black_to_move: bool) -> String {
+pub fn board_to_fen(board: &Position, black_to_move: bool) -> String {
     let mut fen = String::with_capacity(66);
     for i in 0..64 {
         let bit = 1u64 << i;
@@ -426,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_board_to_problem_initial() {
-        let board = Board::initial();
+        let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
 
         // Should end with " X;\n"
@@ -444,7 +448,7 @@ mod tests {
     fn test_board_to_problem_normalizes_to_x() {
         // Even with black_to_move=false, board_to_problem always uses X
         // for the side to move (player)
-        let board = Board::initial();
+        let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
         // Player = side to move → X, always
         assert!(problem.ends_with(" X;\n"));
@@ -452,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_board_to_fen_initial() {
-        let board = Board::initial();
+        let board = Position::initial();
         let fen = board_to_fen(&board, true);
 
         assert_eq!(fen.len(), 66);
@@ -468,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_board_to_fen_white_to_move() {
-        let board = Board::initial();
+        let board = Position::initial();
         let fen = board_to_fen(&board, false);
         let (board_part, side) = split_fen(&fen);
 
@@ -480,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_board_to_fen_empty() {
-        let board = Board::new();
+        let board = Position::new();
         let fen = board_to_fen(&board, true);
         let (board_part, side) = split_fen(&fen);
 
@@ -492,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_fen_board_order() {
-        let board = Board::new();
+        let board = Position::new();
         let fen = board_to_fen(&board, true);
         assert_eq!(fen.len(), 66);
     }

@@ -1,4 +1,4 @@
-use crate::othello::board::Board;
+use crate::othello::position::Position;
 
 /// Represents the 47 Edax features used for position evaluation.
 /// Each feature is a subset of board cells that forms a pattern.
@@ -98,7 +98,7 @@ impl Features {
     /// Extract feature indices from a board position
     /// Returns vector of indices for each feature, where each index represents
     /// the configuration of that feature's cells
-    pub fn extract(&self, board: &Board) -> Vec<u32> {
+    pub fn extract(&self, board: &Position) -> Vec<u32> {
         self.features
             .iter()
             .map(|feature| feature.extract_index(board))
@@ -132,15 +132,15 @@ impl Feature {
     /// Extract this feature's index from the board
     /// Each cell contributes a trinary value: 0 (empty), 1 (player), 2 (opponent)
     /// Index = sum of (value * 3^position) for each cell
-    pub fn extract_index(&self, board: &Board) -> u32 {
+    pub fn extract_index(&self, board: &Position) -> u32 {
         let mut index = 0u32;
         let mut power = 1u32;
 
         for &cell in &self.cells {
             let value = match board.get_cell(cell) {
-                crate::othello::board::Cell::Empty => 0,
-                crate::othello::board::Cell::Player => 1,
-                crate::othello::board::Cell::Opponent => 2,
+                crate::othello::position::Cell::Empty => 0,
+                crate::othello::position::Cell::Player => 1,
+                crate::othello::position::Cell::Opponent => 2,
             };
             index += value * power;
             power *= 3;
@@ -161,10 +161,10 @@ mod tests {
 
     #[test]
     fn test_feature_extraction() {
-        let board = Board::initial();
+        let board = Position::initial();
         let feature = Feature::new("test", vec![0, 1, 2]);
 
-        // Board has cells 0,1,2 empty initially
+        // Position has cells 0,1,2 empty initially
         let idx = feature.extract_index(&board);
         assert_eq!(idx, 0); // All empty = index 0
     }

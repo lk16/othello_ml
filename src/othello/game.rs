@@ -11,15 +11,15 @@
 //
 // Supports loading individual files or recursively scanning directories.
 
-use crate::othello::board::{Board, Cell};
-use crate::othello::positions::Position;
+use crate::othello::board::Board;
+use crate::othello::position::{Cell, Position};
 use std::fs;
 use std::path::Path;
 
 /// A complete game loaded from a file.
 #[derive(Debug, Clone)]
 pub struct Game {
-    pub positions: Vec<Position>,
+    pub positions: Vec<Board>,
     pub black_name: Option<String>,
     pub white_name: Option<String>,
     pub result_score: Option<String>,
@@ -101,7 +101,7 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<Game>, String> {
 
         // Replay the game to generate board positions
         let mut positions = Vec::new();
-        let mut board = Board::initial();
+        let mut board = Position::initial();
         let mut black_to_move = true;
 
         for &mv in moves.iter() {
@@ -134,8 +134,8 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<Game>, String> {
             flip_discs(&mut board, cell as u32);
 
             // Record the position BEFORE the move (the position the player faced)
-            let faced = Position {
-                board: Board {
+            let faced = Board {
+                position: Position {
                     player: if black_to_move {
                         board.player
                     } else {
@@ -170,7 +170,7 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<Game>, String> {
 }
 
 /// Flip opponent discs in all 8 directions after placing a disc at `cell`.
-fn flip_discs(board: &mut Board, cell: u32) {
+fn flip_discs(board: &mut Position, cell: u32) {
     let directions: [(i32, i32); 8] = [
         (-1, -1),
         (0, -1),
@@ -281,7 +281,7 @@ where
 
     // Replay moves to generate board positions
     let mut positions = Vec::new();
-    let mut board = Board::initial();
+    let mut board = Position::initial();
     let mut black_to_move = true;
 
     for line in &move_lines {
@@ -314,8 +314,8 @@ where
                 }
 
                 // Record position BEFORE the move
-                let faced = Position {
-                    board: Board {
+                let faced = Board {
+                    position: Position {
                         player: if black_to_move {
                             board.player
                         } else {

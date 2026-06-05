@@ -9,7 +9,7 @@ use crate::training::features::Features;
 ///
 /// Weights are stored as f32 internally for precise SGD updates.
 ///
-/// Position evaluation = sum of all feature weights for the current board state.
+/// Board evaluation = sum of all feature weights for the current board state.
 pub struct Weights {
     // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
     feature_weights: Vec<Vec<Vec<f32>>>,
@@ -61,7 +61,7 @@ impl Weights {
     }
 
     /// Evaluate a board position by summing contributions from all features
-    pub fn evaluate(&self, board: &crate::othello::board::Board, features: &Features) -> f32 {
+    pub fn evaluate(&self, board: &crate::othello::position::Position, features: &Features) -> f32 {
         let empties = board.empties();
         let range_idx = self.empty_range_index(empties);
         let feature_indices = features.extract(board);

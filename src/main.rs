@@ -1,5 +1,5 @@
 use othello_eval::{
-    board_to_fen, edax_available, extract_positions, load_games, Board, EdaxInterface, Features,
+    board_to_fen, edax_available, extract_positions, load_games, EdaxInterface, Features, Position,
     Trainer, TrainingExample, Weights,
 };
 use std::collections::HashMap;
@@ -160,13 +160,13 @@ fn main() {
             eprintln!("Loaded {} evaluations", eval_map.len());
 
             let mut examples = Vec::with_capacity(positions.len());
-            let mut missing_positions: Vec<&othello_eval::Position> = Vec::new();
+            let mut missing_positions: Vec<&othello_eval::Board> = Vec::new();
             for pos in &positions {
-                let fen = board_to_fen(&pos.board, pos.black_to_move);
+                let fen = board_to_fen(&pos.position, pos.black_to_move);
                 match eval_map.get(&fen) {
                     Some(&score) => {
                         examples.push(TrainingExample {
-                            board: pos.board,
+                            position: pos.position,
                             target_score: score,
                         });
                     }
@@ -181,8 +181,8 @@ fn main() {
                 eprintln!(
                     "Computing {n_missing} missing positions with Edax (level {edax_level})..."
                 );
-                let missing_boards: Vec<Board> =
-                    missing_positions.iter().map(|p| p.board).collect();
+                let missing_boards: Vec<Position> =
+                    missing_positions.iter().map(|p| p.position).collect();
                 let scores = EdaxInterface::batch_evaluate(
                     &missing_boards,
                     edax_level,
@@ -202,7 +202,7 @@ fn main() {
 
                 for (pos, &score) in missing_positions.iter().zip(scores.iter()) {
                     examples.push(TrainingExample {
-                        board: pos.board,
+                        position: pos.position,
                         target_score: score,
                     });
                 }
@@ -217,7 +217,7 @@ fn main() {
             eprintln!("Submitting {n} positions to Edax...");
 
             let eval_start = std::time::Instant::now();
-            let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
+            let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
             let scores =
                 EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads)
                     .unwrap_or_else(|e| {
@@ -236,7 +236,7 @@ fn main() {
                 .iter()
                 .zip(scores.iter())
                 .map(|(pos, &score)| TrainingExample {
-                    board: pos.board,
+                    position: pos.position,
                     target_score: score,
                 })
                 .collect();
@@ -256,7 +256,7 @@ fn main() {
         eprintln!("Submitting {n} positions to Edax...");
 
         let eval_start = std::time::Instant::now();
-        let boards: Vec<Board> = positions.iter().map(|p| p.board).collect();
+        let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
         let scores = EdaxInterface::batch_evaluate(&boards, edax_level, &edax_path, edax_threads)
             .unwrap_or_else(|e| {
                 eprintln!("Edax evaluation failed: {e}");
@@ -274,7 +274,7 @@ fn main() {
             .iter()
             .zip(scores.iter())
             .map(|(pos, &score)| TrainingExample {
-                board: pos.board,
+                position: pos.position,
                 target_score: score,
             })
             .collect()
@@ -308,7 +308,7 @@ fn main() {
 
     // Show some learned weights for corner features
     eprintln!("\n--- Sample learned weights (feature 0 = A1 corner, empty=60) ---");
-    let board = Board::initial();
+    let board = Position::initial();
     let feature_indices = features.extract(&board);
     for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate().take(10) {
         let w = weights.get_weight(feat_idx, pattern_idx, 60);
@@ -422,7 +422,7 @@ fn load_eval_file(path: &str) -> Result<HashMap<String, i32>, String> {
 /// Append evaluations for a subset of positions to an existing eval file.
 fn append_eval_file(
     path: &str,
-    positions: &[&othello_eval::Position],
+    positions: &[&othello_eval::Board],
     scores: &[i32],
 ) -> Result<(), String> {
     let mut file = fs::OpenOptions::new()
@@ -430,7 +430,7 @@ fn append_eval_file(
         .open(path)
         .map_err(|e| format!("Failed to open {path} for appending: {e}"))?;
     for (pos, &score) in positions.iter().zip(scores.iter()) {
-        let fen = board_to_fen(&pos.board, pos.black_to_move);
+        let fen = board_to_fen(&pos.position, pos.black_to_move);
         writeln!(file, "{fen} {score}").map_err(|e| format!("Failed to write eval file: {e}"))?;
     }
     Ok(())
@@ -441,12 +441,12 @@ fn append_eval_file(
 /// Uses positions to recover the `black_to_move` flag needed for FEN generation.
 fn save_eval_from_positions(
     path: &str,
-    positions: &[othello_eval::Position],
+    positions: &[othello_eval::Board],
     examples: &[TrainingExample],
 ) -> Result<(), String> {
     let mut file = fs::File::create(path).map_err(|e| format!("Failed to create {path}: {e}"))?;
     for (pos, ex) in positions.iter().zip(examples.iter()) {
-        let fen = board_to_fen(&pos.board, pos.black_to_move);
+        let fen = board_to_fen(&pos.position, pos.black_to_move);
         writeln!(file, "{} {}", fen, ex.target_score)
             .map_err(|e| format!("Failed to write eval file: {e}"))?;
     }
