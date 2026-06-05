@@ -371,15 +371,14 @@ impl EdaxInterface {
                 }
             }
 
-            match last_score {
-                Some(score) => scores.push(score),
-                None => {
-                    return Err(format!(
-                        "No score found in problem block {}. Block content:\n{}",
-                        scores.len() + 1,
-                        &block[..block.len().min(500)]
-                    ));
-                }
+            if let Some(score) = last_score {
+                scores.push(score);
+            } else {
+                return Err(format!(
+                    "No score found in problem block {}. Block content:\n{}",
+                    scores.len() + 1,
+                    &block[..block.len().min(500)]
+                ));
             }
         }
 
