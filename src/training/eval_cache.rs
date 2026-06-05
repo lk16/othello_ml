@@ -113,14 +113,12 @@ impl EvalCache {
     pub fn build_examples(
         &self,
         positions: &[Board],
-        edax_level: u32,
-        edax_path: &str,
-        edax_threads: usize,
+        edax: &EdaxInterface,
     ) -> Vec<TrainingExample> {
         if self.exists() {
-            self.build_from_existing(positions, edax_level, edax_path, edax_threads)
+            self.build_from_existing(positions, edax)
         } else {
-            self.build_fresh(positions, edax_level, edax_path, edax_threads)
+            self.build_fresh(positions, edax)
         }
     }
 
@@ -128,9 +126,7 @@ impl EvalCache {
     fn build_from_existing(
         &self,
         positions: &[Board],
-        edax_level: u32,
-        edax_path: &str,
-        edax_threads: usize,
+        edax: &EdaxInterface,
     ) -> Vec<TrainingExample> {
         eprintln!("\n--- Loading evaluations from {} ---", self.path);
         let eval_map = self.load_map().unwrap_or_else(|e| {
@@ -154,14 +150,15 @@ impl EvalCache {
 
         if !missing.is_empty() {
             let n = missing.len();
-            eprintln!("Computing {n} missing positions with Edax (level {edax_level})...");
+            eprintln!(
+                "Computing {n} missing positions with Edax (level {})...",
+                edax.level
+            );
             let boards: Vec<Position> = missing.iter().map(|p| p.position).collect();
-            let scores =
-                EdaxInterface::batch_evaluate(&boards, edax_level, edax_path, edax_threads)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Edax evaluation failed: {e}");
-                        std::process::exit(1);
-                    });
+            let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
+                eprintln!("Edax evaluation failed: {e}");
+                std::process::exit(1);
+            });
 
             self.append(&missing, &scores).unwrap_or_else(|e| {
                 eprintln!("Error appending to eval file: {e}");
@@ -180,27 +177,20 @@ impl EvalCache {
     }
 
     /// Evaluate all positions with Edax and create a new cache file.
-    fn build_fresh(
-        &self,
-        positions: &[Board],
-        edax_level: u32,
-        edax_path: &str,
-        edax_threads: usize,
-    ) -> Vec<TrainingExample> {
+    fn build_fresh(&self, positions: &[Board], edax: &EdaxInterface) -> Vec<TrainingExample> {
         eprintln!(
-            "\n--- Evaluating positions with Edax (level {edax_level}) → saving to {} ---",
-            self.path
+            "\n--- Evaluating positions with Edax (level {}) → saving to {} ---",
+            edax.level, self.path
         );
         let n = positions.len();
         eprintln!("Submitting {n} positions to Edax...");
 
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = EdaxInterface::batch_evaluate(&boards, edax_level, edax_path, edax_threads)
-            .unwrap_or_else(|e| {
-                eprintln!("Edax evaluation failed: {e}");
-                std::process::exit(1);
-            });
+        let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
+            eprintln!("Edax evaluation failed: {e}");
+            std::process::exit(1);
+        });
 
         let elapsed = eval_start.elapsed();
         eprintln!(
@@ -237,24 +227,24 @@ impl EvalCache {
 pub fn build_examples(
     eval_file: &Option<String>,
     positions: &[Board],
-    edax_level: u32,
-    edax_path: &str,
-    edax_threads: usize,
+    edax: &EdaxInterface,
 ) -> Vec<TrainingExample> {
     if let Some(ref path) = eval_file {
         let cache = EvalCache::new(path.clone());
-        cache.build_examples(positions, edax_level, edax_path, edax_threads)
+        cache.build_examples(positions, edax)
     } else {
-        eprintln!("\n--- Evaluating positions with Edax (level {edax_level}) ---");
+        eprintln!(
+            "\n--- Evaluating positions with Edax (level {}) ---",
+            edax.level
+        );
         let n = positions.len();
         eprintln!("Submitting {n} positions to Edax...");
         let eval_start = std::time::Instant::now();
         let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = EdaxInterface::batch_evaluate(&boards, edax_level, edax_path, edax_threads)
-            .unwrap_or_else(|e| {
-                eprintln!("Edax evaluation failed: {e}");
-                std::process::exit(1);
-            });
+        let scores = edax.batch_evaluate(&boards).unwrap_or_else(|e| {
+            eprintln!("Edax evaluation failed: {e}");
+            std::process::exit(1);
+        });
         let elapsed = eval_start.elapsed();
         eprintln!(
             "  Done in {:.1}s ({:.0} pos/s)",

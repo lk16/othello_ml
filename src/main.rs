@@ -1,5 +1,6 @@
 use othello_eval::{
-    build_examples, edax_available, load_games, Features, Trainer, TrainingConfig, Weights,
+    build_examples, edax_available, load_games, EdaxInterface, Features, Trainer, TrainingConfig,
+    Weights,
 };
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,14 +159,9 @@ fn main() {
     }
     let edax_path =
         env::var("EDAX_PATH").expect("EDAX_PATH should be set (checked by edax_available)");
+    let edax = EdaxInterface::new(edax_path, args.edax_level, args.edax_threads);
 
-    let mut examples = build_examples(
-        &args.eval_file,
-        &positions,
-        args.edax_level,
-        &edax_path,
-        args.edax_threads,
-    );
+    let mut examples = build_examples(&args.eval_file, &positions, &edax);
     eprintln!("Training examples: {}", examples.len());
 
     // Train

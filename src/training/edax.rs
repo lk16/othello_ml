@@ -22,7 +22,11 @@ use std::thread;
 /// and `-` for empty cells. The side to move is always normalized to `X`.
 /// This means evaluations are always from the side-to-move perspective,
 /// matching the training target convention.
-pub struct EdaxInterface;
+pub struct EdaxInterface {
+    pub path: String,
+    pub level: u32,
+    pub threads: usize,
+}
 
 /// Progress update sent from an Edax solver thread to the parent.
 struct Progress {
@@ -32,6 +36,15 @@ struct Progress {
 }
 
 impl EdaxInterface {
+    /// Create a new Edax interface.
+    pub fn new(path: String, level: u32, threads: usize) -> Self {
+        EdaxInterface {
+            path,
+            level,
+            threads,
+        }
+    }
+
     /// Evaluate a batch of positions.
     ///
     /// Each board's `player` bitboard is the side to move.
@@ -42,17 +55,11 @@ impl EdaxInterface {
     ///      evaluate the passed position, negate the result
     ///   3. **Normal** → send to Edax as-is
     ///
-    /// `edax_path` is the path to the Edax binary.
     /// `level` is the search level (0–60, must be even).
     ///
     /// Returns a `Vec<i32>` of scores, one per position, in the same order.
     /// Scores are from the side-to-move perspective.
-    pub fn batch_evaluate(
-        positions: &[Position],
-        level: u32,
-        edax_path: &str,
-        edax_threads: usize,
-    ) -> Result<Vec<i32>, String> {
+    pub fn batch_evaluate(&self, positions: &[Position]) -> Result<Vec<i32>, String> {
         let n = positions.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -90,7 +97,7 @@ impl EdaxInterface {
         let edax_scores = if edax_boards.is_empty() {
             Vec::new()
         } else {
-            Self::run_with_progress(&edax_boards, level, edax_path, edax_threads)?
+            self.run_with_progress(&edax_boards)?
         };
 
         // Map scores back to the original order
@@ -108,22 +115,18 @@ impl EdaxInterface {
     }
 
     /// Run Edax solvers in background threads, printing progress from the parent.
-    fn run_with_progress(
-        boards: &[Position],
-        level: u32,
-        edax_path: &str,
-        threads: usize,
-    ) -> Result<Vec<i32>, String> {
+    fn run_with_progress(&self, boards: &[Position]) -> Result<Vec<i32>, String> {
         let n = boards.len();
-        let effective_threads = if threads <= 1 || n < threads * 2 {
+        let effective_threads = if self.threads <= 1 || n < self.threads * 2 {
             1
         } else {
-            threads
+            self.threads
         };
 
         let (tx, rx) = mpsc::channel();
         let chunk_size = n.div_ceil(effective_threads);
-        let path_owned = edax_path.to_string();
+        let path_owned = self.path.clone();
+        let level = self.level;
         let mut handles = Vec::with_capacity(effective_threads);
 
         for thread_id in 0..effective_threads {
