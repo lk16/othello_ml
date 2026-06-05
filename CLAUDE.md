@@ -17,6 +17,7 @@ Always use `pre-commit run -a` — not `cargo check` directly. It runs check, fm
 - `test_data/` — sample files for self-contained tests
 
 See [docs/reference.md](docs/reference.md) for detailed architecture and file formats.
+See [docs/best-practices.md](docs/best-practices.md) for project conventions.
 
 ## Guidelines
 
