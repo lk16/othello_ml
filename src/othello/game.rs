@@ -534,4 +534,18 @@ mod tests {
         let games = parse_pgn_multi(pgn);
         assert!(games.is_empty());
     }
+
+    #[test]
+    fn test_read_wthor_file_sample() {
+        let path = std::path::Path::new("test_data/sample.wtb");
+        let games = read_wthor_file(path).expect("failed to read sample WTB");
+        assert!(
+            !games.is_empty(),
+            "sample WTB should contain at least one game"
+        );
+        assert!(
+            !games[0].positions.is_empty(),
+            "game should have generated positions"
+        );
+    }
 }

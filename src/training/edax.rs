@@ -1,6 +1,7 @@
 use crate::othello::position::Position;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 /// Interface to the Edax engine for obtaining ground truth position evaluations.
@@ -22,6 +23,13 @@ use std::thread;
 /// This means evaluations are always from the side-to-move perspective,
 /// matching the training target convention.
 pub struct EdaxInterface;
+
+/// Progress update sent from an Edax solver thread to the parent.
+struct Progress {
+    thread_id: usize,
+    done: usize,
+    total: usize,
+}
 
 impl EdaxInterface {
     /// Evaluate a batch of positions.
@@ -53,8 +61,8 @@ impl EdaxInterface {
         // Classify each position: game-end, pass, or normal
         enum Action {
             Normal(Position),
-            Pass(Position), // passed board (swapped sides)
-            GameEnd(i32),   // exact final score
+            Pass(Position),
+            GameEnd(i32),
         }
 
         let actions: Vec<Action> = positions
@@ -81,51 +89,8 @@ impl EdaxInterface {
 
         let edax_scores = if edax_boards.is_empty() {
             Vec::new()
-        } else if edax_threads <= 1 || edax_boards.len() < edax_threads * 2 {
-            Self::run_edax_solve(&edax_boards, level, edax_path)?
         } else {
-            // Split boards across threads, each with its own Edax processes
-            let chunk_size = edax_boards.len().div_ceil(edax_threads);
-            let edax_path = edax_path.to_string();
-            let mut handles = Vec::with_capacity(edax_threads);
-
-            for thread_idx in 0..edax_threads {
-                let start = thread_idx * chunk_size;
-                if start >= edax_boards.len() {
-                    break;
-                }
-                let end = usize::min(start + chunk_size, edax_boards.len());
-                let subset: Vec<Position> = edax_boards[start..end].to_vec();
-                let path = edax_path.clone();
-
-                handles.push((
-                    thread_idx,
-                    thread::spawn(move || EdaxInterface::run_edax_solve(&subset, level, &path)),
-                ));
-            }
-
-            eprintln!(
-                "  {} Edax threads processing {} positions ({} chunks/thread)",
-                handles.len(),
-                edax_boards.len(),
-                chunk_size.div_ceil(EdaxInterface::CHUNK_SIZE),
-            );
-
-            let n_threads = handles.len();
-            let mut results: Vec<Option<Vec<i32>>> = vec![None; n_threads];
-            for (idx, handle) in handles {
-                match handle.join() {
-                    Ok(Ok(scores)) => results[idx] = Some(scores),
-                    Ok(Err(e)) => {
-                        return Err(format!("Edax thread {idx} failed: {e}"));
-                    }
-                    Err(_) => {
-                        return Err(format!("Edax thread {idx} panicked"));
-                    }
-                }
-            }
-
-            results.into_iter().flatten().flatten().collect()
+            Self::run_with_progress(&edax_boards, level, edax_path, edax_threads)?
         };
 
         // Map scores back to the original order
@@ -142,6 +107,100 @@ impl EdaxInterface {
         Ok(scores)
     }
 
+    /// Run Edax solvers in background threads, printing progress from the parent.
+    fn run_with_progress(
+        boards: &[Position],
+        level: u32,
+        edax_path: &str,
+        threads: usize,
+    ) -> Result<Vec<i32>, String> {
+        let n = boards.len();
+        let effective_threads = if threads <= 1 || n < threads * 2 {
+            1
+        } else {
+            threads
+        };
+
+        if effective_threads == 1 {
+            let (tx, rx) = mpsc::channel();
+            let boards_owned = boards.to_vec();
+            let path_owned = edax_path.to_string();
+            let handle = thread::spawn(move || {
+                Self::run_edax_solve(&boards_owned, level, &path_owned, 0, &tx)
+            });
+            // tx is owned by the thread and dropped when it finishes → rx terminates
+            for p in rx {
+                if p.total > 1 {
+                    let pct = p.done * 100 / p.total;
+                    eprint!(
+                        "\r  Edax: [{:3}%] {}/{} pos          ",
+                        pct, p.done, p.total
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+            }
+            if n > Self::CHUNK_SIZE {
+                eprintln!();
+            }
+
+            handle
+                .join()
+                .map_err(|_| "Edax thread panicked".to_string())?
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let chunk_size = n.div_ceil(effective_threads);
+            let path_owned = edax_path.to_string();
+            let mut handles = Vec::with_capacity(effective_threads);
+
+            for thread_id in 0..effective_threads {
+                let start = thread_id * chunk_size;
+                if start >= n {
+                    break;
+                }
+                let end = usize::min(start + chunk_size, n);
+                let subset = boards[start..end].to_vec();
+                let path = path_owned.clone();
+                let tx = tx.clone();
+
+                handles.push(thread::spawn(move || {
+                    Self::run_edax_solve(&subset, level, &path, thread_id, &tx)
+                }));
+            }
+
+            drop(tx);
+
+            eprintln!(
+                "  {} Edax threads processing {} positions ({} chunks/thread)",
+                handles.len(),
+                n,
+                chunk_size.div_ceil(Self::CHUNK_SIZE),
+            );
+
+            // Aggregate progress from all threads
+            let mut per_thread_done = vec![0usize; handles.len()];
+            for p in rx {
+                per_thread_done[p.thread_id] = p.done;
+                let total_done: usize = per_thread_done.iter().sum();
+                let pct = total_done * 100 / n;
+                eprint!("\r  Edax: [{pct:3}%] {total_done}/{n} pos          ");
+                let _ = std::io::stderr().flush();
+            }
+            eprintln!();
+
+            // Collect results
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(scores)) => results.push(scores),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err("Edax thread panicked".to_string()),
+                }
+            }
+
+            Ok(results.into_iter().flatten().collect())
+        }
+    }
+
     /// Default number of positions per Edax process chunk.
     ///
     /// Each chunk spawns a separate Edax process, writes positions to stdin,
@@ -149,7 +208,7 @@ impl EdaxInterface {
     /// buffers on large datasets (2M+ positions).
     const CHUNK_SIZE: usize = 100;
 
-    /// Run Edax -solve on a list of boards, chunking into separate processes.
+    /// Run Edax -solve on a list of boards, sending progress via `tx`.
     ///
     /// All boards must have legal moves for the side to move — game-ends and
     /// passes must be handled by the caller before reaching this function.
@@ -157,6 +216,8 @@ impl EdaxInterface {
         boards: &[Position],
         level: u32,
         edax_path: &str,
+        thread_id: usize,
+        tx: &Sender<Progress>,
     ) -> Result<Vec<i32>, String> {
         let n = boards.len();
         if n == 0 {
@@ -165,7 +226,6 @@ impl EdaxInterface {
 
         let num_chunks = n.div_ceil(Self::CHUNK_SIZE);
         let mut all_scores = Vec::with_capacity(n);
-        let chunk_start = std::time::Instant::now();
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * Self::CHUNK_SIZE;
@@ -185,27 +245,13 @@ impl EdaxInterface {
 
             all_scores.extend(scores);
 
-            // Progress with ETA
             if num_chunks > 1 {
-                let done = chunk_idx + 1;
-                let elapsed = chunk_start.elapsed().as_secs_f64().max(0.001);
-                let avg_per_chunk = elapsed / done as f64;
-                let remaining = avg_per_chunk * (num_chunks - done) as f64;
-                eprint!(
-                    "\r  [{:3}%] chunk {}/{} | {}/{} pos | ETA: {:.0}s          ",
-                    done * 100 / num_chunks,
-                    done,
-                    num_chunks,
-                    end,
-                    n,
-                    remaining
-                );
-                let _ = std::io::stderr().flush();
+                let _ = tx.send(Progress {
+                    thread_id,
+                    done: end,
+                    total: n,
+                });
             }
-        }
-
-        if num_chunks > 1 {
-            eprintln!();
         }
 
         Ok(all_scores)
@@ -279,7 +325,7 @@ impl EdaxInterface {
     ///
     /// Normalizes so `X` always represents the side to move and `O` the opponent.
     fn board_to_problem(board: &Position) -> String {
-        let mut squares = String::with_capacity(70); // 64 squares + " X;\n" + margin
+        let mut squares = String::with_capacity(70);
         for i in 0..64 {
             let bit = 1u64 << i;
             if board.player & bit != 0 {
@@ -304,8 +350,6 @@ impl EdaxInterface {
     fn parse_solve_output(stdout: &str, expected_count: usize) -> Result<Vec<i32>, String> {
         let mut scores = Vec::with_capacity(expected_count);
 
-        // Split on "*** problem" markers — each block is one position.
-        // The first element is text before the first marker (banner or empty).
         let blocks: Vec<&str> = stdout.split("*** problem").collect();
         let problems = if blocks.len() > 1 { &blocks[1..] } else { &[] };
 
@@ -362,23 +406,15 @@ impl EdaxInterface {
             return None;
         }
 
-        // First column must be depth[@confidence%]
-        if !columns[0].contains('@') && !columns[0].ends_with('%') {
-            // Could be just a depth number, but -verbose 3 includes @confidence
-        }
-
-        // Check that the first column looks like "N@M%" or "N"
         let first = columns[0];
         let has_at = first.contains('@');
         let has_pct = first.ends_with('%') || first.contains('%');
 
         if !has_at && !has_pct && first.parse::<u32>().is_err() {
-            return None; // Not a depth column — not a score line
+            return None;
         }
 
-        // Second column is the score: +12, -5, etc.
         let score_str = columns[1];
-        // Strip angle brackets sometimes used for exact scores: <+10>
         let score_str = score_str.trim_matches(|c: char| c == '<' || c == '>');
         score_str.parse::<i32>().ok()
     }
@@ -432,9 +468,7 @@ mod tests {
         let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
 
-        // Should end with " X;\n"
         assert!(problem.ends_with(" X;\n"));
-        // 64 squares + " X;\n" = 68 chars
         assert_eq!(problem.len(), 68);
 
         let squares = &problem[..64];
@@ -445,11 +479,8 @@ mod tests {
 
     #[test]
     fn test_board_to_problem_normalizes_to_x() {
-        // Even with black_to_move=false, board_to_problem always uses X
-        // for the side to move (player)
         let board = Position::initial();
         let problem = EdaxInterface::board_to_problem(&board);
-        // Player = side to move → X, always
         assert!(problem.ends_with(" X;\n"));
     }
 
