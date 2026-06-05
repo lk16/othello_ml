@@ -1,6 +1,7 @@
 # Best Practices
 
 Conventions established during the restructuring of this project.
+Each item should be descriptive enough that specific examples are unnecessary.
 
 ## Code quality
 
@@ -9,6 +10,7 @@ Conventions established during the restructuring of this project.
 - **Avoid long functions and deep nesting.** When a function exceeds ~60 lines or takes 5+ parameters, extract helpers or introduce a config struct.
 - **Prefer `if let Some(x) = opt { ... } else { return ... }`** over `match opt { Some(x) => ..., None => return ... }` when the `None` branch returns, breaks, or continues. This keeps the happy path indented and the early-exit visible. Same for `if let Ok(x)` vs `match` on `Result`.
 - **Prefer iterator combinators** (`iter().filter().map().collect()`) over manual `for` loops that accumulate into a collection. The intent is clearer and there's less mutable state.
+- **Prefer associated functions** on structs over free functions that take the struct as their first argument.
 - **Avoid wrapper structs** that only delegate to another type (e.g. `WeightIO`). Put the functions directly on the owning struct.
 
 ## Commands

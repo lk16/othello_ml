@@ -9,8 +9,6 @@ use crate::othello::position::{Cell, Position};
 use std::fs;
 use std::path::Path;
 
-use super::flip_discs;
-
 /// Convert a WTHOR move byte to an Edax cell index (0-63).
 ///
 /// WTHOR encodes moves as `10 * row + col + 1` with rows/cols 1-8.
@@ -115,7 +113,7 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<super::Game>, String> {
 
             // Place the disc and flip captured pieces
             board.player |= 1u64 << cell;
-            flip_discs(&mut board, cell as u32);
+            board.flip_discs(cell as u32);
 
             // Record the position BEFORE the move (the position the player faced)
             let faced = Board {

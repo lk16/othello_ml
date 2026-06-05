@@ -419,33 +419,6 @@ impl EdaxInterface {
     }
 }
 
-/// Convert a board to an Edax FEN string (used for eval file persistence).
-///
-/// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
-///   `X` = black disc, `O` = white disc, `-` = empty
-/// Followed by a space and the side to move (`X` for black, `O` for white).
-pub fn board_to_fen(board: &Position, black_to_move: bool) -> String {
-    let mut fen = String::with_capacity(66);
-    for i in 0..64 {
-        let bit = 1u64 << i;
-        let (is_black, is_white) = if black_to_move {
-            (board.player & bit != 0, board.opponent & bit != 0)
-        } else {
-            (board.opponent & bit != 0, board.player & bit != 0)
-        };
-        fen.push(if is_black {
-            'X'
-        } else if is_white {
-            'O'
-        } else {
-            '-'
-        });
-    }
-    fen.push(' ');
-    fen.push(if black_to_move { 'X' } else { 'O' });
-    fen
-}
-
 /// Check whether Edax is available (EDAX_PATH is set).
 pub fn edax_available() -> bool {
     std::env::var("EDAX_PATH").is_ok()
@@ -484,9 +457,9 @@ mod tests {
     }
 
     #[test]
-    fn test_board_to_fen_initial() {
+    fn test_position_to_fen_initial() {
         let board = Position::initial();
-        let fen = board_to_fen(&board, true);
+        let fen = board.to_fen(true);
 
         assert_eq!(fen.len(), 66);
         assert_eq!(&fen[64..65], " ");
@@ -500,9 +473,9 @@ mod tests {
     }
 
     #[test]
-    fn test_board_to_fen_white_to_move() {
+    fn test_position_to_fen_white_to_move() {
         let board = Position::initial();
-        let fen = board_to_fen(&board, false);
+        let fen = board.to_fen(false);
         let (board_part, side) = split_fen(&fen);
 
         assert_eq!(side, 'O');
@@ -512,9 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn test_board_to_fen_empty() {
+    fn test_position_to_fen_empty() {
         let board = Position::new();
-        let fen = board_to_fen(&board, true);
+        let fen = board.to_fen(true);
         let (board_part, side) = split_fen(&fen);
 
         assert_eq!(side, 'X');
@@ -526,7 +499,7 @@ mod tests {
     #[test]
     fn test_fen_board_order() {
         let board = Position::new();
-        let fen = board_to_fen(&board, true);
+        let fen = board.to_fen(true);
         assert_eq!(fen.len(), 66);
     }
 

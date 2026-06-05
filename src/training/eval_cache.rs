@@ -5,7 +5,7 @@
 
 use crate::othello::board::Board;
 use crate::othello::position::Position;
-use crate::training::edax::{board_to_fen, EdaxInterface};
+use crate::training::edax::EdaxInterface;
 use crate::training::trainer::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
@@ -81,7 +81,7 @@ impl EvalCache {
             .open(&self.path)
             .map_err(|e| format!("Failed to open {} for appending: {}", self.path, e))?;
         for (pos, &score) in positions.iter().zip(scores.iter()) {
-            let fen = board_to_fen(&pos.position, pos.black_to_move);
+            let fen = pos.position.to_fen(pos.black_to_move);
             writeln!(file, "{fen} {score}")
                 .map_err(|e| format!("Failed to write eval file: {e}"))?;
         }
@@ -97,7 +97,7 @@ impl EvalCache {
         let mut file = fs::File::create(&self.path)
             .map_err(|e| format!("Failed to create {}: {}", self.path, e))?;
         for (pos, ex) in positions.iter().zip(examples.iter()) {
-            let fen = board_to_fen(&pos.position, pos.black_to_move);
+            let fen = pos.position.to_fen(pos.black_to_move);
             writeln!(file, "{} {}", fen, ex.target_score)
                 .map_err(|e| format!("Failed to write eval file: {e}"))?;
         }
@@ -142,7 +142,7 @@ impl EvalCache {
         let mut examples = Vec::with_capacity(positions.len());
         let mut missing: Vec<&Board> = Vec::new();
         for pos in positions {
-            let fen = board_to_fen(&pos.position, pos.black_to_move);
+            let fen = pos.position.to_fen(pos.black_to_move);
             match eval_map.get(&fen) {
                 Some(&score) => examples.push(TrainingExample {
                     position: pos.position,

@@ -64,6 +64,53 @@ impl Position {
         self.player |= bit;
     }
 
+    /// Flip opponent discs in all 8 directions after placing a disc at `cell`.
+    ///
+    /// Scans outward from `cell` in each direction. When it finds a run of
+    /// opponent discs followed by one of the current player's discs, it flips
+    /// the run. Does nothing if no flanks are found.
+    pub fn flip_discs(&mut self, cell: u32) {
+        let directions: [(i32, i32); 8] = [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+
+        let x = (cell % 8) as i32;
+        let y = (cell / 8) as i32;
+
+        for &(dx, dy) in &directions {
+            let mut flips: u64 = 0;
+            let mut nx = x + dx;
+            let mut ny = y + dy;
+
+            while (0..8).contains(&nx) && (0..8).contains(&ny) {
+                let idx = (ny * 8 + nx) as u32;
+                let bit = 1u64 << idx;
+
+                if self.opponent & bit != 0 {
+                    flips |= bit;
+                } else if self.player & bit != 0 {
+                    // Found our own disc - flip the captured pieces
+                    self.player |= flips;
+                    self.opponent &= !flips;
+                    break;
+                } else {
+                    // Empty cell - no capture in this direction
+                    break;
+                }
+
+                nx += dx;
+                ny += dy;
+            }
+        }
+    }
+
     /// Get all occupied cells
     pub fn occupied(&self) -> u64 {
         self.player | self.opponent
@@ -151,6 +198,33 @@ impl Position {
         } else {
             0
         }
+    }
+
+    /// Convert to an Edax FEN string.
+    ///
+    /// 64 characters (A1..H1, A2..H2, …, A8..H8) using:
+    ///   `X` = black disc, `O` = white disc, `-` = empty
+    /// Followed by a space and the side to move (`X` for black, `O` for white).
+    pub fn to_fen(&self, black_to_move: bool) -> String {
+        let mut fen = String::with_capacity(66);
+        for i in 0..64 {
+            let bit = 1u64 << i;
+            let (is_black, is_white) = if black_to_move {
+                (self.player & bit != 0, self.opponent & bit != 0)
+            } else {
+                (self.opponent & bit != 0, self.player & bit != 0)
+            };
+            fen.push(if is_black {
+                'X'
+            } else if is_white {
+                'O'
+            } else {
+                '-'
+            });
+        }
+        fen.push(' ');
+        fen.push(if black_to_move { 'X' } else { 'O' });
+        fen
     }
 }
 

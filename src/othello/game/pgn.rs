@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use super::flip_discs;
-
 /// Convert a PlayOK-style field (e.g., "E6", "f4") to a cell index (0-63).
 fn field_to_index(field: &str) -> Option<u8> {
     if field.len() != 2 {
@@ -130,7 +128,7 @@ where
 
                 // Apply the move
                 board.player |= 1u64 << cell;
-                flip_discs(&mut board, cell as u32);
+                board.flip_discs(cell as u32);
 
                 // Switch sides
                 std::mem::swap(&mut board.player, &mut board.opponent);
