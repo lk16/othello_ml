@@ -484,21 +484,31 @@ mod tests {
 
     #[test]
     fn test_move_from_wthor() {
-        assert_eq!(move_from_wthor(11), 0); // A1
-        assert_eq!(move_from_wthor(18), 7); // H1
-        assert_eq!(move_from_wthor(21), 8); // A2
-        assert_eq!(move_from_wthor(28), 15); // H2
-        assert_eq!(move_from_wthor(81), 56); // A8
-        assert_eq!(move_from_wthor(88), 63); // H8
+        let cases = [
+            (11, 0),  // A1
+            (18, 7),  // H1
+            (21, 8),  // A2
+            (28, 15), // H2
+            (81, 56), // A8
+            (88, 63), // H8
+        ];
+        for (input, expected) in cases {
+            assert_eq!(move_from_wthor(input), expected, "move_from_wthor({input})");
+        }
     }
 
     #[test]
     fn test_field_to_index() {
-        assert_eq!(field_to_index("a1"), Some(0));
-        assert_eq!(field_to_index("h1"), Some(7));
-        assert_eq!(field_to_index("A2"), Some(8));
-        assert_eq!(field_to_index("H8"), Some(63));
-        assert_eq!(field_to_index("E6"), Some(4 + 5 * 8)); // e=4, 6=5 => 44
+        let cases = [
+            ("a1", Some(0)),
+            ("h1", Some(7)),
+            ("A2", Some(8)),
+            ("H8", Some(63)),
+            ("E6", Some(44)), // e=4, 6=5 → 44
+        ];
+        for (input, expected) in cases {
+            assert_eq!(field_to_index(input), expected, "field_to_index({input:?})");
+        }
     }
 
     #[test]

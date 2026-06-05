@@ -501,35 +501,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_solve_line_positive() {
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 10@100%  +12  f5  g6  d6"),
-            Some(12)
-        );
-        assert_eq!(
-            EdaxInterface::parse_solve_line("  5@73%   -3  d3  c4"),
-            Some(-3)
-        );
-    }
-
-    #[test]
-    fn test_parse_solve_line_exact() {
-        // Exact scores may be wrapped in angle brackets
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 24@100%  <+10>  c4  d3"),
-            Some(10)
-        );
-        assert_eq!(
-            EdaxInterface::parse_solve_line(" 60@100%  <-64>  a1"),
-            Some(-64)
-        );
-    }
-
-    #[test]
-    fn test_parse_solve_line_non_score() {
-        assert_eq!(EdaxInterface::parse_solve_line(""), None);
-        assert_eq!(EdaxInterface::parse_solve_line("  A B C D E F G H"), None);
-        assert_eq!(EdaxInterface::parse_solve_line("Edax version 4.4"), None);
+    fn test_parse_solve_line() {
+        let cases = [
+            (" 10@100%  +12  f5  g6  d6", Some(12)),
+            ("  5@73%   -3  d3  c4", Some(-3)),
+            (" 24@100%  <+10>  c4  d3", Some(10)),
+            (" 60@100%  <-64>  a1", Some(-64)),
+            ("", None),
+            ("  A B C D E F G H", None),
+            ("Edax version 4.4", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                EdaxInterface::parse_solve_line(input),
+                expected,
+                "parse_solve_line({input:?})"
+            );
+        }
     }
 
     #[test]
