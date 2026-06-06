@@ -17,6 +17,12 @@ impl Board {
         let moves = self.position.get_moves();
         let mut out = String::new();
 
+        let (black, white) = if self.black_to_move {
+            (self.position.player, self.position.opponent)
+        } else {
+            (self.position.opponent, self.position.player)
+        };
+
         out.push_str("+-a-b-c-d-e-f-g-h-+\n");
 
         let mut label = b'a';
@@ -26,10 +32,10 @@ impl Board {
                 let cell = y * 8 + x;
                 let bit = 1u64 << cell;
 
-                if self.position.player & bit != 0 {
-                    out.push_str("○ ");
-                } else if self.position.opponent & bit != 0 {
+                if black & bit != 0 {
                     out.push_str("● ");
+                } else if white & bit != 0 {
+                    out.push_str("○ ");
                 } else if moves & bit != 0 {
                     if show_move_labels {
                         out.push(label as char);
@@ -121,5 +127,31 @@ mod tests {
             let s = format!("{} ", label as char);
             assert!(out.contains(&s), "missing label {}", label as char);
         }
+    }
+
+    #[test]
+    fn test_show_black_always_filled() {
+        let board_black = Board {
+            position: Position::initial(),
+            black_to_move: true,
+        };
+        let out_black = board_black.show(false);
+
+        let board_white = Board {
+            position: Position::initial(),
+            black_to_move: false,
+        };
+        let out_white = board_white.show(false);
+
+        assert_eq!(
+            out_black.matches("● ").count(),
+            out_white.matches("● ").count(),
+            "● count (black) should be the same regardless of turn"
+        );
+        assert_eq!(
+            out_black.matches("○ ").count(),
+            out_white.matches("○ ").count(),
+            "○ count (white) should be the same regardless of turn"
+        );
     }
 }

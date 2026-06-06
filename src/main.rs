@@ -287,9 +287,9 @@ fn run_play(args: PlayArgs) {
     eprintln!(
         "You play {}",
         if player_is_black {
-            "black (○ when your turn)"
+            "black (●)"
         } else {
-            "white (○ when your turn)"
+            "white (○)"
         }
     );
 
