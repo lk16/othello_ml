@@ -73,43 +73,98 @@ impl Position {
             return 0;
         }
 
-        const DIRECTIONS: [(i32, i32); 8] = [
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ];
+        // Horizontal and diagonal shifts need col B-G mask to prevent wrap-around.
+        const MIDDLE_COLUMNS: u64 = 0x7E7E7E7E7E7E7E7E;
 
-        let mx = (mv % 8) as i32;
-        let my = (mv / 8) as i32;
+        let opp = self.opponent;
+        let opp_h = opp & MIDDLE_COLUMNS;
+        let opp_v = opp;
+        let opp_d = opp & MIDDLE_COLUMNS;
+
         let mut flipped: u64 = 0;
 
-        for &(dx, dy) in &DIRECTIONS {
-            let mut s = 1;
-            loop {
-                let cx = mx + dx * s;
-                let cy = my + dy * s;
-                if !(0..8).contains(&cx) || !(0..8).contains(&cy) {
-                    break;
-                }
-                let cur = (cy * 8 + cx) as u32;
-                let cur_bit = 1u64 << cur;
-                if self.opponent & cur_bit != 0 {
-                    s += 1;
-                } else {
-                    if (self.player & cur_bit != 0) && s >= 2 {
-                        for dist in 1..s {
-                            let f = mv as i32 + dist * (8 * dy + dx);
-                            flipped |= 1u64 << (f as u32);
-                        }
-                    }
-                    break;
-                }
-            }
+        // Horizontal: shift left (<<1) and right (>>1)
+        let mut f = opp_h & (move_bit << 1);
+        f |= opp_h & (f << 1);
+        f |= opp_h & (f << 1);
+        f |= opp_h & (f << 1);
+        f |= opp_h & (f << 1);
+        f |= opp_h & (f << 1);
+        if self.player & (f << 1) != 0 {
+            flipped |= f;
+        }
+
+        let mut f = opp_h & (move_bit >> 1);
+        f |= opp_h & (f >> 1);
+        f |= opp_h & (f >> 1);
+        f |= opp_h & (f >> 1);
+        f |= opp_h & (f >> 1);
+        f |= opp_h & (f >> 1);
+        if self.player & (f >> 1) != 0 {
+            flipped |= f;
+        }
+
+        // Vertical: shift up (<<8) and down (>>8)
+        let mut f = opp_v & (move_bit << 8);
+        f |= opp_v & (f << 8);
+        f |= opp_v & (f << 8);
+        f |= opp_v & (f << 8);
+        f |= opp_v & (f << 8);
+        f |= opp_v & (f << 8);
+        if self.player & (f << 8) != 0 {
+            flipped |= f;
+        }
+
+        let mut f = opp_v & (move_bit >> 8);
+        f |= opp_v & (f >> 8);
+        f |= opp_v & (f >> 8);
+        f |= opp_v & (f >> 8);
+        f |= opp_v & (f >> 8);
+        f |= opp_v & (f >> 8);
+        if self.player & (f >> 8) != 0 {
+            flipped |= f;
+        }
+
+        // Diagonal /: shift <<7 and >>7
+        let mut f = opp_d & (move_bit << 7);
+        f |= opp_d & (f << 7);
+        f |= opp_d & (f << 7);
+        f |= opp_d & (f << 7);
+        f |= opp_d & (f << 7);
+        f |= opp_d & (f << 7);
+        if self.player & (f << 7) != 0 {
+            flipped |= f;
+        }
+
+        let mut f = opp_d & (move_bit >> 7);
+        f |= opp_d & (f >> 7);
+        f |= opp_d & (f >> 7);
+        f |= opp_d & (f >> 7);
+        f |= opp_d & (f >> 7);
+        f |= opp_d & (f >> 7);
+        if self.player & (f >> 7) != 0 {
+            flipped |= f;
+        }
+
+        // Diagonal \: shift <<9 and >>9
+        let mut f = opp_d & (move_bit << 9);
+        f |= opp_d & (f << 9);
+        f |= opp_d & (f << 9);
+        f |= opp_d & (f << 9);
+        f |= opp_d & (f << 9);
+        f |= opp_d & (f << 9);
+        if self.player & (f << 9) != 0 {
+            flipped |= f;
+        }
+
+        let mut f = opp_d & (move_bit >> 9);
+        f |= opp_d & (f >> 9);
+        f |= opp_d & (f >> 9);
+        f |= opp_d & (f >> 9);
+        f |= opp_d & (f >> 9);
+        f |= opp_d & (f >> 9);
+        if self.player & (f >> 9) != 0 {
+            flipped |= f;
         }
 
         flipped
