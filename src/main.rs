@@ -1,15 +1,17 @@
 use othello_eval::{
-    best_move, build_examples, load_games, Board, Features, Position, Trainer, TrainingConfig,
-    Weights,
+    best_move, build_examples, exact_score, get_node_count, load_games, reset_node_count, Board,
+    Features, Position, Trainer, TrainingConfig, Weights,
 };
 use std::env;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 enum Command {
     Train(TrainArgs),
     Play(PlayArgs),
+    Bench(BenchArgs),
 }
 
 struct TrainArgs {
@@ -30,6 +32,12 @@ struct PlayArgs {
     weights_file: Option<String>,
 }
 
+struct BenchArgs {
+    empties: u32,
+    max_boards: Option<usize>,
+    paths: Vec<String>,
+}
+
 enum PlayerColor {
     Black,
     White,
@@ -46,6 +54,7 @@ fn parse_args() -> Option<Command> {
     match args[1].as_str() {
         "train" => parse_train_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
+        "bench" => parse_bench_args(&args[0], &args[2..]),
         "--help" | "-h" => {
             print_usage(&args[0]);
             None
@@ -176,6 +185,44 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     }))
 }
 
+fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut empties: u32 = 20;
+    let mut max_boards: Option<usize> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--empties" | "-n" => {
+                i += 1;
+                if i < args.len() {
+                    empties = args[i].parse().unwrap_or(20);
+                }
+            }
+            "--max-boards" | "-m" => {
+                i += 1;
+                if i < args.len() {
+                    max_boards = args[i].parse().ok();
+                }
+            }
+            "--help" | "-h" => {
+                print_bench_usage(program);
+                return None;
+            }
+            _ => paths.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if paths.is_empty() {
+        print_bench_usage(program);
+        return None;
+    }
+    Some(Command::Bench(BenchArgs {
+        empties,
+        max_boards,
+        paths,
+    }))
+}
+
 fn parse_player_color(s: &str) -> Option<PlayerColor> {
     match s.to_lowercase().as_str() {
         "b" | "black" => Some(PlayerColor::Black),
@@ -194,6 +241,7 @@ fn main() {
     match cmd {
         Command::Train(args) => run_train(args),
         Command::Play(args) => run_play(args),
+        Command::Bench(args) => run_bench(args),
     }
 }
 
@@ -380,6 +428,62 @@ fn run_play(args: PlayArgs) {
     }
 }
 
+fn run_bench(args: BenchArgs) {
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+
+    let iter = games
+        .iter()
+        .flat_map(|g| g.positions.iter())
+        .filter(|b| b.empties() == args.empties);
+    let positions: Vec<Board> = if let Some(limit) = args.max_boards {
+        iter.take(limit).cloned().collect()
+    } else {
+        iter.cloned().collect()
+    };
+
+    if positions.is_empty() {
+        eprintln!("No positions found with exactly {} empties.", args.empties);
+        eprintln!("Try a different --empties value.");
+        return;
+    }
+
+    eprintln!(
+        "Benchmarking exact_score: {} positions, {} empties each",
+        positions.len(),
+        args.empties
+    );
+
+    let mut total_nodes: u64 = 0;
+    let start = Instant::now();
+
+    for board in &positions {
+        reset_node_count();
+        exact_score(&board.position);
+        total_nodes += get_node_count();
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let n = positions.len() as f64;
+
+    eprintln!("Results:");
+    eprintln!("  Positions    : {}", positions.len());
+    eprintln!("  Total time   : {elapsed:.3}s");
+    eprintln!("  Time/position: {:.1}ms", elapsed / n * 1000.0);
+    eprintln!("  Positions/s  : {:.0}", n / elapsed);
+    eprintln!("  Total nodes  : {total_nodes}");
+    eprintln!("  Nodes/pos    : {:.0}", total_nodes as f64 / n);
+    eprintln!(
+        "  Nodes/s      : {:.2}M",
+        total_nodes as f64 / elapsed / 1_000_000.0
+    );
+}
+
 fn prompt_for_move(moves: u64) -> u32 {
     loop {
         print!("Your move: ");
@@ -465,6 +569,7 @@ fn print_usage(program: &str) {
     eprintln!("Commands:");
     eprintln!("  train    Train evaluation weights from game files");
     eprintln!("  play     Play a game against the CLI");
+    eprintln!("  bench    Benchmark exact alpha-beta search speed");
     eprintln!();
     eprintln!("Use \"{program} <command> --help\" for more information about a command.");
 }
@@ -505,6 +610,20 @@ fn print_train_usage(program: &str) {
     eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
     eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
     eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
+}
+
+fn print_bench_usage(program: &str) {
+    eprintln!("Usage: {program} bench [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Benchmark exact alpha-beta search over positions from game files.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -n, --empties N    Only use positions with exactly N empty cells (default: 20)");
+    eprintln!("  -m, --max-boards N Cap the number of positions benchmarked (default: all)");
+    eprintln!("  -h, --help         Show this help");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  One or more paths to .wtb/.pgn files or directories (same as train subcommand).");
 }
 
 fn print_play_usage(program: &str) {

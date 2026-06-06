@@ -3,6 +3,21 @@
 use crate::othello::position::Position;
 use crate::training::features::Features;
 use crate::training::weights::Weights;
+use std::cell::Cell;
+
+thread_local! {
+    static NODE_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Reset the per-thread node counter to zero.
+pub fn reset_node_count() {
+    NODE_COUNT.with(|c| c.set(0));
+}
+
+/// Return the number of `alphabeta_exact` calls since the last [`reset_node_count`].
+pub fn get_node_count() -> u64 {
+    NODE_COUNT.with(|c| c.get())
+}
 
 /// Exact score for `pos` from the perspective of the side to move.
 ///
@@ -21,6 +36,7 @@ const SCORE_MAX: i32 = 64;
 
 /// Negamax with alpha-beta pruning, searching to game end.
 fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
+    NODE_COUNT.with(|c| c.set(c.get() + 1));
     let moves = pos.get_moves();
     if moves == 0 {
         let passed = pos.pass_move();

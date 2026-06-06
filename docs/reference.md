@@ -26,6 +26,7 @@ othello_eval
 - **Full SGD training** — configurable learning rate, batch size, epochs, LR decay
 - **Eval file caching** — `--eval-file` loads cached evaluations or computes & saves
 - **Interactive gameplay** — play against the bot via `play` subcommand
+- **Search benchmarking** — measure nodes/position and time via `bench` subcommand
 
 ## Binary Weight Format
 
@@ -64,10 +65,14 @@ cargo run --release -- train --eval-file ignored/evals.txt training_data/
 # Play against the bot
 cargo run --release -- play --weights trained_weights.bin
 
+# Benchmark exact search (nodes/pos and time)
+cargo run --release -- bench --empties 14 --max-boards 100 training_data/
+
 # Show all commands
 cargo run --release -- --help
 
 # Show options for a subcommand
 cargo run --release -- train --help
 cargo run --release -- play --help
+cargo run --release -- bench --help
 ```
