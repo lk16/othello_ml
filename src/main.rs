@@ -1,31 +1,73 @@
-use othello_eval::{build_examples, load_games, Features, Trainer, TrainingConfig, Weights};
+use othello_eval::{
+    best_move, build_examples, load_games, Board, Features, Position, Trainer, TrainingConfig,
+    Weights,
+};
 use std::env;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Parsed command-line arguments.
-struct CliArgs {
+enum Command {
+    Train(TrainArgs),
+    Play(PlayArgs),
+}
+
+struct TrainArgs {
     max_empties: u32,
     epochs: usize,
     lr_decay: f32,
     resume_epoch: usize,
     eval_file: Option<String>,
     weights_file: String,
+    threads: usize,
     paths: Vec<String>,
 }
 
-/// Parse CLI arguments. Returns `None` if `--help` was shown.
-fn parse_args() -> Option<CliArgs> {
+struct PlayArgs {
+    depth: u32,
+    exact_empties: u32,
+    player_color: Option<PlayerColor>,
+    weights_file: Option<String>,
+}
+
+enum PlayerColor {
+    Black,
+    White,
+}
+
+fn parse_args() -> Option<Command> {
     let args: Vec<String> = env::args().collect();
 
+    if args.len() < 2 {
+        print_usage(&args[0]);
+        return None;
+    }
+
+    match args[1].as_str() {
+        "train" => parse_train_args(&args[0], &args[2..]),
+        "play" => parse_play_args(&args[0], &args[2..]),
+        "--help" | "-h" => {
+            print_usage(&args[0]);
+            None
+        }
+        other => {
+            eprintln!("Unknown command: {other}\n");
+            print_usage(&args[0]);
+            None
+        }
+    }
+}
+
+fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     let mut max_empties: u32 = 60;
     let mut epochs: usize = 10;
     let mut lr_decay: f32 = 0.01;
     let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
+    let mut threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         if args[i] == "--max-empties" || args[i] == "-n" {
             i += 1;
@@ -57,8 +99,13 @@ fn parse_args() -> Option<CliArgs> {
             if i < args.len() {
                 resume_epoch = args[i].parse::<usize>().unwrap_or(0);
             }
+        } else if args[i] == "--threads" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+            }
         } else if args[i] == "--help" || args[i] == "-h" {
-            print_usage(&args[0]);
+            print_train_usage(program);
             return None;
         } else {
             paths.push(args[i].clone());
@@ -66,33 +113,102 @@ fn parse_args() -> Option<CliArgs> {
         i += 1;
     }
 
-    Some(CliArgs {
+    Some(Command::Train(TrainArgs {
         max_empties,
         epochs,
         lr_decay,
         resume_epoch,
         eval_file,
         weights_file,
+        threads,
         paths,
-    })
+    }))
+}
+
+fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut player_color = None;
+    let mut depth: u32 = 6;
+    let mut exact_empties: u32 = 12;
+    let mut weights_file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--player" || args[i] == "-p" {
+            i += 1;
+            if i < args.len() {
+                if let Some(c) = parse_player_color(&args[i]) {
+                    player_color = Some(c);
+                } else {
+                    eprintln!("Invalid player color: {}. Use b/w/black/white.", args[i]);
+                    return None;
+                }
+            }
+        } else if args[i] == "--depth" {
+            i += 1;
+            if i < args.len() {
+                depth = args[i].parse::<u32>().unwrap_or(6);
+            }
+        } else if args[i] == "--exact-empties" {
+            i += 1;
+            if i < args.len() {
+                exact_empties = args[i].parse::<u32>().unwrap_or(12);
+            }
+        } else if args[i] == "--weights" || args[i] == "-w" {
+            i += 1;
+            if i < args.len() {
+                weights_file = Some(args[i].clone());
+            }
+        } else if args[i] == "--help" || args[i] == "-h" {
+            print_play_usage(program);
+            return None;
+        } else {
+            eprintln!("Unknown option for play: {}\n", args[i]);
+            print_play_usage(program);
+            return None;
+        }
+        i += 1;
+    }
+
+    Some(Command::Play(PlayArgs {
+        depth,
+        exact_empties,
+        player_color,
+        weights_file,
+    }))
+}
+
+fn parse_player_color(s: &str) -> Option<PlayerColor> {
+    match s.to_lowercase().as_str() {
+        "b" | "black" => Some(PlayerColor::Black),
+        "w" | "white" => Some(PlayerColor::White),
+        _ => None,
+    }
 }
 
 fn main() {
-    let args = if let Some(a) = parse_args() {
-        a
+    let cmd = if let Some(c) = parse_args() {
+        c
     } else {
         return;
     };
 
+    match cmd {
+        Command::Train(args) => run_train(args),
+        Command::Play(args) => run_play(args),
+    }
+}
+
+fn run_train(args: TrainArgs) {
     if args.paths.is_empty() {
         eprintln!("Error: No input files or directories specified.\n");
-        print_usage(&env::args().collect::<Vec<_>>()[0]);
+        let program = env::args().next().unwrap_or_default();
+        print_train_usage(&program);
         return;
     }
 
     eprintln!("=== Othello ML Training ===");
     eprintln!("Max empties: {}", args.max_empties);
     eprintln!("Epochs: {}", args.epochs);
+    eprintln!("Threads: {}", args.threads);
     if args.resume_epoch > 0 {
         eprintln!(
             "Resume epoch: {} (LR schedule continues from here)",
@@ -101,8 +217,6 @@ fn main() {
     }
     eprintln!("Input paths: {:?}", args.paths);
 
-    // Load games
-    eprintln!("\n--- Loading games ---");
     let games = match load_games(&args.paths) {
         Ok(g) => g,
         Err(e) => {
@@ -111,12 +225,11 @@ fn main() {
         }
     };
 
-    // Extract positions
     eprintln!(
         "\n--- Extracting positions (empties <= {}) ---",
         args.max_empties
     );
-    let positions: Vec<othello_eval::Board> = games
+    let positions: Vec<Board> = games
         .iter()
         .flat_map(|game| game.positions.iter())
         .filter(|pos| pos.empties() <= args.max_empties)
@@ -129,13 +242,26 @@ fn main() {
         return;
     }
 
-    // Initialize features and weights
     let features = Features::edax();
     eprintln!("Features: {}", features.count());
 
     let mut weights = Weights::load_or_create(&args.weights_file, &features);
 
-    let mut examples = match build_examples(&args.eval_file, &positions) {
+    eprintln!("\n--- Building training examples ---");
+    eprintln!("(press Ctrl+C to stop early and save progress)");
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!("\nInterrupt received — finishing current operation...");
+            interrupted.store(true, Ordering::Relaxed);
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
+    }
+
+    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads)
+    {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -144,29 +270,18 @@ fn main() {
     };
     eprintln!("Training examples: {}", examples.len());
 
-    // Train
     eprintln!("\n--- Training ---");
     eprintln!("(press Ctrl+C to stop early and save weights)");
-    let interrupted = Arc::new(AtomicBool::new(false));
-    {
-        let interrupted = Arc::clone(&interrupted);
-        if let Err(e) = ctrlc::set_handler(move || {
-            eprintln!("\nInterrupt received — finishing current epoch...");
-            interrupted.store(true, Ordering::Relaxed);
-        }) {
-            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
-        }
-    }
 
     let trainer = Trainer::new(0.1, 32, args.lr_decay);
     let train_config = TrainingConfig {
         epochs: args.epochs,
         epoch_offset: args.resume_epoch,
         interrupt: Some(interrupted),
+        threads: args.threads,
     };
     trainer.train_epochs(&mut weights, &mut examples, &train_config);
 
-    // Show sample weights and save
     weights.print_sample(&features, 10);
 
     eprintln!("\n--- Saving weights ---");
@@ -178,8 +293,184 @@ fn main() {
     eprintln!("\nDone!");
 }
 
+fn run_play(args: PlayArgs) {
+    let weights_file = if let Some(w) = args.weights_file {
+        w
+    } else {
+        eprintln!("Error: --weights/-w is required for play command");
+        return;
+    };
+
+    let features = Features::edax();
+    let weights = Weights::load_or_create(&weights_file, &features);
+
+    let player_is_black = match args.player_color {
+        Some(PlayerColor::Black) => true,
+        Some(PlayerColor::White) => false,
+        None => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            nanos % 2 == 0
+        }
+    };
+
+    eprintln!(
+        "You play {}",
+        if player_is_black {
+            "black (●)"
+        } else {
+            "white (○)"
+        }
+    );
+
+    let mut position = Position::initial();
+    let mut black_to_move = true;
+
+    loop {
+        if position.is_game_end() {
+            let board = Board {
+                position,
+                black_to_move,
+            };
+            println!("{}", board.show(false));
+            print_game_result(&position, black_to_move, player_is_black);
+            return;
+        }
+
+        if !position.has_moves() {
+            let side = if black_to_move { "Black" } else { "White" };
+            eprintln!("{side} has no moves, passing.");
+            position = position.pass_move();
+            black_to_move = !black_to_move;
+            continue;
+        }
+
+        let is_player_turn = player_is_black == black_to_move;
+        let board = Board {
+            position,
+            black_to_move,
+        };
+
+        if is_player_turn {
+            println!("{}", board.show(true));
+            let moves = position.get_moves();
+            let cell = prompt_for_move(moves);
+            eprintln!("You play: {}", cell_to_field(cell));
+            position = position.do_move(cell);
+        } else {
+            println!("{}", board.show(false));
+            eprintln!("Bot is thinking...");
+            if let Some(cell) = best_move(
+                &position,
+                args.depth,
+                args.exact_empties,
+                &weights,
+                &features,
+            ) {
+                eprintln!("Bot plays: {}", cell_to_field(cell));
+                position = position.do_move(cell);
+            } else {
+                position = position.pass_move();
+            }
+        }
+
+        black_to_move = !black_to_move;
+    }
+}
+
+fn prompt_for_move(moves: u64) -> u32 {
+    loop {
+        print!("Your move: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            continue;
+        }
+
+        if let Some(cell) = parse_move_input(&input, moves) {
+            return cell;
+        }
+
+        eprintln!("Invalid move. Use the letter shown on the board.");
+    }
+}
+
+fn parse_move_input(input: &str, moves: u64) -> Option<u32> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let ch = input.chars().next()?;
+    if !ch.is_ascii_lowercase() {
+        return None;
+    }
+    let target = (ch as u8).wrapping_sub(b'a');
+    let mut label = 0u8;
+    for cell in 0..64u32 {
+        if moves & (1u64 << cell) != 0 {
+            if label == target {
+                return Some(cell);
+            }
+            label += 1;
+        }
+    }
+    None
+}
+
+fn cell_to_field(cell: u32) -> String {
+    let col = (b'a' + (cell % 8) as u8) as char;
+    let row = (cell / 8) + 1;
+    format!("{col}{row}")
+}
+
+fn print_game_result(position: &Position, black_to_move: bool, player_is_black: bool) {
+    let (black_discs, white_discs) = if black_to_move {
+        (position.player_discs(), position.opponent_discs())
+    } else {
+        (position.opponent_discs(), position.player_discs())
+    };
+
+    eprintln!("Game over!");
+    eprintln!("Black: {black_discs} discs");
+    eprintln!("White: {white_discs} discs");
+
+    let player_discs = if player_is_black {
+        black_discs
+    } else {
+        white_discs
+    };
+    let bot_discs = if player_is_black {
+        white_discs
+    } else {
+        black_discs
+    };
+
+    if player_discs > bot_discs {
+        eprintln!("You win!");
+    } else if bot_discs > player_discs {
+        eprintln!("Bot wins!");
+    } else {
+        eprintln!("Draw!");
+    }
+}
+
 fn print_usage(program: &str) {
-    eprintln!("Usage: {program} [OPTIONS] <path>...");
+    eprintln!("Usage: {program} <COMMAND> [OPTIONS]");
+    eprintln!();
+    eprintln!("Othello ML training and playing.");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  train    Train evaluation weights from game files");
+    eprintln!("  play     Play a game against the CLI");
+    eprintln!();
+    eprintln!("Use \"{program} <command> --help\" for more information about a command.");
+}
+
+fn print_train_usage(program: &str) {
+    eprintln!("Usage: {program} train [OPTIONS] <path>...");
     eprintln!();
     eprintln!("Train Othello evaluation weights from game files.");
     eprintln!();
@@ -196,6 +487,7 @@ fn print_usage(program: &str) {
     eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
     eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)");
     eprintln!("  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)");
+    eprintln!("  -t, --threads N       Number of threads for parallel training (default: 1)");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
@@ -209,8 +501,85 @@ fn print_usage(program: &str) {
     eprintln!("    - directories (scanned recursively for game files)");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  {program} training_data/");
-    eprintln!("  {program} --max-empties 20 --epochs 50 training_data/");
-    eprintln!("  {program} --eval-file ignored/evals.txt --epochs 30 training_data/");
-    eprintln!("  {program} -e 1000 -d 0.001 -f evals.txt training_data/");
+    eprintln!("  {program} train training_data/");
+    eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
+    eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
+    eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
+}
+
+fn print_play_usage(program: &str) {
+    eprintln!("Usage: {program} play [OPTIONS]");
+    eprintln!();
+    eprintln!("Play a game against the CLI bot.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -p, --player COLOR    Player color: b/black or w/white (default: random)");
+    eprintln!("      --depth N         Bot search depth (default: 6)");
+    eprintln!("      --exact-empties N Use exact search when <= N empties remain (default: 12)");
+    eprintln!("  -w, --weights PATH    Weights file (required)");
+    eprintln!("  -h, --help            Show this help message");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_move_input_valid() {
+        let pos = Position::initial();
+        let moves = pos.get_moves();
+        let first_cell = moves.trailing_zeros();
+        assert_eq!(parse_move_input("a", moves), Some(first_cell));
+    }
+
+    #[test]
+    fn test_parse_move_input_invalid_letter() {
+        let pos = Position::initial();
+        let moves = pos.get_moves();
+        assert_eq!(parse_move_input("z", moves), None);
+    }
+
+    #[test]
+    fn test_parse_move_input_empty() {
+        let pos = Position::initial();
+        let moves = pos.get_moves();
+        assert_eq!(parse_move_input("", moves), None);
+        assert_eq!(parse_move_input("  ", moves), None);
+    }
+
+    #[test]
+    fn test_parse_move_input_uppercase() {
+        let pos = Position::initial();
+        let moves = pos.get_moves();
+        assert_eq!(parse_move_input("A", moves), None);
+    }
+
+    #[test]
+    fn test_parse_player_color() {
+        assert!(matches!(parse_player_color("b"), Some(PlayerColor::Black)));
+        assert!(matches!(
+            parse_player_color("black"),
+            Some(PlayerColor::Black)
+        ));
+        assert!(matches!(parse_player_color("w"), Some(PlayerColor::White)));
+        assert!(matches!(
+            parse_player_color("white"),
+            Some(PlayerColor::White)
+        ));
+        assert!(matches!(
+            parse_player_color("Black"),
+            Some(PlayerColor::Black)
+        ));
+        assert!(parse_player_color("x").is_none());
+        assert!(parse_player_color("").is_none());
+    }
+
+    #[test]
+    fn test_cell_to_field() {
+        assert_eq!(cell_to_field(0), "a1");
+        assert_eq!(cell_to_field(7), "h1");
+        assert_eq!(cell_to_field(56), "a8");
+        assert_eq!(cell_to_field(63), "h8");
+        assert_eq!(cell_to_field(27), "d4");
+    }
 }

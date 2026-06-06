@@ -10,6 +10,7 @@ use crate::training::features::Features;
 /// Weights are stored as f32 internally for precise SGD updates.
 ///
 /// Position evaluation = sum of all feature weights for the current board state.
+#[derive(Clone)]
 pub struct Weights {
     // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
     feature_weights: Vec<Vec<Vec<f32>>>,
@@ -194,6 +195,27 @@ impl Weights {
     /// Replace all weights (used during deserialization).
     pub fn set_all_weights(&mut self, weights: Vec<Vec<Vec<f32>>>) {
         self.feature_weights = weights;
+    }
+
+    /// Merge weight deltas from parallel workers.
+    ///
+    /// Each worker cloned the weights before training, so
+    /// `workers[i] - self` is the delta from worker i.  We apply the
+    /// average delta: `self += sum(workers[i] - self) / n_workers`.
+    pub fn merge_from_workers(&mut self, workers: &[Weights]) {
+        let n = workers.len() as f32;
+        for f in 0..self.feature_weights.len() {
+            for e in 0..self.feature_weights[f].len() {
+                for p in 0..self.feature_weights[f][e].len() {
+                    let original = self.feature_weights[f][e][p];
+                    let delta: f32 = workers
+                        .iter()
+                        .map(|w| w.feature_weights[f][e][p] - original)
+                        .sum();
+                    self.feature_weights[f][e][p] = original + delta / n;
+                }
+            }
+        }
     }
 
     // ─── Serialization ──────────────────────────────────────────────

@@ -2,7 +2,7 @@ pub mod eval;
 pub mod othello;
 pub mod training;
 
-pub use eval::alphabeta::{batch_evaluate, exact_score};
+pub use eval::alphabeta::{batch_evaluate, best_move, depth_limited_score, exact_score};
 pub use eval::cache::{build_examples, EvalCache};
 pub use othello::board::Board;
 pub use othello::game::{load_games, Game, GameResult};
