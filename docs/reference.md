@@ -7,12 +7,12 @@ othello_eval
 ├── othello/
 │   ├── Position       - bitboard pair (player + opponent discs)
 │   ├── Board          - Position + side to move
-│   └── Game           - WTHOR/PGN loading & game replay
+│   └── Game           - WTHOR/PGN loading; stores positions as Vec<Board>
 ├── eval/
-│   ├── alphabeta      - exact endgame evaluation via alpha-beta search
+│   ├── alphabeta      - exact endgame search + depth-limited heuristic search & best_move
 │   └── cache          - persistent FEN→score cache for eval files
 ├── training/
-│   ├── Features       - 47 Edax pattern extraction
+│   ├── Features       - 47 position features (46 Edax patterns + edge_parity)
 │   ├── Weights        - weight storage, lookup, save/load
 │   └── Trainer        - SGD optimization with inverse-time LR decay
 ```
@@ -20,11 +20,12 @@ othello_eval
 ## Key Features
 
 - **Minimal dependencies** — only `ctrlc` for graceful SIGINT handling
-- **47 Edax features** — exact pattern set extracted from Edax eval.c
-- **Alpha-beta evaluation** — exact endgame position scoring via negamax with pruning
+- **47 position features** — 46 Edax patterns from eval.c plus one corner-parity feature
+- **Alpha-beta evaluation** — exact endgame search for training; depth-limited heuristic search for gameplay
 - **Compact storage** — single binary file for all weights
 - **Full SGD training** — configurable learning rate, batch size, epochs, LR decay
 - **Eval file caching** — `--eval-file` loads cached evaluations or computes & saves
+- **Interactive gameplay** — play against the bot via `play` subcommand
 
 ## Binary Weight Format
 
@@ -55,11 +56,18 @@ cargo build --release
 cargo test
 
 # Train with exact alpha-beta evaluation
-cargo run --release -- training_data/
+cargo run --release -- train training_data/
 
 # Train with eval file cache (avoids recomputing evaluations)
-cargo run --release -- --eval-file ignored/evals.txt training_data/
+cargo run --release -- train --eval-file ignored/evals.txt training_data/
 
-# Show all options
+# Play against the bot
+cargo run --release -- play --weights trained_weights.bin
+
+# Show all commands
 cargo run --release -- --help
+
+# Show options for a subcommand
+cargo run --release -- train --help
+cargo run --release -- play --help
 ```
