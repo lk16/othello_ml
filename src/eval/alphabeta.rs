@@ -61,6 +61,98 @@ pub fn batch_evaluate(positions: &[Position]) -> Vec<i32> {
     positions.iter().map(exact_score).collect()
 }
 
+/// Depth-limited evaluation for use in gameplay. Falls back to exact search
+/// when `pos.empties() <= exact_empties`, otherwise searches `depth` plies
+/// and applies a heuristic at the leaves.
+pub fn depth_limited_score(pos: &Position, depth: u32, exact_empties: u32) -> i32 {
+    dl_alphabeta(pos, depth, exact_empties, SCORE_MIN, SCORE_MAX)
+}
+
+/// Pick the best legal move for the side to move. Returns `None` when there
+/// are no legal moves.
+pub fn best_move(pos: &Position, depth: u32, exact_empties: u32) -> Option<u32> {
+    let moves = pos.get_moves();
+    if moves == 0 {
+        return None;
+    }
+
+    let mut alpha = SCORE_MIN;
+    let mut best_cell = 0u32;
+
+    for cell in 0..64 {
+        if moves & (1u64 << cell) == 0 {
+            continue;
+        }
+        let child = pos.do_move(cell);
+        let score = -dl_alphabeta(
+            &child,
+            depth.saturating_sub(1),
+            exact_empties,
+            -SCORE_MAX,
+            -alpha,
+        );
+        if score > alpha {
+            alpha = score;
+            best_cell = cell;
+        }
+    }
+
+    Some(best_cell)
+}
+
+fn dl_alphabeta(pos: &Position, depth: u32, exact_empties: u32, mut alpha: i32, beta: i32) -> i32 {
+    if pos.is_game_end() {
+        return pos.final_score();
+    }
+
+    if pos.empties() <= exact_empties {
+        return alphabeta(pos, alpha, beta);
+    }
+
+    if !pos.has_moves() {
+        return -dl_alphabeta(&pos.pass_move(), depth, exact_empties, -beta, -alpha);
+    }
+
+    if depth == 0 {
+        return heuristic(pos);
+    }
+
+    let moves = pos.get_moves();
+    for cell in 0..64 {
+        if moves & (1u64 << cell) == 0 {
+            continue;
+        }
+        let child = pos.do_move(cell);
+        let score = -dl_alphabeta(&child, depth - 1, exact_empties, -beta, -alpha);
+        if score > alpha {
+            alpha = score;
+            if alpha >= beta {
+                break;
+            }
+        }
+    }
+
+    alpha
+}
+
+fn heuristic(pos: &Position) -> i32 {
+    let disc_diff = pos.player_discs() as i32 - pos.opponent_discs() as i32;
+    let mobility = pos.get_moves().count_ones() as i32;
+
+    let corners = [0u32, 7, 56, 63];
+    let mut corner_diff = 0i32;
+    for &c in &corners {
+        let bit = 1u64 << c;
+        if pos.player & bit != 0 {
+            corner_diff += 1;
+        } else if pos.opponent & bit != 0 {
+            corner_diff -= 1;
+        }
+    }
+
+    (disc_diff + 2 * mobility + 10 * corner_diff).clamp(SCORE_MIN, SCORE_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +245,77 @@ mod tests {
                 line_no + 1,
             );
         }
+    }
+
+    #[test]
+    fn test_depth_limited_score_game_end() {
+        let pos = Position {
+            player: u64::MAX,
+            opponent: 0,
+        };
+        assert_eq!(depth_limited_score(&pos, 0, 12), 64);
+    }
+
+    #[test]
+    fn test_depth_limited_score_uses_exact_for_few_empties() {
+        let mut player: u64 = 0;
+        let mut opponent: u64 = 0;
+        for i in 0..32 {
+            player |= 1u64 << i;
+        }
+        for i in 32..63 {
+            opponent |= 1u64 << i;
+        }
+        let pos = Position { player, opponent };
+        assert_eq!(pos.empties(), 1);
+        let exact = exact_score(&pos);
+        let dl = depth_limited_score(&pos, 1, 12);
+        assert_eq!(
+            dl, exact,
+            "empties <= exact_empties should use exact search"
+        );
+    }
+
+    #[test]
+    fn test_depth_limited_score_bounded() {
+        let pos = Position::initial();
+        let score = depth_limited_score(&pos, 4, 12);
+        assert!(
+            (SCORE_MIN..=SCORE_MAX).contains(&score),
+            "score {score} out of bounds"
+        );
+    }
+
+    #[test]
+    fn test_best_move_returns_legal_move() {
+        let pos = Position::initial();
+        let mv = best_move(&pos, 4, 12);
+        assert!(mv.is_some());
+        let cell = mv.unwrap_or_else(|| unreachable!());
+        let moves = pos.get_moves();
+        assert!(
+            moves & (1u64 << cell) != 0,
+            "best_move returned illegal cell {cell}"
+        );
+    }
+
+    #[test]
+    fn test_best_move_none_when_no_moves() {
+        let pos = Position {
+            player: u64::MAX,
+            opponent: 0,
+        };
+        assert!(best_move(&pos, 4, 12).is_none());
+    }
+
+    #[test]
+    fn test_heuristic_bounded() {
+        let pos = Position::initial();
+        let h = heuristic(&pos);
+        assert!(
+            (SCORE_MIN..=SCORE_MAX).contains(&h),
+            "heuristic {h} out of bounds"
+        );
     }
 
     /// Parse an Edax FEN (66 chars: 64 board + space + side-to-move) into a
