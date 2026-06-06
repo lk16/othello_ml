@@ -5,7 +5,6 @@
 
 use crate::eval::alphabeta;
 use crate::othello::board::Board;
-use crate::othello::position::Position;
 use crate::training::trainer::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
@@ -140,8 +139,34 @@ impl EvalCache {
         if !missing.is_empty() {
             let n = missing.len();
             eprintln!("Computing {n} missing positions with alpha-beta...");
-            let boards: Vec<Position> = missing.iter().map(|p| p.position).collect();
-            let scores = alphabeta::batch_evaluate(&boards);
+
+            let eval_start = std::time::Instant::now();
+            let mut scores = Vec::with_capacity(n);
+            let mut last_print = eval_start;
+
+            for (i, pos) in missing.iter().enumerate() {
+                scores.push(alphabeta::exact_score(&pos.position));
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
+                    let elapsed = now.duration_since(eval_start).as_secs_f64();
+                    let completed = i + 1;
+                    let remaining = n - completed;
+                    let rate = completed as f64 / elapsed;
+                    let eta = remaining as f64 / rate;
+                    eprintln!(
+                        "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
+                    );
+                    last_print = now;
+                }
+            }
+
+            let elapsed = eval_start.elapsed();
+            eprintln!(
+                "  Done in {:.1}s ({:.0} pos/s)",
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64().max(0.001)
+            );
 
             self.append(&missing, &scores)?;
             eprintln!("Appended {n} new evaluations to {}", self.path);
@@ -165,8 +190,25 @@ impl EvalCache {
         );
 
         let eval_start = std::time::Instant::now();
-        let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = alphabeta::batch_evaluate(&boards);
+        let mut scores = Vec::with_capacity(n);
+        let mut last_print = eval_start;
+
+        for (i, pos) in positions.iter().enumerate() {
+            scores.push(alphabeta::exact_score(&pos.position));
+
+            let now = std::time::Instant::now();
+            if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
+                let elapsed = now.duration_since(eval_start).as_secs_f64();
+                let completed = i + 1;
+                let remaining = n - completed;
+                let rate = completed as f64 / elapsed;
+                let eta = remaining as f64 / rate;
+                eprintln!(
+                    "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
+                );
+                last_print = now;
+            }
+        }
 
         let elapsed = eval_start.elapsed();
         eprintln!(
@@ -208,8 +250,25 @@ pub fn build_examples(
         let n = positions.len();
         eprintln!("\n--- Evaluating {n} positions with alpha-beta ---");
         let eval_start = std::time::Instant::now();
-        let boards: Vec<Position> = positions.iter().map(|p| p.position).collect();
-        let scores = alphabeta::batch_evaluate(&boards);
+        let mut scores = Vec::with_capacity(n);
+        let mut last_print = eval_start;
+
+        for (i, pos) in positions.iter().enumerate() {
+            scores.push(alphabeta::exact_score(&pos.position));
+
+            let now = std::time::Instant::now();
+            if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
+                let elapsed = now.duration_since(eval_start).as_secs_f64();
+                let completed = i + 1;
+                let remaining = n - completed;
+                let rate = completed as f64 / elapsed;
+                let eta = remaining as f64 / rate;
+                eprintln!(
+                    "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
+                );
+                last_print = now;
+            }
+        }
         let elapsed = eval_start.elapsed();
         eprintln!(
             "  Done in {:.1}s ({:.0} pos/s)",

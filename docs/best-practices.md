@@ -39,6 +39,7 @@ Each item should be descriptive enough that specific examples are unnecessary.
 ## Project conventions
 
 - Commit with concise one-line messages.
+- **Never commit without asking for review first.** Always show the user what will be committed and wait for approval before running `git commit`.
 - When asked a question, suggest solutions in a numbered list and point out a recommended one.
 - Consult source code as the main source of truth. Docstrings help, but the code is canonical. Never assume — verify.
 - When things are unclear or contradictory, ask immediately — don't guess.

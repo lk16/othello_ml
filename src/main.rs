@@ -26,6 +26,7 @@ struct PlayArgs {
     depth: u32,
     exact_empties: u32,
     player_color: Option<PlayerColor>,
+    weights_file: Option<String>,
 }
 
 enum PlayerColor {
@@ -120,6 +121,7 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     let mut player_color = None;
     let mut depth: u32 = 6;
     let mut exact_empties: u32 = 12;
+    let mut weights_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--player" || args[i] == "-p" {
@@ -142,6 +144,11 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
             if i < args.len() {
                 exact_empties = args[i].parse::<u32>().unwrap_or(12);
             }
+        } else if args[i] == "--weights" || args[i] == "-w" {
+            i += 1;
+            if i < args.len() {
+                weights_file = Some(args[i].clone());
+            }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_play_usage(program);
             return None;
@@ -157,6 +164,7 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
         depth,
         exact_empties,
         player_color,
+        weights_file,
     }))
 }
 
@@ -272,6 +280,16 @@ fn run_train(args: TrainArgs) {
 }
 
 fn run_play(args: PlayArgs) {
+    let weights_file = if let Some(w) = args.weights_file {
+        w
+    } else {
+        eprintln!("Error: --weights/-w is required for play command");
+        return;
+    };
+
+    let features = Features::edax();
+    let weights = Weights::load_or_create(&weights_file, &features);
+
     let player_is_black = match args.player_color {
         Some(PlayerColor::Black) => true,
         Some(PlayerColor::White) => false,
@@ -330,7 +348,13 @@ fn run_play(args: PlayArgs) {
         } else {
             println!("{}", board.show(false));
             eprintln!("Bot is thinking...");
-            if let Some(cell) = best_move(&position, args.depth, args.exact_empties) {
+            if let Some(cell) = best_move(
+                &position,
+                args.depth,
+                args.exact_empties,
+                &weights,
+                &features,
+            ) {
                 eprintln!("Bot plays: {}", cell_to_field(cell));
                 position = position.do_move(cell);
             } else {
@@ -477,6 +501,7 @@ fn print_play_usage(program: &str) {
     eprintln!("  -p, --player COLOR    Player color: b/black or w/white (default: random)");
     eprintln!("      --depth N         Bot search depth (default: 6)");
     eprintln!("      --exact-empties N Use exact search when <= N empties remain (default: 12)");
+    eprintln!("  -w, --weights PATH    Weights file (required)");
     eprintln!("  -h, --help            Show this help message");
 }
 
