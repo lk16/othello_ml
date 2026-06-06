@@ -43,7 +43,7 @@ impl Features {
             Feature::new("edge_top2", vec![9, 0, 8, 16, 24, 32, 40, 48, 56, 49]), // B2,A1,A2,A3,A4,A5,A6,A7,A8,B7
             Feature::new("edge_bottom2", vec![14, 7, 15, 23, 31, 39, 47, 55, 63, 54]), // G2,H1,H2,H3,H4,H5,H6,H7,H8,G7
             // 4 extended corner patterns (10 cells each)
-            Feature::new("ext_corner_a1", vec![0, 2, 3, 9, 10, 11, 12, 13, 18, 7]), // A1,C1,D1,C2,D2,E2,F2,E1,F1,H1
+            Feature::new("ext_corner_a1", vec![0, 2, 3, 9, 10, 11, 12, 13, 18, 7]), // A1,C1,D1,C2,D2,E2,F2,E3,F3,H1
             Feature::new(
                 "ext_corner_a8",
                 vec![56, 58, 59, 49, 50, 51, 52, 53, 42, 63],

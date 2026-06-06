@@ -5,7 +5,7 @@
 
 use crate::othello::board::Board;
 use crate::othello::game::GameResult;
-use crate::othello::position::{Cell, Position};
+use crate::othello::position::Position;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -27,8 +27,9 @@ fn field_to_index(field: &str) -> Option<u8> {
 }
 
 /// Parse a single PGN game from an iterator over lines.
-/// Returns None if no game could be parsed (e.g., empty input).
-fn parse_pgn_game<'a, I>(lines: &mut I) -> Option<super::Game>
+/// Returns `Ok(None)` if no game could be parsed (e.g., empty input).
+/// Returns `Err` if the game contains corrupted/illegal moves.
+fn parse_pgn_game<'a, I>(lines: &mut I) -> Result<Option<super::Game>, String>
 where
     I: Iterator<Item = &'a str>,
 {
@@ -72,7 +73,7 @@ where
     }
 
     if metadata.is_empty() && move_lines.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Replay moves to generate board positions
@@ -96,18 +97,26 @@ where
             }
 
             if let Some(cell) = field_to_index(word) {
-                if board.get_cell(cell as u32) != Cell::Empty {
-                    // Could be a pass - swap sides
+                // Check if the move is legal (flips at least one disc).
+                // This covers both occupied cells and empty cells with no flips.
+                if board.flipped(cell as u32) == 0 {
+                    // Illegal move — assume a pass (current player has no moves).
+                    // Swap sides and retry the move for the other player.
                     std::mem::swap(&mut board.player, &mut board.opponent);
                     black_to_move = !black_to_move;
 
-                    if board.get_cell(cell as u32) != Cell::Empty {
-                        // Still invalid, revert and skip
-                        std::mem::swap(&mut board.player, &mut board.opponent);
-                        black_to_move = !black_to_move;
-                        continue;
+                    if board.flipped(cell as u32) == 0 {
+                        // Still illegal after swap — game is corrupted.
+                        return Err(format!(
+                            "Illegal move '{}' at position with {} empties",
+                            word,
+                            board.empties()
+                        ));
                     }
                 }
+
+                // Passed positions are not recorded: the passing player has
+                // no legal moves, so there is no position to train on.
 
                 // Record position BEFORE the move
                 let faced = Board {
@@ -135,19 +144,19 @@ where
     }
 
     if positions.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(super::Game {
+    Ok(Some(super::Game {
         positions,
         black_name: metadata.get("Black").cloned(),
         white_name: metadata.get("White").cloned(),
         result: metadata.get("Result").and_then(|s| GameResult::parse(s)),
-    })
+    }))
 }
 
 /// Parse PGN content with potentially multiple games.
-pub fn parse_pgn_multi(content: &str) -> Vec<super::Game> {
+pub fn parse_pgn_multi(content: &str) -> Result<Vec<super::Game>, String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut games = Vec::new();
     let mut iter = lines.iter().copied().peekable();
@@ -162,21 +171,20 @@ pub fn parse_pgn_multi(content: &str) -> Vec<super::Game> {
             break;
         }
 
-        if let Some(game) = parse_pgn_game(&mut iter) {
-            games.push(game);
-        } else {
-            break;
+        match parse_pgn_game(&mut iter)? {
+            Some(game) => games.push(game),
+            None => break,
         }
     }
 
-    games
+    Ok(games)
 }
 
 /// Read a PGN file (possibly with multiple games).
 pub fn read_pgn_file(path: &Path) -> Result<Vec<super::Game>, String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    Ok(parse_pgn_multi(&content))
+    parse_pgn_multi(&content)
 }
 
 #[cfg(test)]
@@ -206,7 +214,7 @@ mod tests {
 
 1. E6 f4 2. E3 d6 3. C5 f3 50-14
 "#;
-        let games = parse_pgn_multi(pgn);
+        let games = parse_pgn_multi(pgn).expect("valid game");
         assert!(!games.is_empty());
         assert_eq!(games[0].black_name.as_deref(), Some("hz36"));
         assert_eq!(games[0].white_name.as_deref(), Some("lk16"));
@@ -217,7 +225,25 @@ mod tests {
     #[test]
     fn test_parse_pgn_empty() {
         let pgn = "";
-        let games = parse_pgn_multi(pgn);
+        let games = parse_pgn_multi(pgn).expect("empty input");
         assert!(games.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pgn_corrupted_move() {
+        // A1 is occupied at the start, so playing there is illegal for both sides.
+        let pgn = r#"[Event "?"]
+[Black "test"]
+[White "test"]
+[Result "0-0"]
+
+1. A1 0-0
+"#;
+        let result = parse_pgn_multi(pgn);
+        assert!(result.is_err(), "corrupted game should return error");
+        assert!(
+            result.unwrap_err().contains("Illegal move"),
+            "error should mention illegal move"
+        );
     }
 }

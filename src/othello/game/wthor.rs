@@ -5,7 +5,7 @@
 // Edax cell indices (0-63) for replay.
 
 use crate::othello::board::Board;
-use crate::othello::position::{Cell, Position};
+use crate::othello::position::Position;
 use std::fs;
 use std::path::Path;
 
@@ -97,19 +97,23 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<super::Game>, String> {
                 break;
             }
 
-            // Check if the move is valid by seeing if the cell is empty
-            if board.get_cell(cell as u32) != Cell::Empty {
-                // Skip invalid moves (could be a pass that's not recorded)
-                // Swap sides and try again
+            // Check if the move is legal (flips at least one disc).
+            // This covers both occupied cells and empty cells with no flips.
+            if board.flipped(cell as u32) == 0 {
+                // Illegal move — assume a pass (current player has no moves).
+                // Swap sides and retry the move for the other player.
                 std::mem::swap(&mut board.player, &mut board.opponent);
                 black_to_move = !black_to_move;
 
-                if board.get_cell(cell as u32) != Cell::Empty {
-                    // Still occupied, game is corrupted - break
+                if board.flipped(cell as u32) == 0 {
+                    // Still illegal after swap — game is corrupted.
                     std::mem::swap(&mut board.player, &mut board.opponent);
                     break;
                 }
             }
+
+            // Passed positions are not recorded: the passing player has
+            // no legal moves, so there is no position to train on.
 
             // Record the position BEFORE the move (the position the player faced)
             let faced = Board {

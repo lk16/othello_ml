@@ -13,8 +13,7 @@ pub fn exact_score(pos: &Position) -> i32 {
     alphabeta(pos, SCORE_MIN, SCORE_MAX)
 }
 
-/// Score bounds.  +1 is added to the min bound so that `-beta` / `-alpha`
-/// never overflow `i32` in the negamax recursion.
+/// Score bounds.
 const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
 
