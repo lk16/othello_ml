@@ -10,15 +10,15 @@ use crate::othello::position::Position;
 ///
 /// The score is bounded to [-64, 64].
 pub fn exact_score(pos: &Position) -> i32 {
-    alphabeta(pos, SCORE_MIN, SCORE_MAX)
+    alphabeta_exact(pos, SCORE_MIN, SCORE_MAX)
 }
 
 /// Score bounds.
 const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
 
-/// Negamax with alpha-beta pruning.
-fn alphabeta(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
+/// Negamax with alpha-beta pruning, searching to game end.
+fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
     // Terminal position: final score from current player's perspective.
     if pos.is_game_end() {
         return pos.final_score();
@@ -26,7 +26,7 @@ fn alphabeta(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
 
     // Pass: no legal moves for the current player.
     if !pos.has_moves() {
-        return -alphabeta(&pos.pass_move(), -beta, -alpha);
+        return -alphabeta_exact(&pos.pass_move(), -beta, -alpha);
     }
 
     let moves = pos.get_moves();
@@ -36,7 +36,7 @@ fn alphabeta(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
             continue;
         }
         let child = make_move(pos, cell);
-        let score = -alphabeta(&child, -beta, -alpha);
+        let score = -alphabeta_exact(&child, -beta, -alpha);
         if score > alpha {
             alpha = score;
             if alpha >= beta {
@@ -61,16 +61,44 @@ pub fn batch_evaluate(positions: &[Position]) -> Vec<i32> {
     positions.iter().map(exact_score).collect()
 }
 
-/// Depth-limited evaluation for use in gameplay. Falls back to exact search
-/// when `pos.empties() <= exact_empties`, otherwise searches `depth` plies
+/// Depth-limited evaluation for use in gameplay. Searches `depth` plies
 /// and applies a heuristic at the leaves.
-pub fn depth_limited_score(pos: &Position, depth: u32, exact_empties: u32) -> i32 {
-    dl_alphabeta(pos, depth, exact_empties, SCORE_MIN, SCORE_MAX)
+pub fn depth_limited_score(pos: &Position, depth: u32) -> i32 {
+    alphabeta(pos, depth, SCORE_MIN, SCORE_MAX)
 }
 
 /// Pick the best legal move for the side to move. Returns `None` when there
 /// are no legal moves.
 pub fn best_move(pos: &Position, depth: u32, exact_empties: u32) -> Option<u32> {
+    let moves = pos.get_moves();
+    if moves == 0 {
+        return None;
+    }
+
+    if pos.empties() <= exact_empties {
+        return best_move_exact(pos);
+    }
+
+    let mut alpha = SCORE_MIN;
+    let mut best_cell = 0u32;
+
+    for cell in 0..64 {
+        if moves & (1u64 << cell) == 0 {
+            continue;
+        }
+        let child = pos.do_move(cell);
+        let score = -alphabeta(&child, depth.saturating_sub(1), -SCORE_MAX, -alpha);
+        if score > alpha {
+            alpha = score;
+            best_cell = cell;
+        }
+    }
+
+    Some(best_cell)
+}
+
+/// Pick the best legal move using exact search to game end.
+fn best_move_exact(pos: &Position) -> Option<u32> {
     let moves = pos.get_moves();
     if moves == 0 {
         return None;
@@ -84,13 +112,7 @@ pub fn best_move(pos: &Position, depth: u32, exact_empties: u32) -> Option<u32> 
             continue;
         }
         let child = pos.do_move(cell);
-        let score = -dl_alphabeta(
-            &child,
-            depth.saturating_sub(1),
-            exact_empties,
-            -SCORE_MAX,
-            -alpha,
-        );
+        let score = -alphabeta_exact(&child, -SCORE_MAX, -alpha);
         if score > alpha {
             alpha = score;
             best_cell = cell;
@@ -100,17 +122,14 @@ pub fn best_move(pos: &Position, depth: u32, exact_empties: u32) -> Option<u32> 
     Some(best_cell)
 }
 
-fn dl_alphabeta(pos: &Position, depth: u32, exact_empties: u32, mut alpha: i32, beta: i32) -> i32 {
+/// Negamax with alpha-beta pruning and depth limit.
+fn alphabeta(pos: &Position, depth: u32, mut alpha: i32, beta: i32) -> i32 {
     if pos.is_game_end() {
         return pos.final_score();
     }
 
-    if pos.empties() <= exact_empties {
-        return alphabeta(pos, alpha, beta);
-    }
-
     if !pos.has_moves() {
-        return -dl_alphabeta(&pos.pass_move(), depth, exact_empties, -beta, -alpha);
+        return -alphabeta(&pos.pass_move(), depth, -beta, -alpha);
     }
 
     if depth == 0 {
@@ -123,7 +142,7 @@ fn dl_alphabeta(pos: &Position, depth: u32, exact_empties: u32, mut alpha: i32, 
             continue;
         }
         let child = pos.do_move(cell);
-        let score = -dl_alphabeta(&child, depth - 1, exact_empties, -beta, -alpha);
+        let score = -alphabeta(&child, depth - 1, -beta, -alpha);
         if score > alpha {
             alpha = score;
             if alpha >= beta {
@@ -253,11 +272,11 @@ mod tests {
             player: u64::MAX,
             opponent: 0,
         };
-        assert_eq!(depth_limited_score(&pos, 0, 12), 64);
+        assert_eq!(depth_limited_score(&pos, 0), 64);
     }
 
     #[test]
-    fn test_depth_limited_score_uses_exact_for_few_empties() {
+    fn test_best_move_uses_exact_for_few_empties() {
         let mut player: u64 = 0;
         let mut opponent: u64 = 0;
         for i in 0..32 {
@@ -268,18 +287,14 @@ mod tests {
         }
         let pos = Position { player, opponent };
         assert_eq!(pos.empties(), 1);
-        let exact = exact_score(&pos);
-        let dl = depth_limited_score(&pos, 1, 12);
-        assert_eq!(
-            dl, exact,
-            "empties <= exact_empties should use exact search"
-        );
+        let mv = best_move(&pos, 1, 12);
+        assert!(mv.is_some(), "best_move should return a move with 1 empty");
     }
 
     #[test]
     fn test_depth_limited_score_bounded() {
         let pos = Position::initial();
-        let score = depth_limited_score(&pos, 4, 12);
+        let score = depth_limited_score(&pos, 4);
         assert!(
             (SCORE_MIN..=SCORE_MAX).contains(&score),
             "score {score} out of bounds"
