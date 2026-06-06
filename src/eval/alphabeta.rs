@@ -27,7 +27,7 @@ pub fn get_node_count() -> u64 {
 ///
 /// The score is bounded to [-64, 64].
 pub fn exact_score(pos: &Position) -> i32 {
-    alphabeta_exact(pos, SCORE_MIN, SCORE_MAX)
+    alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
 }
 
 /// Score bounds.
@@ -35,15 +35,20 @@ const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
 
 /// Negamax with alpha-beta pruning, searching to game end.
-fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
+fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
     NODE_COUNT.with(|c| c.set(c.get() + 1));
+
+    if empties == 0 {
+        return pos.final_score();
+    }
+
     let moves = pos.get_moves();
     if moves == 0 {
         let passed = pos.pass_move();
         if passed.get_moves() == 0 {
             return pos.final_score();
         }
-        return -alphabeta_exact(&passed, -beta, -alpha);
+        return -alphabeta_exact(&passed, -beta, -alpha, empties);
     }
 
     let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
@@ -57,7 +62,7 @@ fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
     move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
 
     for (_, child) in &move_list {
-        let score = -alphabeta_exact(child, -beta, -alpha);
+        let score = -alphabeta_exact(child, -beta, -alpha, empties - 1);
         if score > alpha {
             alpha = score;
             if alpha >= beta {
@@ -139,13 +144,14 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
 
     let mut alpha = SCORE_MIN;
     let mut best_cell = 0u32;
+    let empties = pos.empties();
 
     let mut remaining = moves;
     while remaining != 0 {
         let cell = remaining.trailing_zeros();
         remaining &= remaining - 1;
         let child = pos.do_move(cell);
-        let score = -alphabeta_exact(&child, -SCORE_MAX, -alpha);
+        let score = -alphabeta_exact(&child, -SCORE_MAX, -alpha, empties - 1);
         if score > alpha {
             alpha = score;
             best_cell = cell;
