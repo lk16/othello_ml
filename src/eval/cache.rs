@@ -9,6 +9,8 @@ use crate::training::trainer::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Cached exact evaluations backed by a text file.
 pub struct EvalCache {
@@ -109,16 +111,24 @@ impl EvalCache {
     /// If the cache file exists, known positions are loaded from it and only
     /// missing ones are computed (appended after). If the cache doesn't
     /// exist yet, all positions are evaluated and the result is saved.
-    pub fn build_examples(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
+    pub fn build_examples(
+        &self,
+        positions: &[Board],
+        interrupt: &Arc<AtomicBool>,
+    ) -> Result<Vec<TrainingExample>, String> {
         if self.exists() {
-            self.build_from_existing(positions)
+            self.build_from_existing(positions, interrupt)
         } else {
-            self.build_fresh(positions)
+            self.build_fresh(positions, interrupt)
         }
     }
 
     /// Load cached evaluations and compute only missing positions.
-    fn build_from_existing(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
+    fn build_from_existing(
+        &self,
+        positions: &[Board],
+        interrupt: &Arc<AtomicBool>,
+    ) -> Result<Vec<TrainingExample>, String> {
         eprintln!("\n--- Loading evaluations from {} ---", self.path);
         let eval_map = self.load_map()?;
         eprintln!("Loaded {} evaluations", eval_map.len());
@@ -145,6 +155,13 @@ impl EvalCache {
             let mut last_print = eval_start;
 
             for (i, pos) in missing.iter().enumerate() {
+                if interrupt.load(Ordering::Relaxed) {
+                    eprintln!("\nInterrupted! Saving {i} evaluated positions...");
+                    self.append(&missing[..i], &scores)?;
+                    eprintln!("Saved {i} evaluations to {}", self.path);
+                    return Err("Interrupted by user".to_string());
+                }
+
                 scores.push(alphabeta::exact_score(&pos.position));
 
                 let now = std::time::Instant::now();
@@ -182,7 +199,11 @@ impl EvalCache {
     }
 
     /// Evaluate all positions and create a new cache file.
-    fn build_fresh(&self, positions: &[Board]) -> Result<Vec<TrainingExample>, String> {
+    fn build_fresh(
+        &self,
+        positions: &[Board],
+        interrupt: &Arc<AtomicBool>,
+    ) -> Result<Vec<TrainingExample>, String> {
         let n = positions.len();
         eprintln!(
             "\n--- Evaluating {n} positions with alpha-beta → saving to {} ---",
@@ -194,6 +215,21 @@ impl EvalCache {
         let mut last_print = eval_start;
 
         for (i, pos) in positions.iter().enumerate() {
+            if interrupt.load(Ordering::Relaxed) {
+                eprintln!("\nInterrupted! Saving {i} evaluated positions...");
+                let partial_examples: Vec<TrainingExample> = positions[..i]
+                    .iter()
+                    .zip(scores.iter())
+                    .map(|(p, &s)| TrainingExample {
+                        position: p.position,
+                        target_score: s,
+                    })
+                    .collect();
+                self.save_all(&positions[..i], &partial_examples)?;
+                eprintln!("Saved {i} evaluations to {}", self.path);
+                return Err("Interrupted by user".to_string());
+            }
+
             scores.push(alphabeta::exact_score(&pos.position));
 
             let now = std::time::Instant::now();
@@ -242,10 +278,11 @@ impl EvalCache {
 pub fn build_examples(
     eval_file: &Option<String>,
     positions: &[Board],
+    interrupt: &Arc<AtomicBool>,
 ) -> Result<Vec<TrainingExample>, String> {
     if let Some(ref path) = eval_file {
         let cache = EvalCache::new(path.clone());
-        cache.build_examples(positions)
+        cache.build_examples(positions, interrupt)
     } else {
         let n = positions.len();
         eprintln!("\n--- Evaluating {n} positions with alpha-beta ---");
@@ -254,6 +291,11 @@ pub fn build_examples(
         let mut last_print = eval_start;
 
         for (i, pos) in positions.iter().enumerate() {
+            if interrupt.load(Ordering::Relaxed) {
+                eprintln!("\nInterrupted! Evaluated {i}/{n} positions.");
+                return Err("Interrupted by user".to_string());
+            }
+
             scores.push(alphabeta::exact_score(&pos.position));
 
             let now = std::time::Instant::now();

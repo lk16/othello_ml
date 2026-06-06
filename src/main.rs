@@ -238,7 +238,20 @@ fn run_train(args: TrainArgs) {
 
     let mut weights = Weights::load_or_create(&args.weights_file, &features);
 
-    let mut examples = match build_examples(&args.eval_file, &positions) {
+    eprintln!("\n--- Building training examples ---");
+    eprintln!("(press Ctrl+C to stop early and save progress)");
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!("\nInterrupt received — finishing current operation...");
+            interrupted.store(true, Ordering::Relaxed);
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
+    }
+
+    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted) {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -249,16 +262,6 @@ fn run_train(args: TrainArgs) {
 
     eprintln!("\n--- Training ---");
     eprintln!("(press Ctrl+C to stop early and save weights)");
-    let interrupted = Arc::new(AtomicBool::new(false));
-    {
-        let interrupted = Arc::clone(&interrupted);
-        if let Err(e) = ctrlc::set_handler(move || {
-            eprintln!("\nInterrupt received — finishing current epoch...");
-            interrupted.store(true, Ordering::Relaxed);
-        }) {
-            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
-        }
-    }
 
     let trainer = Trainer::new(0.1, 32, args.lr_decay);
     let train_config = TrainingConfig {
