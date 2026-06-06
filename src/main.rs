@@ -19,6 +19,7 @@ struct TrainArgs {
     resume_epoch: usize,
     eval_file: Option<String>,
     weights_file: String,
+    threads: usize,
     paths: Vec<String>,
 }
 
@@ -64,6 +65,7 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
+    let mut threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -97,6 +99,11 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
             if i < args.len() {
                 resume_epoch = args[i].parse::<usize>().unwrap_or(0);
             }
+        } else if args[i] == "--threads" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+            }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_train_usage(program);
             return None;
@@ -113,6 +120,7 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
         resume_epoch,
         eval_file,
         weights_file,
+        threads,
         paths,
     }))
 }
@@ -200,6 +208,7 @@ fn run_train(args: TrainArgs) {
     eprintln!("=== Othello ML Training ===");
     eprintln!("Max empties: {}", args.max_empties);
     eprintln!("Epochs: {}", args.epochs);
+    eprintln!("Threads: {}", args.threads);
     if args.resume_epoch > 0 {
         eprintln!(
             "Resume epoch: {} (LR schedule continues from here)",
@@ -251,7 +260,8 @@ fn run_train(args: TrainArgs) {
         }
     }
 
-    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted) {
+    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads)
+    {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -268,6 +278,7 @@ fn run_train(args: TrainArgs) {
         epochs: args.epochs,
         epoch_offset: args.resume_epoch,
         interrupt: Some(interrupted),
+        threads: args.threads,
     };
     trainer.train_epochs(&mut weights, &mut examples, &train_config);
 
@@ -476,6 +487,7 @@ fn print_train_usage(program: &str) {
     eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
     eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)");
     eprintln!("  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)");
+    eprintln!("  -t, --threads N       Number of threads for parallel training (default: 1)");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");

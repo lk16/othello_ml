@@ -5,6 +5,7 @@
 
 use crate::eval::alphabeta;
 use crate::othello::board::Board;
+use crate::othello::position::Position;
 use crate::training::trainer::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
@@ -89,6 +90,25 @@ impl EvalCache {
         Ok(())
     }
 
+    /// Append evaluations for specific indices of the missing positions.
+    fn append_indices(
+        &self,
+        missing: &[&Board],
+        scores: &[i32],
+        indices: &[usize],
+    ) -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| format!("Failed to open {} for appending: {}", self.path, e))?;
+        for &idx in indices {
+            let fen = missing[idx].position.to_fen(missing[idx].black_to_move);
+            writeln!(file, "{fen} {}", scores[idx])
+                .map_err(|e| format!("Failed to write eval file: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Create (or overwrite) the cache file with evaluations for all positions.
     pub fn save_all(
         &self,
@@ -105,6 +125,23 @@ impl EvalCache {
         Ok(())
     }
 
+    /// Save evaluations for specific indices of positions.
+    fn save_indices(
+        &self,
+        positions: &[Board],
+        scores: &[i32],
+        indices: &[usize],
+    ) -> Result<(), String> {
+        let mut file = fs::File::create(&self.path)
+            .map_err(|e| format!("Failed to create {}: {}", self.path, e))?;
+        for &idx in indices {
+            let fen = positions[idx].position.to_fen(positions[idx].black_to_move);
+            writeln!(file, "{fen} {}", scores[idx])
+                .map_err(|e| format!("Failed to write eval file: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Build training examples from positions, using cached evaluations when
     /// available and computing the rest via alpha-beta.
     ///
@@ -115,11 +152,12 @@ impl EvalCache {
         &self,
         positions: &[Board],
         interrupt: &Arc<AtomicBool>,
+        threads: usize,
     ) -> Result<Vec<TrainingExample>, String> {
         if self.exists() {
-            self.build_from_existing(positions, interrupt)
+            self.build_from_existing(positions, interrupt, threads)
         } else {
-            self.build_fresh(positions, interrupt)
+            self.build_fresh(positions, interrupt, threads)
         }
     }
 
@@ -128,6 +166,7 @@ impl EvalCache {
         &self,
         positions: &[Board],
         interrupt: &Arc<AtomicBool>,
+        threads: usize,
     ) -> Result<Vec<TrainingExample>, String> {
         eprintln!("\n--- Loading evaluations from {} ---", self.path);
         let eval_map = self.load_map()?;
@@ -150,42 +189,21 @@ impl EvalCache {
             let n = missing.len();
             eprintln!("Computing {n} missing positions with alpha-beta...");
 
-            let eval_start = std::time::Instant::now();
-            let mut scores = Vec::with_capacity(n);
-            let mut last_print = eval_start;
+            let missing_positions: Vec<Position> = missing.iter().map(|b| b.position).collect();
+            let (scores, completed) =
+                evaluate_positions_parallel(&missing_positions, threads, interrupt);
 
-            for (i, pos) in missing.iter().enumerate() {
-                if interrupt.load(Ordering::Relaxed) {
-                    eprintln!("\nInterrupted! Saving {i} evaluated positions...");
-                    self.append(&missing[..i], &scores)?;
-                    eprintln!("Saved {i} evaluations to {}", self.path);
-                    return Err("Interrupted by user".to_string());
-                }
-
-                scores.push(alphabeta::exact_score(&pos.position));
-
-                let now = std::time::Instant::now();
-                if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
-                    let elapsed = now.duration_since(eval_start).as_secs_f64();
-                    let completed = i + 1;
-                    let remaining = n - completed;
-                    let rate = completed as f64 / elapsed;
-                    let eta = remaining as f64 / rate;
-                    eprintln!(
-                        "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
-                    );
-                    last_print = now;
-                }
+            if interrupt.load(Ordering::Relaxed) {
+                eprintln!(
+                    "\nInterrupted! Saving {} evaluated positions...",
+                    completed.len()
+                );
+                self.append_indices(&missing, &scores, &completed)?;
+                eprintln!("Saved {} evaluations to {}", completed.len(), self.path);
+                return Err("Interrupted by user".to_string());
             }
 
-            let elapsed = eval_start.elapsed();
-            eprintln!(
-                "  Done in {:.1}s ({:.0} pos/s)",
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64().max(0.001)
-            );
-
-            self.append(&missing, &scores)?;
+            self.append_indices(&missing, &scores, &completed)?;
             eprintln!("Appended {n} new evaluations to {}", self.path);
 
             for (pos, &score) in missing.iter().zip(scores.iter()) {
@@ -203,6 +221,7 @@ impl EvalCache {
         &self,
         positions: &[Board],
         interrupt: &Arc<AtomicBool>,
+        threads: usize,
     ) -> Result<Vec<TrainingExample>, String> {
         let n = positions.len();
         eprintln!(
@@ -210,48 +229,18 @@ impl EvalCache {
             self.path
         );
 
-        let eval_start = std::time::Instant::now();
-        let mut scores = Vec::with_capacity(n);
-        let mut last_print = eval_start;
+        let all_positions: Vec<Position> = positions.iter().map(|b| b.position).collect();
+        let (scores, completed) = evaluate_positions_parallel(&all_positions, threads, interrupt);
 
-        for (i, pos) in positions.iter().enumerate() {
-            if interrupt.load(Ordering::Relaxed) {
-                eprintln!("\nInterrupted! Saving {i} evaluated positions...");
-                let partial_examples: Vec<TrainingExample> = positions[..i]
-                    .iter()
-                    .zip(scores.iter())
-                    .map(|(p, &s)| TrainingExample {
-                        position: p.position,
-                        target_score: s,
-                    })
-                    .collect();
-                self.save_all(&positions[..i], &partial_examples)?;
-                eprintln!("Saved {i} evaluations to {}", self.path);
-                return Err("Interrupted by user".to_string());
-            }
-
-            scores.push(alphabeta::exact_score(&pos.position));
-
-            let now = std::time::Instant::now();
-            if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
-                let elapsed = now.duration_since(eval_start).as_secs_f64();
-                let completed = i + 1;
-                let remaining = n - completed;
-                let rate = completed as f64 / elapsed;
-                let eta = remaining as f64 / rate;
-                eprintln!(
-                    "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
-                );
-                last_print = now;
-            }
+        if interrupt.load(Ordering::Relaxed) {
+            eprintln!(
+                "\nInterrupted! Saving {} evaluated positions...",
+                completed.len()
+            );
+            self.save_indices(positions, &scores, &completed)?;
+            eprintln!("Saved {} evaluations to {}", completed.len(), self.path);
+            return Err("Interrupted by user".to_string());
         }
-
-        let elapsed = eval_start.elapsed();
-        eprintln!(
-            "  Done in {:.1}s ({:.0} pos/s)",
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64().max(0.001)
-        );
 
         let examples: Vec<TrainingExample> = positions
             .iter()
@@ -269,6 +258,76 @@ impl EvalCache {
     }
 }
 
+/// Evaluate positions in parallel using worker threads and channels.
+///
+/// Returns `(scores, completed_indices)`. If interrupted, `completed_indices`
+/// contains only the indices that were evaluated before the interrupt.
+/// Otherwise, `completed_indices.len() == positions.len()`.
+fn evaluate_positions_parallel(
+    positions: &[Position],
+    threads: usize,
+    interrupt: &Arc<AtomicBool>,
+) -> (Vec<i32>, Vec<usize>) {
+    use std::sync::mpsc;
+
+    let n = positions.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let n_threads = threads.max(1).min(n);
+    let (tx, rx) = mpsc::channel::<(usize, i32)>();
+
+    let chunk_size = n.div_ceil(n_threads);
+    for (chunk_idx, chunk) in positions.chunks(chunk_size).enumerate() {
+        let tx = tx.clone();
+        let chunk: Vec<Position> = chunk.to_vec();
+        let start = chunk_idx * chunk_size;
+        let interrupt = Arc::clone(interrupt);
+        std::thread::spawn(move || {
+            for (i, pos) in chunk.iter().enumerate() {
+                if interrupt.load(Ordering::Relaxed) {
+                    return;
+                }
+                let score = alphabeta::exact_score(pos);
+                if tx.send((start + i, score)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let mut scores = vec![0i32; n];
+    let mut completed = Vec::with_capacity(n);
+    let eval_start = std::time::Instant::now();
+    let spin = b"|/-\\";
+
+    while let Ok((idx, score)) = rx.recv() {
+        scores[idx] = score;
+        completed.push(idx);
+        let done = completed.len();
+        let elapsed = eval_start.elapsed().as_secs_f64();
+        let remaining = n - done;
+        let rate = done as f64 / elapsed.max(0.001);
+        let eta = remaining as f64 / rate;
+        eprint!(
+            "\r  {} {done}/{n} evaluated, {remaining} remaining, ETA: {eta:.0}s          ",
+            spin[done % spin.len()] as char,
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    let elapsed = eval_start.elapsed();
+    eprintln!(
+        "\r  Done in {:.1}s ({:.0} pos/s)          ",
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64().max(0.001)
+    );
+
+    (scores, completed)
+}
+
 /// Build training examples from positions, either via an eval-file cache or
 /// by evaluating all positions with alpha-beta directly.
 ///
@@ -279,44 +338,27 @@ pub fn build_examples(
     eval_file: &Option<String>,
     positions: &[Board],
     interrupt: &Arc<AtomicBool>,
+    threads: usize,
 ) -> Result<Vec<TrainingExample>, String> {
     if let Some(ref path) = eval_file {
         let cache = EvalCache::new(path.clone());
-        cache.build_examples(positions, interrupt)
+        cache.build_examples(positions, interrupt, threads)
     } else {
         let n = positions.len();
         eprintln!("\n--- Evaluating {n} positions with alpha-beta ---");
-        let eval_start = std::time::Instant::now();
-        let mut scores = Vec::with_capacity(n);
-        let mut last_print = eval_start;
 
-        for (i, pos) in positions.iter().enumerate() {
-            if interrupt.load(Ordering::Relaxed) {
-                eprintln!("\nInterrupted! Evaluated {i}/{n} positions.");
-                return Err("Interrupted by user".to_string());
-            }
+        let all_positions: Vec<Position> = positions.iter().map(|b| b.position).collect();
+        let (scores, completed) = evaluate_positions_parallel(&all_positions, threads, interrupt);
 
-            scores.push(alphabeta::exact_score(&pos.position));
-
-            let now = std::time::Instant::now();
-            if now.duration_since(last_print) >= std::time::Duration::from_secs(1) {
-                let elapsed = now.duration_since(eval_start).as_secs_f64();
-                let completed = i + 1;
-                let remaining = n - completed;
-                let rate = completed as f64 / elapsed;
-                let eta = remaining as f64 / rate;
-                eprintln!(
-                    "  {completed}/{n} positions evaluated, {remaining} remaining, ETA: {eta:.0}s"
-                );
-                last_print = now;
-            }
+        if interrupt.load(Ordering::Relaxed) {
+            eprintln!(
+                "\nInterrupted! Evaluated {}/{} positions.",
+                completed.len(),
+                n
+            );
+            return Err("Interrupted by user".to_string());
         }
-        let elapsed = eval_start.elapsed();
-        eprintln!(
-            "  Done in {:.1}s ({:.0} pos/s)",
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64().max(0.001)
-        );
+
         let examples = positions
             .iter()
             .zip(scores.iter())

@@ -4,6 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Message sent from worker threads back to the main thread.
+enum WorkerMsg {
+    Done { weights: Weights, loss: f64 },
+}
+
 /// Training data point: a board position paired with its ground truth evaluation.
 #[derive(Debug, Clone)]
 pub struct TrainingExample {
@@ -67,6 +72,8 @@ pub struct TrainingConfig {
     pub epoch_offset: usize,
     /// Optional interrupt flag for graceful early stopping.
     pub interrupt: Option<Arc<AtomicBool>>,
+    /// Number of threads for parallel batch processing (1 = single-threaded).
+    pub threads: usize,
 }
 
 impl Trainer {
@@ -128,8 +135,13 @@ impl Trainer {
 
     /// Train for multiple epochs with progress logging.
     ///
-    /// Uses [`TrainingConfig`] to control epochs, LR schedule offset, and
-    /// optional early stopping via an interrupt flag.
+    /// Uses [`TrainingConfig`] to control epochs, LR schedule offset,
+    /// optional early stopping via an interrupt flag, and thread count.
+    ///
+    /// When `threads > 1`, each batch is processed in parallel: the batch
+    /// is split across worker threads, each with a cloned copy of the
+    /// weights.  Results are sent back via channels and merged by
+    /// averaging the weight deltas.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
@@ -137,12 +149,14 @@ impl Trainer {
         config: &TrainingConfig,
     ) {
         use std::io::{self, Write};
+        use std::sync::mpsc;
 
         let epochs = config.epochs;
         let epoch_offset = config.epoch_offset;
         let n_examples = examples.len();
         let n_batches = n_examples.div_ceil(self.batch_size);
         let total_updates = n_examples * weights.feature_count() * epochs;
+        let n_threads = config.threads.max(1);
 
         eprintln!(
             "Training: {} epochs × {} examples ({} batches/epoch, batch_size={})",
@@ -163,6 +177,9 @@ impl Trainer {
             epoch_offset + epochs.saturating_sub(1),
             self.lr_decay
         );
+        if n_threads > 1 {
+            eprintln!("  threads: {n_threads}");
+        }
         eprintln!();
 
         let total_start = Instant::now();
@@ -181,8 +198,6 @@ impl Trainer {
                 }
             }
 
-            // Shuffle examples at the start of each epoch to break ordering
-            // biases.  Use a deterministic seed per epoch so runs are reproducible.
             let global_epoch = epoch_offset + epoch;
             let mut rng = XorShift32::new(global_epoch as u32);
             shuffle(examples, &mut rng);
@@ -192,25 +207,88 @@ impl Trainer {
             let epoch_start = Instant::now();
             let mut loss: f64 = 0.0;
 
-            // Process in mini-batches
-            for (batch_idx, chunk) in examples.chunks(self.batch_size).enumerate() {
-                loss += self.train_batch(weights, chunk, current_lr);
+            for chunk in examples.chunks(self.batch_size) {
+                let workers = n_threads.min(chunk.len());
+                let chunk: Vec<TrainingExample> = chunk.to_vec();
+                let chunk_size = chunk.len();
 
-                // Intra-epoch progress: show every 10% of batches
-                let progress_pct = (batch_idx + 1) * 100 / n_batches;
-                if progress_pct % 10 == 0 || batch_idx == n_batches - 1 {
-                    let elapsed = epoch_start.elapsed();
-                    let done = (batch_idx + 1) * self.batch_size;
-                    let throughput = done as f64 / elapsed.as_secs_f64().max(0.001);
-                    eprint!(
-                        "\r  [{:3}%] batch {}/{} ({:.0} ex/s)          ",
-                        progress_pct,
-                        batch_idx + 1,
-                        n_batches,
-                        throughput
-                    );
-                    let _ = io::stderr().flush();
+                let (tx, rx) = mpsc::channel::<WorkerMsg>();
+
+                for part in chunk.chunks(chunk_size.div_ceil(workers)) {
+                    let tx = tx.clone();
+                    let mut w = weights.clone();
+                    let part = part.to_vec();
+                    let lr = current_lr;
+                    std::thread::spawn(move || {
+                        let loss = {
+                            let features = w.features().clone();
+                            let n_features = features.count() as f32;
+                            let mut loss: f64 = 0.0;
+                            for example in &part {
+                                let predicted = w.evaluate(&example.position, &features);
+                                let error = example.target_score as f32 - predicted;
+                                loss += (error as f64) * (error as f64);
+                                let gradient = 2.0 * error / n_features;
+                                let feature_indices = features.extract(&example.position);
+                                for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
+                                    w.update_weight_sgd(
+                                        feat_idx,
+                                        pattern_idx,
+                                        example.position.empties(),
+                                        lr,
+                                        gradient,
+                                    );
+                                }
+                            }
+                            loss
+                        };
+                        let _ = tx.send(WorkerMsg::Done { weights: w, loss });
+                    });
                 }
+                drop(tx);
+
+                let mut worker_weights = Vec::with_capacity(workers);
+                let mut done = 0usize;
+                let spin = b"|/-\\";
+
+                while done < workers {
+                    match rx.recv() {
+                        Ok(WorkerMsg::Done {
+                            weights: w,
+                            loss: l,
+                        }) => {
+                            done += 1;
+                            loss += l;
+                            worker_weights.push(w);
+                            let elapsed = epoch_start.elapsed().as_secs_f64();
+                            let throughput = if elapsed > 0.01 {
+                                (done * chunk_size / workers) as f64 / elapsed
+                            } else {
+                                0.0
+                            };
+                            eprint!(
+                                "\r  {} {}/{} workers  {:.0} ex/s          ",
+                                spin[done % spin.len()] as char,
+                                done,
+                                workers,
+                                throughput,
+                            );
+                            let _ = io::stderr().flush();
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if let Some(ref flag) = config.interrupt {
+                    if flag.load(Ordering::Relaxed) {
+                        eprintln!(
+                            "\nInterrupted during epoch {global_epoch} — keeping weights from last completed epoch."
+                        );
+                        return;
+                    }
+                }
+
+                weights.merge_from_workers(&worker_weights);
             }
 
             let epoch_elapsed = epoch_start.elapsed();
@@ -218,7 +296,6 @@ impl Trainer {
             let avg_loss = loss / n_examples as f64;
             let throughput = n_examples as f64 / epoch_elapsed.as_secs_f64().max(0.001);
 
-            // Estimate time remaining
             let avg_epoch_secs = total_elapsed.as_secs_f64() / (epoch + 1) as f64;
             let remaining_secs = avg_epoch_secs * (epochs - epoch - 1) as f64;
 

@@ -21,23 +21,20 @@ const SCORE_MAX: i32 = 64;
 
 /// Negamax with alpha-beta pruning, searching to game end.
 fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
-    // Terminal position: final score from current player's perspective.
-    if pos.is_game_end() {
-        return pos.final_score();
-    }
-
-    // Pass: no legal moves for the current player.
-    if !pos.has_moves() {
-        return -alphabeta_exact(&pos.pass_move(), -beta, -alpha);
-    }
-
     let moves = pos.get_moves();
-    for cell in 0..64 {
-        let bit = 1u64 << cell;
-        if moves & bit == 0 {
-            continue;
+    if moves == 0 {
+        let passed = pos.pass_move();
+        if passed.get_moves() == 0 {
+            return pos.final_score();
         }
-        let child = make_move(pos, cell);
+        return -alphabeta_exact(&passed, -beta, -alpha);
+    }
+
+    let mut remaining = moves;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        let child = pos.do_move(cell);
         let score = -alphabeta_exact(&child, -beta, -alpha);
         if score > alpha {
             alpha = score;
@@ -48,12 +45,6 @@ fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
     }
 
     alpha
-}
-
-/// Apply a move via [`Position::do_move`], which places a disc, flips
-/// opponent discs, and swaps sides.
-fn make_move(pos: &Position, cell: u32) -> Position {
-    pos.do_move(cell)
 }
 
 /// Evaluate a batch of positions, returning one score per position
@@ -95,10 +86,10 @@ pub fn best_move(
     let mut alpha = SCORE_MIN;
     let mut best_cell = 0u32;
 
-    for cell in 0..64 {
-        if moves & (1u64 << cell) == 0 {
-            continue;
-        }
+    let mut remaining = moves;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
         let child = pos.do_move(cell);
         let score = -alphabeta(
             &child,
@@ -127,10 +118,10 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
     let mut alpha = SCORE_MIN;
     let mut best_cell = 0u32;
 
-    for cell in 0..64 {
-        if moves & (1u64 << cell) == 0 {
-            continue;
-        }
+    let mut remaining = moves;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
         let child = pos.do_move(cell);
         let score = -alphabeta_exact(&child, -SCORE_MAX, -alpha);
         if score > alpha {
@@ -151,23 +142,23 @@ fn alphabeta(
     mut alpha: i32,
     beta: i32,
 ) -> i32 {
-    if pos.is_game_end() {
-        return pos.final_score();
-    }
-
-    if !pos.has_moves() {
-        return -alphabeta(&pos.pass_move(), depth, weights, features, -beta, -alpha);
+    let moves = pos.get_moves();
+    if moves == 0 {
+        let passed = pos.pass_move();
+        if passed.get_moves() == 0 {
+            return pos.final_score();
+        }
+        return -alphabeta(&passed, depth, weights, features, -beta, -alpha);
     }
 
     if depth == 0 {
         return heuristic(pos, weights, features);
     }
 
-    let moves = pos.get_moves();
-    for cell in 0..64 {
-        if moves & (1u64 << cell) == 0 {
-            continue;
-        }
+    let mut remaining = moves;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
         let child = pos.do_move(cell);
         let score = -alphabeta(&child, depth - 1, weights, features, -beta, -alpha);
         if score > alpha {
