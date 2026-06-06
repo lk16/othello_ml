@@ -3,8 +3,12 @@ use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Parsed command-line arguments.
-struct CliArgs {
+enum Command {
+    Train(TrainArgs),
+    Play,
+}
+
+struct TrainArgs {
     max_empties: u32,
     epochs: usize,
     lr_decay: f32,
@@ -14,10 +18,30 @@ struct CliArgs {
     paths: Vec<String>,
 }
 
-/// Parse CLI arguments. Returns `None` if `--help` was shown.
-fn parse_args() -> Option<CliArgs> {
+fn parse_args() -> Option<Command> {
     let args: Vec<String> = env::args().collect();
 
+    if args.len() < 2 {
+        print_usage(&args[0]);
+        return None;
+    }
+
+    match args[1].as_str() {
+        "train" => parse_train_args(&args[0], &args[2..]),
+        "play" => Some(Command::Play),
+        "--help" | "-h" => {
+            print_usage(&args[0]);
+            None
+        }
+        other => {
+            eprintln!("Unknown command: {other}\n");
+            print_usage(&args[0]);
+            None
+        }
+    }
+}
+
+fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     let mut max_empties: u32 = 60;
     let mut epochs: usize = 10;
     let mut lr_decay: f32 = 0.01;
@@ -25,7 +49,7 @@ fn parse_args() -> Option<CliArgs> {
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
     let mut paths: Vec<String> = Vec::new();
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         if args[i] == "--max-empties" || args[i] == "-n" {
             i += 1;
@@ -58,7 +82,7 @@ fn parse_args() -> Option<CliArgs> {
                 resume_epoch = args[i].parse::<usize>().unwrap_or(0);
             }
         } else if args[i] == "--help" || args[i] == "-h" {
-            print_usage(&args[0]);
+            print_train_usage(program);
             return None;
         } else {
             paths.push(args[i].clone());
@@ -66,7 +90,7 @@ fn parse_args() -> Option<CliArgs> {
         i += 1;
     }
 
-    Some(CliArgs {
+    Some(Command::Train(TrainArgs {
         max_empties,
         epochs,
         lr_decay,
@@ -74,19 +98,27 @@ fn parse_args() -> Option<CliArgs> {
         eval_file,
         weights_file,
         paths,
-    })
+    }))
 }
 
 fn main() {
-    let args = if let Some(a) = parse_args() {
-        a
+    let cmd = if let Some(c) = parse_args() {
+        c
     } else {
         return;
     };
 
+    match cmd {
+        Command::Train(args) => run_train(args),
+        Command::Play => eprintln!("play command not yet implemented"),
+    }
+}
+
+fn run_train(args: TrainArgs) {
     if args.paths.is_empty() {
         eprintln!("Error: No input files or directories specified.\n");
-        print_usage(&env::args().collect::<Vec<_>>()[0]);
+        let program = env::args().next().unwrap_or_default();
+        print_train_usage(&program);
         return;
     }
 
@@ -101,8 +133,6 @@ fn main() {
     }
     eprintln!("Input paths: {:?}", args.paths);
 
-    // Load games
-    eprintln!("\n--- Loading games ---");
     let games = match load_games(&args.paths) {
         Ok(g) => g,
         Err(e) => {
@@ -111,7 +141,6 @@ fn main() {
         }
     };
 
-    // Extract positions
     eprintln!(
         "\n--- Extracting positions (empties <= {}) ---",
         args.max_empties
@@ -129,7 +158,6 @@ fn main() {
         return;
     }
 
-    // Initialize features and weights
     let features = Features::edax();
     eprintln!("Features: {}", features.count());
 
@@ -144,7 +172,6 @@ fn main() {
     };
     eprintln!("Training examples: {}", examples.len());
 
-    // Train
     eprintln!("\n--- Training ---");
     eprintln!("(press Ctrl+C to stop early and save weights)");
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -166,7 +193,6 @@ fn main() {
     };
     trainer.train_epochs(&mut weights, &mut examples, &train_config);
 
-    // Show sample weights and save
     weights.print_sample(&features, 10);
 
     eprintln!("\n--- Saving weights ---");
@@ -179,7 +205,19 @@ fn main() {
 }
 
 fn print_usage(program: &str) {
-    eprintln!("Usage: {program} [OPTIONS] <path>...");
+    eprintln!("Usage: {program} <COMMAND> [OPTIONS]");
+    eprintln!();
+    eprintln!("Othello ML training and playing.");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  train    Train evaluation weights from game files");
+    eprintln!("  play     Play a game against the CLI");
+    eprintln!();
+    eprintln!("Use \"{program} <command> --help\" for more information about a command.");
+}
+
+fn print_train_usage(program: &str) {
+    eprintln!("Usage: {program} train [OPTIONS] <path>...");
     eprintln!();
     eprintln!("Train Othello evaluation weights from game files.");
     eprintln!();
@@ -209,8 +247,8 @@ fn print_usage(program: &str) {
     eprintln!("    - directories (scanned recursively for game files)");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  {program} training_data/");
-    eprintln!("  {program} --max-empties 20 --epochs 50 training_data/");
-    eprintln!("  {program} --eval-file ignored/evals.txt --epochs 30 training_data/");
-    eprintln!("  {program} -e 1000 -d 0.001 -f evals.txt training_data/");
+    eprintln!("  {program} train training_data/");
+    eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
+    eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
+    eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
 }
