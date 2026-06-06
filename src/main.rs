@@ -118,6 +118,8 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
 
 fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     let mut player_color = None;
+    let mut depth: u32 = 6;
+    let mut exact_empties: u32 = 12;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--player" || args[i] == "-p" {
@@ -129,6 +131,16 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
                     eprintln!("Invalid player color: {}. Use b/w/black/white.", args[i]);
                     return None;
                 }
+            }
+        } else if args[i] == "--depth" {
+            i += 1;
+            if i < args.len() {
+                depth = args[i].parse::<u32>().unwrap_or(6);
+            }
+        } else if args[i] == "--exact-empties" {
+            i += 1;
+            if i < args.len() {
+                exact_empties = args[i].parse::<u32>().unwrap_or(12);
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             print_play_usage(program);
@@ -142,8 +154,8 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     }
 
     Some(Command::Play(PlayArgs {
-        depth: 6,
-        exact_empties: 12,
+        depth,
+        exact_empties,
         player_color,
     }))
 }
@@ -463,6 +475,8 @@ fn print_play_usage(program: &str) {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("  -p, --player COLOR    Player color: b/black or w/white (default: random)");
+    eprintln!("      --depth N         Bot search depth (default: 6)");
+    eprintln!("      --exact-empties N Use exact search when <= N empties remain (default: 12)");
     eprintln!("  -h, --help            Show this help message");
 }
 
