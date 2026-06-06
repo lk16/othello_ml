@@ -127,12 +127,8 @@ where
                 };
                 positions.push(faced);
 
-                // Apply the move
-                board.player |= 1u64 << cell;
-                board.flip_discs(cell as u32);
-
-                // Switch sides
-                std::mem::swap(&mut board.player, &mut board.opponent);
+                // Apply the move and switch sides
+                board = board.do_move(cell as u32);
                 black_to_move = !black_to_move;
             }
         }

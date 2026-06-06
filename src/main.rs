@@ -1,7 +1,4 @@
-use othello_eval::{
-    build_examples, edax_available, load_games, EdaxInterface, Features, Trainer, TrainingConfig,
-    Weights,
-};
+use othello_eval::{build_examples, load_games, Features, Trainer, TrainingConfig, Weights};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,8 +11,6 @@ struct CliArgs {
     resume_epoch: usize,
     eval_file: Option<String>,
     weights_file: String,
-    edax_level: u32,
-    edax_threads: usize,
     paths: Vec<String>,
 }
 
@@ -29,8 +24,6 @@ fn parse_args() -> Option<CliArgs> {
     let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
-    let mut edax_level: u32 = 10;
-    let mut edax_threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -48,16 +41,6 @@ fn parse_args() -> Option<CliArgs> {
             i += 1;
             if i < args.len() {
                 eval_file = Some(args[i].clone());
-            }
-        } else if args[i] == "--level" || args[i] == "-l" {
-            i += 1;
-            if i < args.len() {
-                edax_level = args[i].parse::<u32>().unwrap_or(10);
-            }
-        } else if args[i] == "--edax-threads" || args[i] == "-t" {
-            i += 1;
-            if i < args.len() {
-                edax_threads = args[i].parse::<usize>().unwrap_or(1);
             }
         } else if args[i] == "--weights" || args[i] == "-w" {
             i += 1;
@@ -90,8 +73,6 @@ fn parse_args() -> Option<CliArgs> {
         resume_epoch,
         eval_file,
         weights_file,
-        edax_level,
-        edax_threads,
         paths,
     })
 }
@@ -117,9 +98,6 @@ fn main() {
             "Resume epoch: {} (LR schedule continues from here)",
             args.resume_epoch
         );
-    }
-    if edax_available() || args.eval_file.is_some() {
-        eprintln!("Edax level: {}", args.edax_level);
     }
     eprintln!("Input paths: {:?}", args.paths);
 
@@ -157,17 +135,7 @@ fn main() {
 
     let mut weights = Weights::load_or_create(&args.weights_file, &features);
 
-    // Require Edax for ground truth
-    let edax_path = match env::var("EDAX_PATH") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("Error: Edax is required. Set EDAX_PATH to the Edax binary.");
-            return;
-        }
-    };
-    let edax = EdaxInterface::new(edax_path, args.edax_level, args.edax_threads);
-
-    let mut examples = match build_examples(&args.eval_file, &positions, &edax) {
+    let mut examples = match build_examples(&args.eval_file, &positions) {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -215,15 +183,13 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Train Othello evaluation weights from game files.");
     eprintln!();
-    eprintln!("Requires Edax (set EDAX_PATH) for ground truth evaluations.");
+    eprintln!("Uses exact alpha-beta evaluation for ground truth scores.");
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!(
         "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
     );
     eprintln!("  -e, --epochs N        Number of training epochs (default: 10)");
-    eprintln!("  -l, --level N         Edax search level, 0-60 even (default: 10)");
-    eprintln!("  -t, --edax-threads N  Parallel Edax processes (default: 1)");
     eprintln!(
         "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
     );
@@ -233,7 +199,7 @@ fn print_usage(program: &str) {
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
-    eprintln!("  Each line: <Edax FEN> <score>");
+    eprintln!("  Each line: <FEN> <score>");
     eprintln!("  FEN is 66 chars (64 board cells + space + side to move).");
     eprintln!();
     eprintln!("INPUT:");
@@ -243,12 +209,8 @@ fn print_usage(program: &str) {
     eprintln!("    - directories (scanned recursively for game files)");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  EDAX_PATH=../edax {program} training_data/");
-    eprintln!("  EDAX_PATH=../edax {program} --max-empties 20 --epochs 50 training_data/");
-    eprintln!(
-        "  EDAX_PATH=../edax {program} --eval-file ignored/evals.txt --epochs 30 training_data/"
-    );
-    eprintln!("  EDAX_PATH=../edax {program} -e 1000 -d 0.001 -f evals.txt training_data/");
-    eprintln!("  EDAX_PATH=../edax {program} -e 500 -r 1000 -w trained_weights.bin training_data/");
-    eprintln!("    (resume from epoch 1000, LR schedule continues from there)");
+    eprintln!("  {program} training_data/");
+    eprintln!("  {program} --max-empties 20 --epochs 50 training_data/");
+    eprintln!("  {program} --eval-file ignored/evals.txt --epochs 30 training_data/");
+    eprintln!("  {program} -e 1000 -d 0.001 -f evals.txt training_data/");
 }

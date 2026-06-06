@@ -33,7 +33,7 @@ Each item should be descriptive enough that specific examples are unnecessary.
 ## Documentation
 
 - **Cross-link between docs.** Group related content in one file and link from others rather than repeating.
-- **`ignored/` is not tracked.** It holds weight files, cached Edax evaluations, and other local-state files.
+- **`ignored/` is not tracked.** It holds weight files, cached evaluation files, and other local-state files.
 - **CLAUDE.md** loaded every session — keep it concise with build commands, architecture overview, and these guidelines.
 
 ## Project conventions

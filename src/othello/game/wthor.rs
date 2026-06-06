@@ -111,10 +111,6 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<super::Game>, String> {
                 }
             }
 
-            // Place the disc and flip captured pieces
-            board.player |= 1u64 << cell;
-            board.flip_discs(cell as u32);
-
             // Record the position BEFORE the move (the position the player faced)
             let faced = Board {
                 position: Position {
@@ -133,8 +129,8 @@ pub fn read_wthor_file(path: &Path) -> Result<Vec<super::Game>, String> {
             };
             positions.push(faced);
 
-            // Switch sides
-            std::mem::swap(&mut board.player, &mut board.opponent);
+            // Apply the move and switch sides
+            board = board.do_move(cell as u32);
             black_to_move = !black_to_move;
         }
 

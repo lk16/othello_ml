@@ -1,6 +1,6 @@
 //! Position representation for Othello — a pair of bitboards (player + opponent).
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Position {
     // Bitboards: bit position i represents cell i (0-63)
     // Cell mapping: a1=0, b1=1, ..., h1=7 (rank 1)
@@ -20,7 +20,7 @@ impl Position {
         }
     }
 
-    /// Create initial Othello position
+    /// Create initial Othello position.
     pub fn initial() -> Self {
         // d4=27, e4=28, d5=35, e5=36
         // Initially: player (black) at d5=35, e4=28
@@ -31,7 +31,7 @@ impl Position {
         }
     }
 
-    /// Get piece at cell (0-63)
+    /// Get piece at cell (0-63).
     pub fn get_cell(&self, cell: u32) -> Cell {
         let bit = 1u64 << cell;
         if self.player & bit != 0 {
@@ -43,86 +43,109 @@ impl Position {
         }
     }
 
-    /// Count discs for current player
+    /// Count discs for current player.
     pub fn player_discs(&self) -> u32 {
         self.player.count_ones()
     }
 
-    /// Count discs for opponent
+    /// Count discs for opponent.
     pub fn opponent_discs(&self) -> u32 {
         self.opponent.count_ones()
     }
 
-    /// Count empty cells
+    /// Count empty cells.
     pub fn empties(&self) -> u32 {
         64 - self.player_discs() - self.opponent_discs()
     }
 
-    /// Place a disc for current player at cell
-    pub fn place_disc(&mut self, cell: u32) {
-        let bit = 1u64 << cell;
-        self.player |= bit;
+    /// Count total occupied cells.
+    pub fn count_discs(&self) -> u32 {
+        (self.player | self.opponent).count_ones()
     }
 
-    /// Flip opponent discs in all 8 directions after placing a disc at `cell`.
+    /// Bitboard of all opponent discs that would be flipped by playing at `mv`.
     ///
-    /// Scans outward from `cell` in each direction. When it finds a run of
-    /// opponent discs followed by one of the current player's discs, it flips
-    /// the run. Does nothing if no flanks are found.
-    pub fn flip_discs(&mut self, cell: u32) {
-        let directions: [(i32, i32); 8] = [
+    /// Returns 0 if `mv` is occupied or would not flip any discs.
+    /// Adapted from Edax / flippy.
+    pub fn flipped(&self, mv: u32) -> u64 {
+        let move_bit = 1u64 << mv;
+        if (self.player | self.opponent) & move_bit != 0 {
+            return 0;
+        }
+
+        const DIRECTIONS: [(i32, i32); 8] = [
             (-1, -1),
-            (0, -1),
-            (1, -1),
             (-1, 0),
-            (1, 0),
             (-1, 1),
+            (0, -1),
             (0, 1),
+            (1, -1),
+            (1, 0),
             (1, 1),
         ];
 
-        let x = (cell % 8) as i32;
-        let y = (cell / 8) as i32;
+        let mx = (mv % 8) as i32;
+        let my = (mv / 8) as i32;
+        let mut flipped: u64 = 0;
 
-        for &(dx, dy) in &directions {
-            let mut flips: u64 = 0;
-            let mut nx = x + dx;
-            let mut ny = y + dy;
-
-            while (0..8).contains(&nx) && (0..8).contains(&ny) {
-                let idx = (ny * 8 + nx) as u32;
-                let bit = 1u64 << idx;
-
-                if self.opponent & bit != 0 {
-                    flips |= bit;
-                } else if self.player & bit != 0 {
-                    // Found our own disc - flip the captured pieces
-                    self.player |= flips;
-                    self.opponent &= !flips;
-                    break;
-                } else {
-                    // Empty cell - no capture in this direction
+        for &(dx, dy) in &DIRECTIONS {
+            let mut s = 1;
+            loop {
+                let cx = mx + dx * s;
+                let cy = my + dy * s;
+                if !(0..8).contains(&cx) || !(0..8).contains(&cy) {
                     break;
                 }
-
-                nx += dx;
-                ny += dy;
+                let cur = (cy * 8 + cx) as u32;
+                let cur_bit = 1u64 << cur;
+                if self.opponent & cur_bit != 0 {
+                    s += 1;
+                } else {
+                    if (self.player & cur_bit != 0) && s >= 2 {
+                        for dist in 1..s {
+                            let f = mv as i32 + dist * (8 * dy + dx);
+                            flipped |= 1u64 << (f as u32);
+                        }
+                    }
+                    break;
+                }
             }
+        }
+
+        flipped
+    }
+
+    /// Apply a move, returning the resulting position (opponent to move next).
+    ///
+    /// If the move is invalid (occupied cell or no flips), returns `*self`
+    /// unchanged.
+    /// Adapted from Edax / flippy.
+    pub fn do_move(&self, mv: u32) -> Position {
+        let flipped = self.flipped(mv);
+        if flipped == 0 {
+            return *self;
+        }
+
+        let opp = self.player | flipped | (1u64 << mv);
+        let me = self.opponent & !opp;
+
+        Position {
+            player: me,
+            opponent: opp,
         }
     }
 
-    /// Get all occupied cells
+    /// Get all occupied cells.
     pub fn occupied(&self) -> u64 {
         self.player | self.opponent
     }
 
-    /// Get all empty cells
+    /// Get all empty cells.
     pub fn empty_cells(&self) -> u64 {
         !self.occupied()
     }
 
-    /// Convert cell index (0-63) to x8 board representation (same as Edax)
-    /// For compatibility with Edax patterns
+    /// Convert cell index (0-63) to x8 board representation.
     pub fn cell_to_coords(cell: u32) -> (u32, u32) {
         (cell % 8, cell / 8)
     }
@@ -131,32 +154,67 @@ impl Position {
     ///
     /// A move is legal at an empty cell if placing a disc there would flip
     /// at least one opponent disc in any of the 8 directions.
+    ///
+    /// Adapted from Edax / flippy.
     pub fn get_moves(&self) -> u64 {
-        // Mask: exclude the rightmost column to prevent horizontal wrapping
-        // 0x7E7E7E7E7E7E7E7E = all columns except 'H'
-        let mask = self.opponent & 0x7E7E7E7E7E7E7E7E;
+        // Middle columns mask (excludes A and H) prevents horizontal and
+        // diagonal bitboard wrapping.  Vertical shifts need no mask.
+        const MIDDLE_COLUMNS: u64 = 0x7E7E7E7E7E7E7E7E;
+        let mask = self.opponent & MIDDLE_COLUMNS;
         let mut moves: u64 = 0;
 
-        // Horizontal / vertical / diagonal shift amounts
-        for &shift in &[1, 7, 9, 8] {
-            // Direction: positive shift (left/up)
-            let mut flip = mask & (self.player << shift);
-            flip |= mask & (flip << shift);
-            let mask_dir = mask & (mask << shift);
-            flip |= mask_dir & (flip << (2 * shift));
-            flip |= mask_dir & (flip << (2 * shift));
-            moves |= flip << shift;
+        // Horizontal (shift 1)
+        let mut flip_l = mask & (self.player << 1);
+        flip_l |= mask & (flip_l << 1);
+        let mask_l = mask & (mask << 1);
+        flip_l |= mask_l & (flip_l << 2);
+        flip_l |= mask_l & (flip_l << 2);
+        let mut flip_r = mask & (self.player >> 1);
+        flip_r |= mask & (flip_r >> 1);
+        let mask_r = mask & (mask >> 1);
+        flip_r |= mask_r & (flip_r >> 2);
+        flip_r |= mask_r & (flip_r >> 2);
+        moves |= (flip_l << 1) | (flip_r >> 1);
 
-            // Direction: negative shift (right/down)
-            let mut flip = mask & (self.player >> shift);
-            flip |= mask & (flip >> shift);
-            let mask_dir = mask & (mask >> shift);
-            flip |= mask_dir & (flip >> (2 * shift));
-            flip |= mask_dir & (flip >> (2 * shift));
-            moves |= flip >> shift;
-        }
+        // Diagonal / (shift 7)
+        let mut flip_l = mask & (self.player << 7);
+        flip_l |= mask & (flip_l << 7);
+        let mask_l = mask & (mask << 7);
+        flip_l |= mask_l & (flip_l << 14);
+        flip_l |= mask_l & (flip_l << 14);
+        let mut flip_r = mask & (self.player >> 7);
+        flip_r |= mask & (flip_r >> 7);
+        let mask_r = mask & (mask >> 7);
+        flip_r |= mask_r & (flip_r >> 14);
+        flip_r |= mask_r & (flip_r >> 14);
+        moves |= (flip_l << 7) | (flip_r >> 7);
 
-        // Only empty cells are legal moves, mask to 64 bits
+        // Diagonal \ (shift 9)
+        let mut flip_l = mask & (self.player << 9);
+        flip_l |= mask & (flip_l << 9);
+        let mask_l = mask & (mask << 9);
+        flip_l |= mask_l & (flip_l << 18);
+        flip_l |= mask_l & (flip_l << 18);
+        let mut flip_r = mask & (self.player >> 9);
+        flip_r |= mask & (flip_r >> 9);
+        let mask_r = mask & (mask >> 9);
+        flip_r |= mask_r & (flip_r >> 18);
+        flip_r |= mask_r & (flip_r >> 18);
+        moves |= (flip_l << 9) | (flip_r >> 9);
+
+        // Vertical (shift 8) — no column masking needed
+        let mut flip_l = self.opponent & (self.player << 8);
+        flip_l |= self.opponent & (flip_l << 8);
+        let mask_l = self.opponent & (self.opponent << 8);
+        flip_l |= mask_l & (flip_l << 16);
+        flip_l |= mask_l & (flip_l << 16);
+        let mut flip_r = self.opponent & (self.player >> 8);
+        flip_r |= self.opponent & (flip_r >> 8);
+        let mask_r = self.opponent & (self.opponent >> 8);
+        flip_r |= mask_r & (flip_r >> 16);
+        flip_r |= mask_r & (flip_r >> 16);
+        moves |= (flip_l << 8) | (flip_r >> 8);
+
         moves & !(self.player | self.opponent)
     }
 
@@ -264,14 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn test_place_disc() {
-        let mut board = Position::new();
-        board.place_disc(0);
-        assert_eq!(board.get_cell(0), Cell::Player);
-        assert_eq!(board.player_discs(), 1);
-    }
-
-    #[test]
     fn test_initial_has_moves() {
         let board = Position::initial();
         assert!(board.has_moves());
@@ -296,24 +346,20 @@ mod tests {
 
     #[test]
     fn test_game_end_and_final_score() {
-        // Create a game-end position: black controls entire board
         let board = Position {
-            player: 0xFFFFFFFFFFFFFFFF, // all discs
+            player: u64::MAX,
             opponent: 0,
         };
-        assert!(!board.has_moves()); // no empty squares
+        assert!(!board.has_moves());
         assert!(board.is_game_end());
-        // Player wins: 64 - 2*0 = 64
         assert_eq!(board.final_score(), 64);
 
-        // Opponent wins
         let board = Position {
             player: 0,
-            opponent: 0xFFFFFFFFFFFFFFFF,
+            opponent: u64::MAX,
         };
         assert_eq!(board.final_score(), -64);
 
-        // Tie: 32 each
         let board = Position {
             player: 0x00000000FFFFFFFF,
             opponent: 0xFFFFFFFF00000000,
@@ -323,9 +369,106 @@ mod tests {
 
     #[test]
     fn test_get_moves_empty_board() {
-        // An empty board: no opponent discs to flip → no moves
         let board = Position::new();
         assert!(!board.has_moves());
         assert_eq!(board.get_moves(), 0);
+    }
+
+    #[test]
+    fn test_do_move_initial() {
+        // Black plays f5 (cell 37) in the initial position
+        let pos = Position::initial();
+        let next = pos.do_move(37);
+        // Black places f5, flips e5.  White loses e5.
+        // After swap: player=white(1), opponent=black(4)
+        assert_eq!(next.player_discs(), 1); // white: 2 original, lost 1 (e5 flipped)
+        assert_eq!(next.opponent_discs(), 4); // black: 2 original + 1 placed + 1 flipped
+        assert!(next.has_moves());
+    }
+
+    #[test]
+    fn test_do_move_invalid_occupied() {
+        let pos = Position::initial();
+        // d5 (cell 35) already has a black disc
+        let result = pos.do_move(35);
+        assert_eq!(result, pos); // unchanged
+    }
+
+    #[test]
+    fn test_do_move_invalid_no_flips() {
+        let pos = Position::new();
+        // No opponent discs → no flips possible
+        let result = pos.do_move(0);
+        assert_eq!(result, pos); // unchanged
+    }
+
+    #[test]
+    fn test_flipped_initial() {
+        let pos = Position::initial();
+        // Black playing f5 (cell 37) should flip e5 (cell 36)
+        let flipped = pos.flipped(37);
+        assert_eq!(flipped, 1u64 << 36);
+    }
+
+    #[test]
+    fn test_flipped_invalid_occupied() {
+        let pos = Position::initial();
+        assert_eq!(pos.flipped(35), 0); // already occupied
+    }
+
+    #[test]
+    fn test_flipped_invalid_no_flips() {
+        let pos = Position::new();
+        assert_eq!(pos.flipped(0), 0);
+    }
+
+    #[test]
+    fn test_get_moves_corner_capture() {
+        // Regression: column A disc should be capturable by a vertical move.
+        // White to move, can play A8 capturing A7.
+        // Build position: white=O=player, black=X=opponent
+        // a8 empty, a7 black, a6 white
+        let mut pos = Position::new();
+        pos.player |= 1u64 << 40; // a6 white
+        pos.opponent |= 1u64 << 48; // a7 black
+        let moves = pos.get_moves();
+        assert!(moves & (1u64 << 56) != 0, "A8 should be a legal move");
+    }
+
+    #[test]
+    fn test_get_moves_no_phantom_wrap() {
+        // Regression: player disc at A8 should not wrap to H7 via horizontal shift.
+        // This position has X to move, but X has no legal moves (must pass).
+        // If get_moves is buggy, it finds a phantom move at g7 (cell 54).
+        let fen = "OOOOOOOOOXXXXOXOOXXXOXXOOXOOXXOOOXOXXXOOOOXOXXXOOOOXXX-OXXXXXXXO X";
+        // Parse FEN manually
+        let board = fen.as_bytes();
+        let mut x_discs: u64 = 0;
+        let mut o_discs: u64 = 0;
+        for i in 0..64 {
+            match board[i] {
+                b'X' => x_discs |= 1u64 << i,
+                b'O' => o_discs |= 1u64 << i,
+                _ => {}
+            }
+        }
+        let pos = Position {
+            player: x_discs,
+            opponent: o_discs,
+        };
+        assert!(!pos.has_moves(), "X should have no legal moves (must pass)");
+        assert_eq!(pos.get_moves(), 0);
+    }
+
+    #[test]
+    fn test_do_move_sequence() {
+        // Play a known opening and verify disc counts.
+        let pos = Position::initial();
+        // Black f5 (cell 37) — captures e5
+        let next = pos.do_move(37);
+        assert_eq!((next.opponent_discs(), next.player_discs()), (4, 1));
+        // White d6 (cell 43) — captures d5
+        let next = next.do_move(43);
+        assert_eq!((next.opponent_discs(), next.player_discs()), (3, 3));
     }
 }

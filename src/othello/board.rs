@@ -41,11 +41,10 @@ mod tests {
 
     #[test]
     fn test_board_empties_full_board() {
-        let mut pos = Position::new();
-        // Fill the board: place discs in all 64 cells (alternating sides just to fill)
-        for i in 0..64 {
-            pos.place_disc(i);
-        }
+        let pos = Position {
+            player: u64::MAX,
+            opponent: 0,
+        };
         let board = Board {
             position: pos,
             black_to_move: true,

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Othello ML — a Rust feature-based Othello position evaluator trained via SGD against Edax ground truth.
+Othello ML — a Rust feature-based Othello position evaluator trained via SGD against exact ground truth.
 
 ## Build & test
 
@@ -13,7 +13,8 @@ Always use `pre-commit run -a` — not `cargo check` directly. It runs check, fm
 ## Architecture
 
 - `src/othello/` — game logic: `Position` (bitboards), `Board` (position + side), `Game` (WTHOR/PGN)
-- `src/training/` — eval & training: `Features`, `Weights`, `Trainer`, `EdaxInterface`, `EvalCache`
+- `src/eval/` — exact evaluation: `alphabeta` (negamax), `cache` (FEN→score persistence)
+- `src/training/` — training: `Features`, `Weights`, `Trainer`
 - `test_data/` — sample files for self-contained tests
 
 See [docs/reference.md](docs/reference.md) for detailed architecture and file formats.
@@ -28,4 +29,4 @@ See [docs/best-practices.md](docs/best-practices.md) for project conventions.
 - **Prefer commands that require little human approval.** Avoid `sed` or commands with pipes or loops unless it's by far the best solution.
 - **Commit with concise one-line messages.**
 - **Docs should be grouped and self-contained.** Do not repeat content — cross-link between sections/files instead.
-- **The `ignored/` folder** is intentionally not in git. It holds weight files, cached Edax evaluations, and prompt files.
+- **The `ignored/` folder** is intentionally not in git. It holds weight files, cached evaluations, and prompt files.
