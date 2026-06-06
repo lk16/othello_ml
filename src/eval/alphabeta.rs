@@ -46,12 +46,18 @@ fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32) -> i32 {
         return -alphabeta_exact(&passed, -beta, -alpha);
     }
 
+    let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
     let mut remaining = moves;
     while remaining != 0 {
         let cell = remaining.trailing_zeros();
         remaining &= remaining - 1;
         let child = pos.do_move(cell);
-        let score = -alphabeta_exact(&child, -beta, -alpha);
+        move_list.push((child.get_moves().count_ones(), child));
+    }
+    move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
+
+    for (_, child) in &move_list {
+        let score = -alphabeta_exact(child, -beta, -alpha);
         if score > alpha {
             alpha = score;
             if alpha >= beta {
