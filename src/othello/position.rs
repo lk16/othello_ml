@@ -142,9 +142,11 @@ impl Position {
     /// the occupied-square check. Assumes `mv` is empty (no such check), which
     /// lets the endgame leaf solvers skip it on the hot path.
     ///
-    /// Dispatches to a per-square specialization (see [`FLIP`]).
+    /// Dispatches to a per-square specialization (see [`FLIP`]). The `& 63`
+    /// proves the index is in range so no bounds check is emitted; `mv` is
+    /// always a 0..64 square, so it never changes the result.
     pub(crate) fn flip_mask(mv: u32, player: u64, opponent: u64) -> u64 {
-        FLIP[mv as usize](player, opponent)
+        FLIP[(mv & 63) as usize](player, opponent)
     }
 
     /// Apply a move, returning the resulting position (opponent to move next).

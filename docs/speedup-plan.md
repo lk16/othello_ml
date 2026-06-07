@@ -179,7 +179,11 @@ a major bottleneck, and the table-lookup cost is dwarfed by the savings.
   Identical node counts; ~1.37× faster — the biggest single win since the early
   steps, confirming flip computation was a major bottleneck. The general 8-ray
   body now lives once, in `flip_at`. Composes with Step 11 (a per-square body
-  could itself use SIMD).
+  could itself use SIMD). Verified in the emitted asm: corner specializations
+  are ~1/3 the size of the centre (3 vs 8 ray directions), and the table is
+  indexed as `FLIP[(mv & 63) as usize]` so no bounds check is emitted (the `&63`
+  compiles to a single `and`, dropping the lib's `panic_bounds_check` count from
+  36 to 22); perf-neutral since that branch was predicted-not-taken anyway.
 
 ## Refactors (no perf change)
 
