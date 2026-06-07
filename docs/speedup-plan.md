@@ -38,13 +38,12 @@ boards, so noisy).
 | 18 | 55 | 4,682,275 | 382.5ms | 12.24M | 1.30× |
 | 20 | 8 | 40,164,910 | 3036.1ms | 13.23M | 1.15× |
 
-## Current baseline (after Step 7 — 3/4-empty solvers)
+## Baseline after Step 7 (3/4-empty solvers)
 
-Dedicated `solve_3`/`solve_4` leaf solvers, natural square order (no parity
-ordering yet). ~1.26× at every depth. The nodes/pos drop is partly a metric
-change: `solve_3`/`solve_4` internal nodes aren't counted (only `solve_1`
-leaves via `solve_2`), which also lowers the reported nodes/s — ms/pos is the
-honest measure.
+Dedicated `solve_3`/`solve_4` leaf solvers, natural square order. ~1.26× at
+every depth. The nodes/pos drop is partly a metric change: `solve_3`/`solve_4`
+internal nodes aren't counted (only `solve_1` leaves via `solve_2`), which also
+lowers reported nodes/s — ms/pos is the honest measure.
 
 | empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 6 |
 |---------|--------|-----------|--------|---------|-----------|
@@ -52,6 +51,18 @@ honest measure.
 | 16 | 350 | 431,642 | 45.3ms | 9.52M | 1.26× |
 | 18 | 55 | 2,864,005 | 303.1ms | 9.45M | 1.26× |
 | 20 | 8 | 23,721,405 | 2388.0ms | 9.93M | 1.27× |
+
+## Current baseline (after Step 8 — flip table)
+
+`count_last_flip` table for `solve_1`. Identical node counts (search unchanged),
+~1.13× faster per node.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 7 |
+|---------|--------|-----------|--------|---------|-----------|
+| 14 | 673 | 66,306 | 6.0ms | 11.04M | 1.13× |
+| 16 | 350 | 431,642 | 40.2ms | 10.75M | 1.13× |
+| 18 | 55 | 2,864,005 | 269.5ms | 10.63M | 1.12× |
+| 20 | 8 | 23,721,405 | 2079.3ms | 11.41M | 1.15× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -85,6 +96,12 @@ honest measure.
   empties, recursing into `solve_2`/`solve_3`. Edax's `search_solve_3/4` use a
   fixed-reference min/max convention; reimplemented here as plain negamax for
   consistency with `solve_2`. Natural square order (parity ordering is Step 9).
+- **Step 8**: `count_last_flip` table for `solve_1` — the move's four lines are
+  full except the move square, so flip counts come from a per-line lookup
+  indexed by (line position, player pattern). `COUNT_FLIP` and the diagonal
+  masks are generated at compile time with `const` blocks (no hardcoded
+  tables). `solve_2`/`solve_3`/`solve_4` keep `flips_for` since they need the
+  full flip mask to build child positions.
 
 ## Remaining steps
 
@@ -93,11 +110,6 @@ PVS pays off in proportion to ordering quality. Add Edax's other ordering
 signals (square-weighted mobility, corner stability) and selectivity tricks to
 reduce re-searches. Mobility (the dominant term) is already in place, so expect
 modest gains. (Parity ordering is split out into Step 9.)
-
-### Step 8 — Flip table
-Edax uses a precomputed `count_last_flip` table indexed by row/col.
-Would speed up `solve_1` and `solve_2` (and future 3/4-empty).
-Currently using bitboard fallback.
 
 ### Step 9 — Edax parity move ordering
 Order the empties so odd-parity regions are tried first, in `solve_3`/`solve_4`

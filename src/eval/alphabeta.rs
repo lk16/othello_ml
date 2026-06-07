@@ -85,6 +85,105 @@ fn solve_game_over(player: u64, n_empties: u32) -> i32 {
     }
 }
 
+// --- last-move flip count (Edax `count_last_flip`) -------------------------
+//
+// When a move is the board's *only* empty square, the four lines through it are
+// otherwise full, so every non-player cell on a line is an opponent disc. The
+// number of discs the move flips on one 8-cell line then depends only on the
+// player-disc pattern and the move's position in the line — a value we look up
+// in `COUNT_FLIP`. Tables are generated at compile time rather than hardcoded.
+
+/// `COUNT_FLIP[i][pattern]` = 2× discs flipped by playing at line-position `i`,
+/// where `pattern` bit j is set iff the player holds line-cell j and every
+/// other (non-`i`) cell is an opponent disc. Doubled to ease disc-difference
+/// arithmetic, matching Edax.
+const COUNT_FLIP: [[u8; 256]; 8] = {
+    let mut table = [[0u8; 256]; 8];
+    let mut i = 0;
+    while i < 8 {
+        let mut p = 0usize;
+        while p < 256 {
+            let mut flips = 0u32;
+            // Walk right of i: opponent cells flip once a player cell closes them.
+            let mut run = 0u32;
+            let mut j = i + 1;
+            while j < 8 {
+                if p & (1 << j) != 0 {
+                    flips += run;
+                    break;
+                }
+                run += 1;
+                j += 1;
+            }
+            // Walk left of i.
+            run = 0;
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if p & (1 << j) != 0 {
+                    flips += run;
+                    break;
+                }
+                run += 1;
+            }
+            table[i][p] = (2 * flips) as u8;
+            p += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
+/// Diagonal masks per square: `[0]` = the ╲ diagonal, `[1]` = the ╱ diagonal.
+const MASK_DIAG: [[u64; 64]; 2] = {
+    let mut m = [[0u64; 64]; 2];
+    let mut pos = 0;
+    while pos < 64 {
+        let x = (pos % 8) as i32;
+        let y = (pos / 8) as i32;
+        let mut sq = 0;
+        while sq < 64 {
+            let sx = sq % 8;
+            let sy = sq / 8;
+            if sx - sy == x - y {
+                m[0][pos] |= 1u64 << sq;
+            }
+            if sx + sy == x + y {
+                m[1][pos] |= 1u64 << sq;
+            }
+            sq += 1;
+        }
+        pos += 1;
+    }
+    m
+};
+
+/// Gather column `x` (bits x, x+8, …, x+56) into a contiguous 8-bit value,
+/// bit r = row r.
+#[inline]
+fn pack_v(p: u64, x: u32) -> usize {
+    (((p >> x) & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize
+}
+
+/// Gather a diagonal-masked bitboard into 8 bits, bit c = column c. Each
+/// diagonal cell sits in a distinct row/column, so the bytes don't collide.
+#[inline]
+fn pack_d(pm: u64) -> usize {
+    (pm.wrapping_mul(0x0101_0101_0101_0101) >> 56) as usize
+}
+
+/// 2× the number of discs `player` flips by playing at `pos`, valid only when
+/// `pos` is the board's only empty square (the [`solve_1`] invariant).
+fn count_last_flip(pos: u32, player: u64) -> i32 {
+    let x = (pos & 7) as usize;
+    let y = (pos >> 3) as usize;
+    let mut n = COUNT_FLIP[x][((player >> (y * 8)) & 0xFF) as usize]; // row
+    n += COUNT_FLIP[y][pack_v(player, x as u32)]; // column
+    n += COUNT_FLIP[x][pack_d(player & MASK_DIAG[0][pos as usize])]; // ╲
+    n += COUNT_FLIP[x][pack_d(player & MASK_DIAG[1][pos as usize])]; // ╱
+    n as i32
+}
+
 /// 1-empty leaf solver. Returns the exact score from `player`'s perspective
 /// for a full board with a single empty square at `sq`.
 ///
@@ -92,21 +191,21 @@ fn solve_game_over(player: u64, n_empties: u32) -> i32 {
 /// so no search window is needed. Does NOT increment NODE_COUNT; the caller
 /// accounts for this node.
 fn solve_1(player: u64, sq: u32) -> i32 {
-    let opponent = !player & !(1u64 << sq);
     // Differential after `player` places at `sq` before flips: +1 disc for the
     // player. Each flipped disc then shifts the differential by a further 2.
     let score_base = 2 * player.count_ones() as i32 - 62;
 
     // The side to move is forced to play at `sq` whenever that move is legal.
-    let flipped = flips_for(sq, player, opponent);
-    if flipped != 0 {
-        return score_base + 2 * flipped.count_ones() as i32;
+    let n_flips = count_last_flip(sq, player);
+    if n_flips != 0 {
+        return score_base + n_flips;
     }
 
     // Player cannot play, so it passes; the opponent is then forced to play.
-    let flipped_opp = flips_for(sq, opponent, player);
-    if flipped_opp != 0 {
-        return score_base - 2 - 2 * flipped_opp.count_ones() as i32;
+    let opponent = !player & !(1u64 << sq);
+    let n_flips_opp = count_last_flip(sq, opponent);
+    if n_flips_opp != 0 {
+        return score_base - 2 - n_flips_opp;
     }
 
     // Neither side can play: game over with one empty square.
@@ -666,6 +765,25 @@ mod tests {
                 assert_eq!(
                     solve_1(player, sq),
                     naive_exact(&pos),
+                    "player={player:#x} sq={sq}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_last_flip_matches_flips_for() {
+        // On a full board with one empty, the table lookup must equal 2× the
+        // popcount of the full flip mask, for every square and pattern.
+        for &sq in SQUARES {
+            let empty = 1u64 << sq;
+            for &pat in PATTERNS {
+                let player = pat & !empty;
+                let opponent = !player & !empty;
+                let expected = 2 * flips_for(sq, player, opponent).count_ones() as i32;
+                assert_eq!(
+                    count_last_flip(sq, player),
+                    expected,
                     "player={player:#x} sq={sq}"
                 );
             }
