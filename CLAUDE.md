@@ -19,6 +19,7 @@ Always use `pre-commit run -a` — not `cargo check` directly. It runs check, fm
 
 See [docs/reference.md](docs/reference.md) for detailed architecture and file formats.
 See [docs/best-practices.md](docs/best-practices.md) for project conventions.
+See [docs/speedup-plan.md](docs/speedup-plan.md) for the exact-search optimization roadmap.
 
 ## Guidelines
 
