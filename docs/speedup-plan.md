@@ -76,7 +76,7 @@ longer re-tests them per node. Identical node counts; ~2% faster at every depth.
 | 18 | 55 | 2,864,005 | 263.6ms | 10.87M | 1.02× |
 | 20 | 8 | 23,721,405 | 2029.3ms | 11.69M | 1.02× |
 
-## Current baseline (after Step 13 — skip ordering at 5 empties)
+## Baseline after Step 13 (skip ordering at 5 empties)
 
 Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
 (unordered empties-5 nodes re-search more under PVS) but each node is cheaper
@@ -88,6 +88,20 @@ Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
 | 16 | 350 | 469,604 | 38.3ms | 12.27M | 1.03× |
 | 18 | 55 | 3,108,566 | 256.7ms | 12.11M | 1.03× |
 | 20 | 8 | 25,561,308 | 1982.8ms | 12.89M | 1.02× |
+
+## Current baseline (after Step 14 — dedicated no-sort search)
+
+`alphabeta_nosort` handles the unordered range (empties 5 here) iterating the
+moves bitboard directly — no move-list `Vec`, no mobility tuples. Identical node
+counts to Step 13; ~4–6% faster (empties-5 nodes are frequent, so dropping their
+allocation matters).
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 13 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 71,882 | 5.5ms | 13.07M | 1.04× |
+| 16 | 350 | 469,604 | 36.3ms | 12.94M | 1.05× |
+| 18 | 55 | 3,108,566 | 242.0ms | 12.84M | 1.06× |
+| 20 | 8 | 25,561,308 | 1895.7ms | 13.49M | 1.05× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -139,6 +153,11 @@ Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
   extra nodes from worse PVS ordering. Set `SORT_MIN_EMPTIES = 6`. This crossover
   is empirical: re-tune it after Steps 6b / 10 / 11 (see notes on each), which
   shift the ordering cost/benefit balance.
+- **Step 14**: dedicated `alphabeta_nosort` for the unordered range
+  (`5 ..< SORT_MIN_EMPTIES`) — iterates the moves bitboard directly with no
+  move-list `Vec` or mobility tuples; `search_exact` is now a 3-way dispatch
+  (leaf / no-sort / sorted). Identical node counts; ~4–6% faster. The win grows
+  if `SORT_MIN_EMPTIES` rises (more levels use this allocation-free path).
 
 ## Refactors (no perf change)
 
@@ -149,16 +168,6 @@ Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
   the Step 8 baseline (a `const`-init thread-local is already a `%fs`-relative
   load/store, the same cost as a struct-field write) — done purely for clearer
   state ownership.
-
-## Next up — search-structure experiments (do these before the Remaining steps)
-
-### Step 14 — Dedicated no-sort search function
-Step 13 landed with `SORT_MIN_EMPTIES = 6`, so the only unordered general level
-is empties = 5. Remove the per-node `if sort` branch (and the unused mobility
-tuple) by factoring a separate never-sorts routine for empties = 5, with the
-sorting search dispatching into it at the boundary (mirroring Step 12's split).
-Expected gain is small (empties-5 nodes are a minority); benchmark to confirm
-it's worth the extra code.
 
 ## Remaining steps
 

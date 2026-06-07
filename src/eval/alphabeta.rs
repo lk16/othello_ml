@@ -385,11 +385,14 @@ impl Search {
     }
 
     /// Dispatch to the right routine for `empties`: the leaf solver for four or
-    /// fewer empties, the general PVS search otherwise.
+    /// fewer empties, the unordered PVS search below `SORT_MIN_EMPTIES`, the
+    /// ordered PVS search above it.
     #[inline]
     fn search_exact(&mut self, pos: &Position, alpha: i32, beta: i32, empties: u32) -> i32 {
         if empties <= 4 {
             self.solve_leaf(pos, alpha, beta, empties)
+        } else if empties < SORT_MIN_EMPTIES {
+            self.alphabeta_nosort(pos, alpha, beta, empties)
         } else {
             self.alphabeta_exact(pos, alpha, beta, empties)
         }
@@ -435,9 +438,9 @@ impl Search {
         }
     }
 
-    /// Negamax with PVS for positions with five or more empties. Leaf cases
-    /// (≤ 4 empties) are handled by [`Search::solve_leaf`] at the recursion
-    /// boundary, so this hot path never re-tests them.
+    /// Negamax with PVS and move ordering, for `empties >= SORT_MIN_EMPTIES`.
+    /// Children dispatch through [`Search::search_exact`] at the recursion
+    /// boundary, so this hot path never re-tests the leaf or unordered cases.
     fn alphabeta_exact(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
         self.nodes += 1;
 
@@ -450,26 +453,16 @@ impl Search {
             return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
         }
 
-        // Near the leaves the subtrees are small, so the cost of move ordering
-        // (a `get_moves` per child plus the sort) can outweigh the pruning it
-        // buys. Only order when at least `SORT_MIN_EMPTIES` empties remain.
-        let sort = empties >= SORT_MIN_EMPTIES;
+        // Order children by opponent mobility (fewest replies first).
         let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            let mobility = if sort {
-                child.get_moves().count_ones()
-            } else {
-                0
-            };
-            move_list.push((mobility, child));
+            move_list.push((child.get_moves().count_ones(), child));
         }
-        if sort {
-            move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
-        }
+        move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
 
         // Principal Variation Search: search the first (best-ordered) move with the
         // full window, then probe each sibling with a null window and re-search only
@@ -482,6 +475,49 @@ impl Search {
                 let probe = -self.search_exact(child, -alpha - 1, -alpha, empties - 1);
                 if probe > alpha && probe < beta {
                     -self.search_exact(child, -beta, -alpha, empties - 1)
+                } else {
+                    probe
+                }
+            };
+            first = false;
+            if score > alpha {
+                alpha = score;
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+
+        alpha
+    }
+
+    /// Negamax with PVS but no move ordering, for the few-empties range
+    /// (`5 ..< SORT_MIN_EMPTIES`) where ordering costs more than it saves.
+    /// Moves are tried in natural board order with no move-list allocation.
+    fn alphabeta_nosort(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.alphabeta_nosort(&passed, -beta, -alpha, empties);
+        }
+
+        let mut first = true;
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            let score = if first {
+                -self.search_exact(&child, -beta, -alpha, empties - 1)
+            } else {
+                let probe = -self.search_exact(&child, -alpha - 1, -alpha, empties - 1);
+                if probe > alpha && probe < beta {
+                    -self.search_exact(&child, -beta, -alpha, empties - 1)
                 } else {
                     probe
                 }
