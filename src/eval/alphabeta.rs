@@ -161,6 +161,108 @@ fn solve_2(player: u64, opponent: u64, mut alpha: i32, beta: i32, x1: u32, x2: u
     -solve_2(opponent, player, -beta, -alpha, x1, x2)
 }
 
+/// 3-empty leaf solver: a fail-soft negamax alpha-beta over the three empties
+/// at `x1`, `x2`, `x3`, recursing into [`solve_2`]. Returns the score from
+/// `player`'s perspective. Leaf node accounting happens in `solve_2`.
+fn solve_3(
+    player: u64,
+    opponent: u64,
+    mut alpha: i32,
+    beta: i32,
+    x1: u32,
+    x2: u32,
+    x3: u32,
+) -> i32 {
+    const NONE: i32 = SCORE_MIN - 1;
+    let mut best = NONE;
+
+    // (sq, the other two empties) for each candidate move.
+    for &(sq, a, b) in &[(x1, x2, x3), (x2, x1, x3), (x3, x1, x2)] {
+        if alpha >= beta {
+            break;
+        }
+        let f = flips_for(sq, player, opponent);
+        if f != 0 {
+            let moved = player | f | (1u64 << sq); // child opponent (just-moved discs)
+            let child_player = opponent & !moved; // opponent to move, empties a and b
+            let s = -solve_2(child_player, moved, -beta, -alpha, a, b);
+            if s > best {
+                best = s;
+                if best > alpha {
+                    alpha = best;
+                }
+            }
+        }
+    }
+
+    if best != NONE {
+        return best;
+    }
+
+    // Player passes. Game over if the opponent also has no move here.
+    if flips_for(x1, opponent, player) == 0
+        && flips_for(x2, opponent, player) == 0
+        && flips_for(x3, opponent, player) == 0
+    {
+        return solve_game_over(player, 3);
+    }
+    -solve_3(opponent, player, -beta, -alpha, x1, x2, x3)
+}
+
+/// 4-empty leaf solver: a fail-soft negamax alpha-beta over the four empties,
+/// recursing into [`solve_3`]. Returns the score from `player`'s perspective.
+fn solve_4(
+    player: u64,
+    opponent: u64,
+    mut alpha: i32,
+    beta: i32,
+    x1: u32,
+    x2: u32,
+    x3: u32,
+    x4: u32,
+) -> i32 {
+    const NONE: i32 = SCORE_MIN - 1;
+    let mut best = NONE;
+
+    // (sq, the other three empties) for each candidate move.
+    for &(sq, a, b, c) in &[
+        (x1, x2, x3, x4),
+        (x2, x1, x3, x4),
+        (x3, x1, x2, x4),
+        (x4, x1, x2, x3),
+    ] {
+        if alpha >= beta {
+            break;
+        }
+        let f = flips_for(sq, player, opponent);
+        if f != 0 {
+            let moved = player | f | (1u64 << sq);
+            let child_player = opponent & !moved;
+            let s = -solve_3(child_player, moved, -beta, -alpha, a, b, c);
+            if s > best {
+                best = s;
+                if best > alpha {
+                    alpha = best;
+                }
+            }
+        }
+    }
+
+    if best != NONE {
+        return best;
+    }
+
+    // Player passes. Game over if the opponent also has no move here.
+    if flips_for(x1, opponent, player) == 0
+        && flips_for(x2, opponent, player) == 0
+        && flips_for(x3, opponent, player) == 0
+        && flips_for(x4, opponent, player) == 0
+    {
+        return solve_game_over(player, 4);
+    }
+    -solve_4(opponent, player, -beta, -alpha, x1, x2, x3, x4)
+}
+
 /// Negamax with alpha-beta pruning, searching to game end.
 fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
     NODE_COUNT.with(|c| c.set(c.get() + 1));
@@ -180,6 +282,28 @@ fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i
         empty &= empty - 1;
         let x2 = empty.trailing_zeros();
         return solve_2(pos.player, pos.opponent, alpha, beta, x1, x2);
+    }
+
+    if empties == 3 {
+        let mut empty = !pos.occupied();
+        let x1 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x2 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x3 = empty.trailing_zeros();
+        return solve_3(pos.player, pos.opponent, alpha, beta, x1, x2, x3);
+    }
+
+    if empties == 4 {
+        let mut empty = !pos.occupied();
+        let x1 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x2 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x3 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x4 = empty.trailing_zeros();
+        return solve_4(pos.player, pos.opponent, alpha, beta, x1, x2, x3, x4);
     }
 
     let moves = pos.get_moves();
@@ -623,6 +747,145 @@ mod tests {
         for (player, opponent) in two_empty_layouts() {
             let pos = Position { player, opponent };
             assert_eq!(exact_score(&pos), naive_exact(&pos));
+        }
+    }
+
+    // --- solve_3 / solve_4 -------------------------------------------------
+
+    /// Player/opponent layouts for a fixed set of empty squares, one per
+    /// pattern. The empties become the board's only empty cells.
+    fn layouts_for(empties: &[u32]) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mask = empties.iter().fold(0u64, |m, &s| m | (1u64 << s));
+        PATTERNS.iter().map(move |&pat| {
+            let player = pat & !mask;
+            (player, !player & !mask)
+        })
+    }
+
+    fn run_solve_3(player: u64, opponent: u64) -> i32 {
+        let mut e = !(player | opponent);
+        let x1 = e.trailing_zeros();
+        e &= e - 1;
+        let x2 = e.trailing_zeros();
+        e &= e - 1;
+        let x3 = e.trailing_zeros();
+        solve_3(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3)
+    }
+
+    fn run_solve_4(player: u64, opponent: u64) -> i32 {
+        let mut e = !(player | opponent);
+        let x1 = e.trailing_zeros();
+        e &= e - 1;
+        let x2 = e.trailing_zeros();
+        e &= e - 1;
+        let x3 = e.trailing_zeros();
+        e &= e - 1;
+        let x4 = e.trailing_zeros();
+        solve_4(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3, x4)
+    }
+
+    /// Smaller square set (includes all four corners) to bound the 4-empty
+    /// combination count.
+    const SQUARES4: &[u32] = &[0, 7, 9, 28, 35, 49, 56, 63];
+
+    #[test]
+    fn solve_3_matches_naive() {
+        let n = SQUARES.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    let empties = [SQUARES[i], SQUARES[j], SQUARES[k]];
+                    for (player, opponent) in layouts_for(&empties) {
+                        let pos = Position { player, opponent };
+                        assert_eq!(pos.empties(), 3);
+                        assert_eq!(
+                            run_solve_3(player, opponent),
+                            naive_exact(&pos),
+                            "player={player:#x} opponent={opponent:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solve_4_matches_naive() {
+        let n = SQUARES4.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    for l in (k + 1)..n {
+                        let empties = [SQUARES4[i], SQUARES4[j], SQUARES4[k], SQUARES4[l]];
+                        for (player, opponent) in layouts_for(&empties) {
+                            let pos = Position { player, opponent };
+                            assert_eq!(pos.empties(), 4);
+                            assert_eq!(
+                                run_solve_4(player, opponent),
+                                naive_exact(&pos),
+                                "player={player:#x} opponent={opponent:#x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solve_3_and_4_respect_window() {
+        // Fail-soft: tight windows must land on the correct side of the bound.
+        let check = |player: u64, opponent: u64, solve: &dyn Fn(u64, u64, i32, i32) -> i32| {
+            let truth = naive_exact(&Position { player, opponent });
+            let lo = truth + 1;
+            assert!(solve(player, opponent, lo, lo + 1) <= lo, "fail-low");
+            let hi = truth - 1;
+            assert!(solve(player, opponent, hi - 1, hi) >= hi, "fail-high");
+        };
+        let solve3 = |p: u64, o: u64, a: i32, b: i32| {
+            let mut e = !(p | o);
+            let x1 = e.trailing_zeros();
+            e &= e - 1;
+            let x2 = e.trailing_zeros();
+            e &= e - 1;
+            let x3 = e.trailing_zeros();
+            solve_3(p, o, a, b, x1, x2, x3)
+        };
+        let n = SQUARES4.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    for (player, opponent) in layouts_for(&[SQUARES4[i], SQUARES4[j], SQUARES4[k]])
+                    {
+                        check(player, opponent, &solve3);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solve_3_and_4_drive_exact_score() {
+        // End-to-end through exact_score's empties==3 / ==4 dispatch.
+        let n = SQUARES4.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                for k in (j + 1)..n {
+                    for (player, opponent) in layouts_for(&[SQUARES4[i], SQUARES4[j], SQUARES4[k]])
+                    {
+                        let pos = Position { player, opponent };
+                        assert_eq!(exact_score(&pos), naive_exact(&pos));
+                    }
+                    for l in (k + 1)..n {
+                        for (player, opponent) in
+                            layouts_for(&[SQUARES4[i], SQUARES4[j], SQUARES4[k], SQUARES4[l]])
+                        {
+                            let pos = Position { player, opponent };
+                            assert_eq!(exact_score(&pos), naive_exact(&pos));
+                        }
+                    }
+                }
+            }
         }
     }
 

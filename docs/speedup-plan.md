@@ -26,11 +26,10 @@ improves on.
 | 18 | 55 | 6,243,131 | 498.1ms | 12.53M |
 | 20 | 8 | 47,214,268 | 3492.0ms | 13.52M |
 
-## Current baseline (after Step 6 — PVS)
+## Baseline after Step 6 (PVS)
 
 Null-window (PVS) search. Gain grows with depth (the 20-empty row is only 8
-boards, so noisy). Move-ordering quality caps the win; better ordering would
-amplify it.
+boards, so noisy).
 
 | empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 5b |
 |---------|--------|-----------|--------|---------|------------|
@@ -38,6 +37,21 @@ amplify it.
 | 16 | 350 | 707,030 | 57.1ms | 12.39M | 1.16× |
 | 18 | 55 | 4,682,275 | 382.5ms | 12.24M | 1.30× |
 | 20 | 8 | 40,164,910 | 3036.1ms | 13.23M | 1.15× |
+
+## Current baseline (after Step 7 — 3/4-empty solvers)
+
+Dedicated `solve_3`/`solve_4` leaf solvers, natural square order (no parity
+ordering yet). ~1.26× at every depth. The nodes/pos drop is partly a metric
+change: `solve_3`/`solve_4` internal nodes aren't counted (only `solve_1`
+leaves via `solve_2`), which also lowers the reported nodes/s — ms/pos is the
+honest measure.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 6 |
+|---------|--------|-----------|--------|---------|-----------|
+| 14 | 673 | 66,306 | 6.8ms | 9.72M | 1.26× |
+| 16 | 350 | 431,642 | 45.3ms | 9.52M | 1.26× |
+| 18 | 55 | 2,864,005 | 303.1ms | 9.45M | 1.26× |
+| 20 | 8 | 23,721,405 | 2388.0ms | 9.93M | 1.27× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -67,23 +81,29 @@ amplify it.
   `(alpha, alpha+1)` and re-searched only on a fail-high. No empties gate (Edax
   applies PVS at every node). `solve_2` stays general-window because the first
   child along the PV calls it with a full window.
+- **Step 7**: `solve_3`/`solve_4` leaf solvers — fail-soft negamax over the 3/4
+  empties, recursing into `solve_2`/`solve_3`. Edax's `search_solve_3/4` use a
+  fixed-reference min/max convention; reimplemented here as plain negamax for
+  consistency with `solve_2`. Natural square order (parity ordering is Step 9).
 
 ## Remaining steps
 
-### Step 6b — More Edax search tricks (follow-up to PVS)
-PVS pays off in proportion to move-ordering quality; ours (fastest-first
-mobility) is decent but not great. Improve ordering and add selectivity tricks
-Edax uses (e.g. hash-move first, stability-based cutoffs) to reduce re-searches.
-
-### Step 7 — 3-empty and 4-empty special cases
-Port `search_solve_3` / `search_solve_4` from Edax for further speedup.
-4-empty adds parity-based move ordering.
+### Step 6b — Move ordering: Edax tricks
+PVS pays off in proportion to ordering quality. Add Edax's other ordering
+signals (square-weighted mobility, corner stability) and selectivity tricks to
+reduce re-searches. Mobility (the dominant term) is already in place, so expect
+modest gains. (Parity ordering is split out into Step 9.)
 
 ### Step 8 — Flip table
 Edax uses a precomputed `count_last_flip` table indexed by row/col.
 Would speed up `solve_1` and `solve_2` (and future 3/4-empty).
 Currently using bitboard fallback.
 
-### Step 9 — Transposition table (last; was "Step 5")
+### Step 9 — Edax parity move ordering
+Order the empties so odd-parity regions are tried first, in `solve_3`/`solve_4`
+(Edax's `sort3` / `parity_case` tables) and the main search. Speed-only;
+deferred from Step 7.
+
+### Step 10 — Transposition table (last; was "Step 5"/"Step 9")
 Previously attempted but had a correctness bug. Do this last, once the rest of
 the search is in its final shape.
