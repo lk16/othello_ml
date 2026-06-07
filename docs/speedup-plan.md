@@ -111,10 +111,20 @@ signals (square-weighted mobility, corner stability) and selectivity tricks to
 reduce re-searches. Mobility (the dominant term) is already in place, so expect
 modest gains. (Parity ordering is split out into Step 9.)
 
-### Step 9 — Edax parity move ordering
-Order the empties so odd-parity regions are tried first, in `solve_3`/`solve_4`
-(Edax's `sort3` / `parity_case` tables) and the main search. Speed-only;
-deferred from Step 7.
+### Step 9 — Edax parity move ordering (TRIED, REVERTED)
+Order the empties so odd-parity regions are tried first. A quadrant's empties
+have odd parity iff the XOR of `quadrant_bit` over them sets that quadrant's bit
+(matching Edax's `QUADRANT_ID`/`parity`).
+
+Implemented as a `sort_by_key` reorder in `solve_3`/`solve_4`. Result: ~2% fewer
+nodes but ~2% **slower** wall-clock at every depth — the runtime sort (≈12–16
+`quadrant_bit` calls per call, in the hottest solvers) costs more than the
+pruning saves. Reverted.
+
+Edax avoids this overhead with precomputed `sort3`/`parity_case` table lookups
+(O(1) reorder) plus *incremental* parity (one XOR per ply). Replicating that
+full machinery is the only way to make parity pay here, for a ~2% node ceiling —
+not worth it versus Step 10. Left unimplemented.
 
 ### Step 10 — Transposition table (was "Step 5"/"Step 9")
 Previously attempted but had a correctness bug. Do this once the rest of the
