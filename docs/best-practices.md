@@ -19,6 +19,8 @@ Each item should be descriptive enough that specific examples are unnecessary.
 
 - **Always run `pre-commit run -a`**, not `cargo check` directly. It runs check, fmt, and clippy together.
 - **Prefer commands that require little human approval.** Avoid `sed` or commands with pipes or loops unless it's by far the best solution.
+- **Bound long-running commands with a timeout.** Anything whose runtime is uncertain (benchmarks, searches, exact evaluation) should be wrapped in `timeout <secs> …` and/or given an explicit tool-level timeout, so a bad estimate or a hang can't run unbounded. Estimate the cost first (a small calibration run) before launching the full job.
+- **The `bench` subcommand reloads all input files on every invocation.** Loading is outside the timed loop but still counts against wall-clock; pass the fewest files that supply enough boards, and prefer one larger file over many small ones when sweeping multiple `--empties` values.
 
 ## Threading
 

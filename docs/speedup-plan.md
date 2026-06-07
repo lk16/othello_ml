@@ -1,9 +1,32 @@
 # Alphabeta Exact-Search Speed-Up Plan
 
-## Benchmark target
-`cargo run --release -- bench --empties 14 --max-boards 20 training_data/playok_pgn_75927000.pgn`
+## Benchmark
 
-## Results so far
+Single file (avoids reloading many files per invocation), board counts chosen
+so each `--empties` level runs in ~30s. Wrap runs in `timeout` (see
+best-practices.md). Example:
+
+```
+F=training_data/playok_pgn_75927000.pgn
+for spec in "14 1000" "16 350" "18 55" "20 8"; do
+  set -- $spec
+  timeout 90 cargo run --release -q -- bench --empties $1 --max-boards $2 "$F"
+done
+```
+
+## Current baseline (after Step 5b)
+
+Measured over a larger sample to reduce noise. ~12.5–13.5M nodes/s, consistent
+across depth. This is the reference point for future optimizations.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s |
+|---------|--------|-----------|--------|---------|
+| 14 | 673 | 116,666 | 9.1ms | 12.85M |
+| 16 | 350 | 836,979 | 66.5ms | 12.60M |
+| 18 | 55 | 6,243,131 | 498.1ms | 12.53M |
+| 20 | 8 | 47,214,268 | 3492.0ms | 13.52M |
+
+## History (early benchmark — 14 empties, only 20 boards, noisy)
 
 | Step | nodes/pos | ms/pos | speedup vs baseline |
 |------|-----------|--------|---------------------|
