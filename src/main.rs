@@ -1,6 +1,6 @@
 use othello_eval::{
-    best_move, build_examples, exact_score, get_node_count, load_games, reset_node_count, Board,
-    Features, Position, Trainer, TrainingConfig, Weights,
+    best_move, build_examples, exact_score_with_nodes, load_games, Board, Features, Position,
+    Trainer, TrainingConfig, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -463,9 +463,8 @@ fn run_bench(args: BenchArgs) {
     let start = Instant::now();
 
     for board in &positions {
-        reset_node_count();
-        exact_score(&board.position);
-        total_nodes += get_node_count();
+        let (_, nodes) = exact_score_with_nodes(&board.position);
+        total_nodes += nodes;
     }
 
     let elapsed = start.elapsed().as_secs_f64();

@@ -3,22 +3,6 @@
 use crate::othello::position::Position;
 use crate::training::features::Features;
 use crate::training::weights::Weights;
-use std::cell::Cell;
-
-thread_local! {
-    static NODE_COUNT: Cell<u64> = const { Cell::new(0) };
-}
-
-/// Reset the per-thread node counter to zero.
-pub fn reset_node_count() {
-    NODE_COUNT.with(|c| c.set(0));
-}
-
-/// Return the number of `alphabeta_exact` calls since the last [`reset_node_count`].
-pub fn get_node_count() -> u64 {
-    NODE_COUNT.with(|c| c.get())
-}
-
 /// Exact score for `pos` from the perspective of the side to move.
 ///
 /// Searches all legal move sequences to game end with alpha-beta pruning.
@@ -27,7 +11,16 @@ pub fn get_node_count() -> u64 {
 ///
 /// The score is bounded to [-64, 64].
 pub fn exact_score(pos: &Position) -> i32 {
-    alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+    Search::new().alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+}
+
+/// Exact score together with the number of search nodes visited. Used by the
+/// `bench` subcommand; `exact_score` runs the identical search without exposing
+/// the node count.
+pub fn exact_score_with_nodes(pos: &Position) -> (i32, u64) {
+    let mut search = Search::new();
+    let score = search.alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
+    (score, search.nodes)
 }
 
 /// Score bounds.
@@ -188,7 +181,7 @@ fn count_last_flip(pos: u32, player: u64) -> i32 {
 /// for a full board with a single empty square at `sq`.
 ///
 /// With one empty, every move is forced (the lone empty is the only candidate),
-/// so no search window is needed. Does NOT increment NODE_COUNT; the caller
+/// so no search window is needed. A pure function: the calling `Search` method
 /// accounts for this node.
 fn solve_1(player: u64, sq: u32) -> i32 {
     // Differential after `player` places at `sq` before flips: +1 disc for the
@@ -212,243 +205,263 @@ fn solve_1(player: u64, sq: u32) -> i32 {
     solve_game_over(player, 1)
 }
 
-/// 2-empty leaf solver: a negamax alpha-beta search over a full board with
-/// empties at `x1` and `x2`. Returns the score from `player`'s perspective.
-/// Increments NODE_COUNT once per 1-empty child visited.
-fn solve_2(player: u64, opponent: u64, mut alpha: i32, beta: i32, x1: u32, x2: u32) -> i32 {
-    const NONE: i32 = SCORE_MIN - 1; // below any real score
-    let mut best = NONE;
-    let mut nodes: u64 = 0;
-
-    // Player tries x1.
-    let f1 = flips_for(x1, player, opponent);
-    if f1 != 0 {
-        let moved = player | f1 | (1u64 << x1);
-        let child_player = opponent & !moved; // opponent to move, only x2 empty
-        best = -solve_1(child_player, x2);
-        nodes += 1;
-        if best > alpha {
-            alpha = best;
-        }
-    }
-
-    // Player tries x2 unless x1 already caused a beta cutoff.
-    if alpha < beta {
-        let f2 = flips_for(x2, player, opponent);
-        if f2 != 0 {
-            let moved = player | f2 | (1u64 << x2);
-            let child_player = opponent & !moved; // opponent to move, only x1 empty
-            let s = -solve_1(child_player, x1);
-            nodes += 1;
-            if s > best {
-                best = s;
-            }
-        }
-    }
-
-    NODE_COUNT.with(|c| c.set(c.get() + nodes));
-
-    if best != NONE {
-        return best;
-    }
-
-    // Player has no move and passes. If the opponent also has no move the game
-    // is over; otherwise search the opponent's reply and negate.
-    if flips_for(x1, opponent, player) == 0 && flips_for(x2, opponent, player) == 0 {
-        return solve_game_over(player, 2);
-    }
-    -solve_2(opponent, player, -beta, -alpha, x1, x2)
+/// Mutable state for one exact search: the running count of nodes visited. The
+/// recursive search routines are methods so this state is explicit rather than
+/// a thread-local global.
+struct Search {
+    nodes: u64,
 }
 
-/// 3-empty leaf solver: a fail-soft negamax alpha-beta over the three empties
-/// at `x1`, `x2`, `x3`, recursing into [`solve_2`]. Returns the score from
-/// `player`'s perspective. Leaf node accounting happens in `solve_2`.
-fn solve_3(
-    player: u64,
-    opponent: u64,
-    mut alpha: i32,
-    beta: i32,
-    x1: u32,
-    x2: u32,
-    x3: u32,
-) -> i32 {
-    const NONE: i32 = SCORE_MIN - 1;
-    let mut best = NONE;
+impl Search {
+    fn new() -> Self {
+        Search { nodes: 0 }
+    }
 
-    // (sq, the other two empties) for each candidate move.
-    for &(sq, a, b) in &[(x1, x2, x3), (x2, x1, x3), (x3, x1, x2)] {
-        if alpha >= beta {
-            break;
+    /// 2-empty leaf solver: a negamax alpha-beta search over a full board with
+    /// empties at `x1` and `x2`. Returns the score from `player`'s perspective.
+    /// Counts one node per 1-empty child visited.
+    fn solve_2(
+        &mut self,
+        player: u64,
+        opponent: u64,
+        mut alpha: i32,
+        beta: i32,
+        x1: u32,
+        x2: u32,
+    ) -> i32 {
+        const NONE: i32 = SCORE_MIN - 1; // below any real score
+        let mut best = NONE;
+
+        // Player tries x1.
+        let f1 = flips_for(x1, player, opponent);
+        if f1 != 0 {
+            let moved = player | f1 | (1u64 << x1);
+            let child_player = opponent & !moved; // opponent to move, only x2 empty
+            best = -solve_1(child_player, x2);
+            self.nodes += 1;
+            if best > alpha {
+                alpha = best;
+            }
         }
-        let f = flips_for(sq, player, opponent);
-        if f != 0 {
-            let moved = player | f | (1u64 << sq); // child opponent (just-moved discs)
-            let child_player = opponent & !moved; // opponent to move, empties a and b
-            let s = -solve_2(child_player, moved, -beta, -alpha, a, b);
-            if s > best {
-                best = s;
-                if best > alpha {
-                    alpha = best;
+
+        // Player tries x2 unless x1 already caused a beta cutoff.
+        if alpha < beta {
+            let f2 = flips_for(x2, player, opponent);
+            if f2 != 0 {
+                let moved = player | f2 | (1u64 << x2);
+                let child_player = opponent & !moved; // opponent to move, only x1 empty
+                let s = -solve_1(child_player, x1);
+                self.nodes += 1;
+                if s > best {
+                    best = s;
                 }
             }
         }
-    }
 
-    if best != NONE {
-        return best;
-    }
-
-    // Player passes. Game over if the opponent also has no move here.
-    if flips_for(x1, opponent, player) == 0
-        && flips_for(x2, opponent, player) == 0
-        && flips_for(x3, opponent, player) == 0
-    {
-        return solve_game_over(player, 3);
-    }
-    -solve_3(opponent, player, -beta, -alpha, x1, x2, x3)
-}
-
-/// 4-empty leaf solver: a fail-soft negamax alpha-beta over the four empties,
-/// recursing into [`solve_3`]. Returns the score from `player`'s perspective.
-fn solve_4(
-    player: u64,
-    opponent: u64,
-    mut alpha: i32,
-    beta: i32,
-    x1: u32,
-    x2: u32,
-    x3: u32,
-    x4: u32,
-) -> i32 {
-    const NONE: i32 = SCORE_MIN - 1;
-    let mut best = NONE;
-
-    // (sq, the other three empties) for each candidate move.
-    for &(sq, a, b, c) in &[
-        (x1, x2, x3, x4),
-        (x2, x1, x3, x4),
-        (x3, x1, x2, x4),
-        (x4, x1, x2, x3),
-    ] {
-        if alpha >= beta {
-            break;
+        if best != NONE {
+            return best;
         }
-        let f = flips_for(sq, player, opponent);
-        if f != 0 {
-            let moved = player | f | (1u64 << sq);
-            let child_player = opponent & !moved;
-            let s = -solve_3(child_player, moved, -beta, -alpha, a, b, c);
-            if s > best {
-                best = s;
-                if best > alpha {
-                    alpha = best;
-                }
-            }
+
+        // Player has no move and passes. If the opponent also has no move the game
+        // is over; otherwise search the opponent's reply and negate.
+        if flips_for(x1, opponent, player) == 0 && flips_for(x2, opponent, player) == 0 {
+            return solve_game_over(player, 2);
         }
+        -self.solve_2(opponent, player, -beta, -alpha, x1, x2)
     }
 
-    if best != NONE {
-        return best;
-    }
+    /// 3-empty leaf solver: a fail-soft negamax alpha-beta over the three empties
+    /// at `x1`, `x2`, `x3`, recursing into [`solve_2`]. Returns the score from
+    /// `player`'s perspective. Leaf node accounting happens in `solve_2`.
+    fn solve_3(
+        &mut self,
+        player: u64,
+        opponent: u64,
+        mut alpha: i32,
+        beta: i32,
+        x1: u32,
+        x2: u32,
+        x3: u32,
+    ) -> i32 {
+        const NONE: i32 = SCORE_MIN - 1;
+        let mut best = NONE;
 
-    // Player passes. Game over if the opponent also has no move here.
-    if flips_for(x1, opponent, player) == 0
-        && flips_for(x2, opponent, player) == 0
-        && flips_for(x3, opponent, player) == 0
-        && flips_for(x4, opponent, player) == 0
-    {
-        return solve_game_over(player, 4);
-    }
-    -solve_4(opponent, player, -beta, -alpha, x1, x2, x3, x4)
-}
-
-/// Negamax with alpha-beta pruning, searching to game end.
-fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
-    NODE_COUNT.with(|c| c.set(c.get() + 1));
-
-    if empties == 0 {
-        return pos.final_score();
-    }
-
-    if empties == 1 {
-        let sq = (!pos.occupied()).trailing_zeros();
-        return solve_1(pos.player, sq);
-    }
-
-    if empties == 2 {
-        let mut empty = !pos.occupied();
-        let x1 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x2 = empty.trailing_zeros();
-        return solve_2(pos.player, pos.opponent, alpha, beta, x1, x2);
-    }
-
-    if empties == 3 {
-        let mut empty = !pos.occupied();
-        let x1 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x2 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x3 = empty.trailing_zeros();
-        return solve_3(pos.player, pos.opponent, alpha, beta, x1, x2, x3);
-    }
-
-    if empties == 4 {
-        let mut empty = !pos.occupied();
-        let x1 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x2 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x3 = empty.trailing_zeros();
-        empty &= empty - 1;
-        let x4 = empty.trailing_zeros();
-        return solve_4(pos.player, pos.opponent, alpha, beta, x1, x2, x3, x4);
-    }
-
-    let moves = pos.get_moves();
-    if moves == 0 {
-        let passed = pos.pass_move();
-        if passed.get_moves() == 0 {
-            return pos.final_score();
-        }
-        return -alphabeta_exact(&passed, -beta, -alpha, empties);
-    }
-
-    let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
-    let mut remaining = moves;
-    while remaining != 0 {
-        let cell = remaining.trailing_zeros();
-        remaining &= remaining - 1;
-        let child = pos.do_move(cell);
-        move_list.push((child.get_moves().count_ones(), child));
-    }
-    move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
-
-    // Principal Variation Search: search the first (best-ordered) move with the
-    // full window, then probe each sibling with a null window and re-search only
-    // on a fail-high. No empties gate — Edax applies this at every node.
-    let mut first = true;
-    for (_, child) in &move_list {
-        let score = if first {
-            -alphabeta_exact(child, -beta, -alpha, empties - 1)
-        } else {
-            let probe = -alphabeta_exact(child, -alpha - 1, -alpha, empties - 1);
-            if probe > alpha && probe < beta {
-                -alphabeta_exact(child, -beta, -alpha, empties - 1)
-            } else {
-                probe
-            }
-        };
-        first = false;
-        if score > alpha {
-            alpha = score;
+        // (sq, the other two empties) for each candidate move.
+        for &(sq, a, b) in &[(x1, x2, x3), (x2, x1, x3), (x3, x1, x2)] {
             if alpha >= beta {
                 break;
             }
+            let f = flips_for(sq, player, opponent);
+            if f != 0 {
+                let moved = player | f | (1u64 << sq); // child opponent (just-moved discs)
+                let child_player = opponent & !moved; // opponent to move, empties a and b
+                let s = -self.solve_2(child_player, moved, -beta, -alpha, a, b);
+                if s > best {
+                    best = s;
+                    if best > alpha {
+                        alpha = best;
+                    }
+                }
+            }
         }
+
+        if best != NONE {
+            return best;
+        }
+
+        // Player passes. Game over if the opponent also has no move here.
+        if flips_for(x1, opponent, player) == 0
+            && flips_for(x2, opponent, player) == 0
+            && flips_for(x3, opponent, player) == 0
+        {
+            return solve_game_over(player, 3);
+        }
+        -self.solve_3(opponent, player, -beta, -alpha, x1, x2, x3)
     }
 
-    alpha
+    /// 4-empty leaf solver: a fail-soft negamax alpha-beta over the four empties,
+    /// recursing into [`solve_3`]. Returns the score from `player`'s perspective.
+    fn solve_4(
+        &mut self,
+        player: u64,
+        opponent: u64,
+        mut alpha: i32,
+        beta: i32,
+        x1: u32,
+        x2: u32,
+        x3: u32,
+        x4: u32,
+    ) -> i32 {
+        const NONE: i32 = SCORE_MIN - 1;
+        let mut best = NONE;
+
+        // (sq, the other three empties) for each candidate move.
+        for &(sq, a, b, c) in &[
+            (x1, x2, x3, x4),
+            (x2, x1, x3, x4),
+            (x3, x1, x2, x4),
+            (x4, x1, x2, x3),
+        ] {
+            if alpha >= beta {
+                break;
+            }
+            let f = flips_for(sq, player, opponent);
+            if f != 0 {
+                let moved = player | f | (1u64 << sq);
+                let child_player = opponent & !moved;
+                let s = -self.solve_3(child_player, moved, -beta, -alpha, a, b, c);
+                if s > best {
+                    best = s;
+                    if best > alpha {
+                        alpha = best;
+                    }
+                }
+            }
+        }
+
+        if best != NONE {
+            return best;
+        }
+
+        // Player passes. Game over if the opponent also has no move here.
+        if flips_for(x1, opponent, player) == 0
+            && flips_for(x2, opponent, player) == 0
+            && flips_for(x3, opponent, player) == 0
+            && flips_for(x4, opponent, player) == 0
+        {
+            return solve_game_over(player, 4);
+        }
+        -self.solve_4(opponent, player, -beta, -alpha, x1, x2, x3, x4)
+    }
+
+    /// Negamax with alpha-beta pruning, searching to game end.
+    fn alphabeta_exact(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+
+        if empties == 0 {
+            return pos.final_score();
+        }
+
+        if empties == 1 {
+            let sq = (!pos.occupied()).trailing_zeros();
+            return solve_1(pos.player, sq);
+        }
+
+        if empties == 2 {
+            let mut empty = !pos.occupied();
+            let x1 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x2 = empty.trailing_zeros();
+            return self.solve_2(pos.player, pos.opponent, alpha, beta, x1, x2);
+        }
+
+        if empties == 3 {
+            let mut empty = !pos.occupied();
+            let x1 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x2 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x3 = empty.trailing_zeros();
+            return self.solve_3(pos.player, pos.opponent, alpha, beta, x1, x2, x3);
+        }
+
+        if empties == 4 {
+            let mut empty = !pos.occupied();
+            let x1 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x2 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x3 = empty.trailing_zeros();
+            empty &= empty - 1;
+            let x4 = empty.trailing_zeros();
+            return self.solve_4(pos.player, pos.opponent, alpha, beta, x1, x2, x3, x4);
+        }
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
+        }
+
+        let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            move_list.push((child.get_moves().count_ones(), child));
+        }
+        move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
+
+        // Principal Variation Search: search the first (best-ordered) move with the
+        // full window, then probe each sibling with a null window and re-search only
+        // on a fail-high. No empties gate — Edax applies this at every node.
+        let mut first = true;
+        for (_, child) in &move_list {
+            let score = if first {
+                -self.alphabeta_exact(child, -beta, -alpha, empties - 1)
+            } else {
+                let probe = -self.alphabeta_exact(child, -alpha - 1, -alpha, empties - 1);
+                if probe > alpha && probe < beta {
+                    -self.alphabeta_exact(child, -beta, -alpha, empties - 1)
+                } else {
+                    probe
+                }
+            };
+            first = false;
+            if score > alpha {
+                alpha = score;
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+
+        alpha
+    }
 }
 
 /// Evaluate a batch of positions, returning one score per position
@@ -522,13 +535,14 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
     let mut alpha = SCORE_MIN;
     let mut best_cell = 0u32;
     let empties = pos.empties();
+    let mut search = Search::new();
 
     let mut remaining = moves;
     while remaining != 0 {
         let cell = remaining.trailing_zeros();
         remaining &= remaining - 1;
         let child = pos.do_move(cell);
-        let score = -alphabeta_exact(&child, -SCORE_MAX, -alpha, empties - 1);
+        let score = -search.alphabeta_exact(&child, -SCORE_MAX, -alpha, empties - 1);
         if score > alpha {
             alpha = score;
             best_cell = cell;
@@ -797,7 +811,7 @@ mod tests {
         let x1 = empty.trailing_zeros();
         empty &= empty - 1;
         let x2 = empty.trailing_zeros();
-        solve_2(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2)
+        Search::new().solve_2(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2)
     }
 
     /// Every ordered pair of distinct empty squares from [`SQUARES`], crossed
@@ -840,11 +854,11 @@ mod tests {
 
             // Window entirely above the true score → fail low (result <= alpha).
             let lo = truth + 1;
-            let r = solve_2(player, opponent, lo, lo + 1, x1, x2);
+            let r = Search::new().solve_2(player, opponent, lo, lo + 1, x1, x2);
             assert!(r <= lo, "fail-low: r={r} alpha={lo} truth={truth}");
             // Window entirely below the true score → fail high (result >= beta).
             let hi = truth - 1;
-            let r = solve_2(player, opponent, hi - 1, hi, x1, x2);
+            let r = Search::new().solve_2(player, opponent, hi - 1, hi, x1, x2);
             assert!(r >= hi, "fail-high: r={r} beta={hi} truth={truth}");
         }
     }
@@ -887,7 +901,7 @@ mod tests {
         let x2 = e.trailing_zeros();
         e &= e - 1;
         let x3 = e.trailing_zeros();
-        solve_3(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3)
+        Search::new().solve_3(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3)
     }
 
     fn run_solve_4(player: u64, opponent: u64) -> i32 {
@@ -899,7 +913,7 @@ mod tests {
         let x3 = e.trailing_zeros();
         e &= e - 1;
         let x4 = e.trailing_zeros();
-        solve_4(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3, x4)
+        Search::new().solve_4(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3, x4)
     }
 
     /// Smaller square set (includes all four corners) to bound the 4-empty
@@ -967,7 +981,7 @@ mod tests {
             let x2 = e.trailing_zeros();
             e &= e - 1;
             let x3 = e.trailing_zeros();
-            solve_3(p, o, a, b, x1, x2, x3)
+            Search::new().solve_3(p, o, a, b, x1, x2, x3)
         };
         let n = SQUARES4.len();
         for i in 0..n {

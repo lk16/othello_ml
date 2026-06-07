@@ -103,6 +103,16 @@ lowers reported nodes/s — ms/pos is the honest measure.
   tables). `solve_2`/`solve_3`/`solve_4` keep `flips_for` since they need the
   full flip mask to build child positions.
 
+## Refactors (no perf change)
+
+- **Search struct**: the node counter moved from a thread-local `Cell` global
+  into a `Search` struct threaded through the recursion, with the search
+  routines as methods. `exact_score_with_nodes` returns the count for `bench`;
+  `exact_score` discards it. Measured identical node counts and wall-clock vs
+  the Step 8 baseline (a `const`-init thread-local is already a `%fs`-relative
+  load/store, the same cost as a struct-field write) — done purely for clearer
+  state ownership.
+
 ## Remaining steps
 
 ### Step 6b — Move ordering: Edax tricks
