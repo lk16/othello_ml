@@ -68,18 +68,26 @@ impl Position {
     /// Returns 0 if `mv` is occupied or would not flip any discs.
     /// Adapted from Edax / flippy.
     pub fn flipped(&self, mv: u32) -> u64 {
-        let move_bit = 1u64 << mv;
-        if (self.player | self.opponent) & move_bit != 0 {
+        if (self.player | self.opponent) & (1u64 << mv) != 0 {
             return 0;
         }
+        Self::flip_mask(mv, self.player, self.opponent)
+    }
+
+    /// Discs flipped by `player` playing at `mv`, with `opponent` the other
+    /// discs. The single source of the 8-direction flip computation; `flipped`
+    /// wraps it with the occupied-square check. Assumes `mv` is empty (no such
+    /// check), which lets the endgame leaf solvers skip it on the hot path.
+    /// Adapted from Edax / flippy.
+    pub(crate) fn flip_mask(mv: u32, player: u64, opponent: u64) -> u64 {
+        let move_bit = 1u64 << mv;
 
         // Horizontal and diagonal shifts need col B-G mask to prevent wrap-around.
         const MIDDLE_COLUMNS: u64 = 0x7E7E7E7E7E7E7E7E;
 
-        let opp = self.opponent;
-        let opp_h = opp & MIDDLE_COLUMNS;
-        let opp_v = opp;
-        let opp_d = opp & MIDDLE_COLUMNS;
+        let opp_h = opponent & MIDDLE_COLUMNS;
+        let opp_v = opponent;
+        let opp_d = opponent & MIDDLE_COLUMNS;
 
         let mut flipped: u64 = 0;
 
@@ -90,7 +98,7 @@ impl Position {
         f |= opp_h & (f << 1);
         f |= opp_h & (f << 1);
         f |= opp_h & (f << 1);
-        if self.player & (f << 1) != 0 {
+        if player & (f << 1) != 0 {
             flipped |= f;
         }
 
@@ -100,7 +108,7 @@ impl Position {
         f |= opp_h & (f >> 1);
         f |= opp_h & (f >> 1);
         f |= opp_h & (f >> 1);
-        if self.player & (f >> 1) != 0 {
+        if player & (f >> 1) != 0 {
             flipped |= f;
         }
 
@@ -111,7 +119,7 @@ impl Position {
         f |= opp_v & (f << 8);
         f |= opp_v & (f << 8);
         f |= opp_v & (f << 8);
-        if self.player & (f << 8) != 0 {
+        if player & (f << 8) != 0 {
             flipped |= f;
         }
 
@@ -121,7 +129,7 @@ impl Position {
         f |= opp_v & (f >> 8);
         f |= opp_v & (f >> 8);
         f |= opp_v & (f >> 8);
-        if self.player & (f >> 8) != 0 {
+        if player & (f >> 8) != 0 {
             flipped |= f;
         }
 
@@ -132,7 +140,7 @@ impl Position {
         f |= opp_d & (f << 7);
         f |= opp_d & (f << 7);
         f |= opp_d & (f << 7);
-        if self.player & (f << 7) != 0 {
+        if player & (f << 7) != 0 {
             flipped |= f;
         }
 
@@ -142,7 +150,7 @@ impl Position {
         f |= opp_d & (f >> 7);
         f |= opp_d & (f >> 7);
         f |= opp_d & (f >> 7);
-        if self.player & (f >> 7) != 0 {
+        if player & (f >> 7) != 0 {
             flipped |= f;
         }
 
@@ -153,7 +161,7 @@ impl Position {
         f |= opp_d & (f << 9);
         f |= opp_d & (f << 9);
         f |= opp_d & (f << 9);
-        if self.player & (f << 9) != 0 {
+        if player & (f << 9) != 0 {
             flipped |= f;
         }
 
@@ -163,7 +171,7 @@ impl Position {
         f |= opp_d & (f >> 9);
         f |= opp_d & (f >> 9);
         f |= opp_d & (f >> 9);
-        if self.player & (f >> 9) != 0 {
+        if player & (f >> 9) != 0 {
             flipped |= f;
         }
 

@@ -41,39 +41,6 @@ const SORT_MIN_EMPTIES: u32 = 6;
 // Leaf solvers (ported from Edax endgame.c)
 // ---------------------------------------------------------------------------
 
-/// Standalone bitboard flip computation on raw u64s.
-/// Same 8-direction logic as `Position::flipped`; returns flipped-disc mask.
-fn flips_for(sq: u32, player: u64, opponent: u64) -> u64 {
-    let move_bit = 1u64 << sq;
-    const MC: u64 = 0x7E7E7E7E7E7E7E7E; // middle columns
-    let opp_h = opponent & MC;
-    let opp_d = opponent & MC;
-    let mut flipped: u64 = 0;
-
-    macro_rules! ray {
-        ($opp:expr, $seed:expr, $shift:literal, $dir:tt) => {{
-            let mut f = $opp & ($seed $dir $shift);
-            f |= $opp & (f $dir $shift);
-            f |= $opp & (f $dir $shift);
-            f |= $opp & (f $dir $shift);
-            f |= $opp & (f $dir $shift);
-            f |= $opp & (f $dir $shift);
-            if player & (f $dir $shift) != 0 { flipped |= f; }
-        }};
-    }
-
-    ray!(opp_h,  move_bit, 1, <<);
-    ray!(opp_h,  move_bit, 1, >>);
-    ray!(opponent, move_bit, 8, <<);
-    ray!(opponent, move_bit, 8, >>);
-    ray!(opp_d,  move_bit, 7, <<);
-    ray!(opp_d,  move_bit, 7, >>);
-    ray!(opp_d,  move_bit, 9, <<);
-    ray!(opp_d,  move_bit, 9, >>);
-
-    flipped
-}
-
 /// Game-over score when no moves remain: winner gets all empties.
 /// Port of `board_solve` from Edax.
 fn solve_game_over(player: u64, n_empties: u32) -> i32 {
@@ -243,7 +210,7 @@ impl Search {
         let mut best = NONE;
 
         // Player tries x1.
-        let f1 = flips_for(x1, player, opponent);
+        let f1 = Position::flip_mask(x1, player, opponent);
         if f1 != 0 {
             let moved = player | f1 | (1u64 << x1);
             let child_player = opponent & !moved; // opponent to move, only x2 empty
@@ -256,7 +223,7 @@ impl Search {
 
         // Player tries x2 unless x1 already caused a beta cutoff.
         if alpha < beta {
-            let f2 = flips_for(x2, player, opponent);
+            let f2 = Position::flip_mask(x2, player, opponent);
             if f2 != 0 {
                 let moved = player | f2 | (1u64 << x2);
                 let child_player = opponent & !moved; // opponent to move, only x1 empty
@@ -274,7 +241,9 @@ impl Search {
 
         // Player has no move and passes. If the opponent also has no move the game
         // is over; otherwise search the opponent's reply and negate.
-        if flips_for(x1, opponent, player) == 0 && flips_for(x2, opponent, player) == 0 {
+        if Position::flip_mask(x1, opponent, player) == 0
+            && Position::flip_mask(x2, opponent, player) == 0
+        {
             return solve_game_over(player, 2);
         }
         -self.solve_2(opponent, player, -beta, -alpha, x1, x2)
@@ -301,7 +270,7 @@ impl Search {
             if alpha >= beta {
                 break;
             }
-            let f = flips_for(sq, player, opponent);
+            let f = Position::flip_mask(sq, player, opponent);
             if f != 0 {
                 let moved = player | f | (1u64 << sq); // child opponent (just-moved discs)
                 let child_player = opponent & !moved; // opponent to move, empties a and b
@@ -320,9 +289,9 @@ impl Search {
         }
 
         // Player passes. Game over if the opponent also has no move here.
-        if flips_for(x1, opponent, player) == 0
-            && flips_for(x2, opponent, player) == 0
-            && flips_for(x3, opponent, player) == 0
+        if Position::flip_mask(x1, opponent, player) == 0
+            && Position::flip_mask(x2, opponent, player) == 0
+            && Position::flip_mask(x3, opponent, player) == 0
         {
             return solve_game_over(player, 3);
         }
@@ -355,7 +324,7 @@ impl Search {
             if alpha >= beta {
                 break;
             }
-            let f = flips_for(sq, player, opponent);
+            let f = Position::flip_mask(sq, player, opponent);
             if f != 0 {
                 let moved = player | f | (1u64 << sq);
                 let child_player = opponent & !moved;
@@ -374,10 +343,10 @@ impl Search {
         }
 
         // Player passes. Game over if the opponent also has no move here.
-        if flips_for(x1, opponent, player) == 0
-            && flips_for(x2, opponent, player) == 0
-            && flips_for(x3, opponent, player) == 0
-            && flips_for(x4, opponent, player) == 0
+        if Position::flip_mask(x1, opponent, player) == 0
+            && Position::flip_mask(x2, opponent, player) == 0
+            && Position::flip_mask(x3, opponent, player) == 0
+            && Position::flip_mask(x4, opponent, player) == 0
         {
             return solve_game_over(player, 4);
         }
@@ -674,44 +643,10 @@ mod tests {
 
     // --- helpers -----------------------------------------------------------
 
-    // --- flips_for ---------------------------------------------------------
-
-    #[test]
-    fn flips_for_no_flip_isolated() {
-        // Empty board: no opponent discs, so no flip possible.
-        assert_eq!(flips_for(0, 0, 0), 0);
-    }
-
-    #[test]
-    fn flips_for_horizontal_single() {
-        // player at bit 0, opponent at bit 1, player at bit 2 → playing at 0 wraps? No.
-        // player at bit 2, opponent at bit 1, play at 0 → should flip bit 1.
-        let player = 1u64 << 2;
-        let opponent = 1u64 << 1;
-        let flipped = flips_for(0, player, opponent);
-        assert_eq!(flipped, 1u64 << 1);
-    }
-
-    #[test]
-    fn flips_for_vertical_chain() {
-        // player at row3 col0, opponent at row2 and row1 col0, play at row0 col0 → flip rows 1,2.
-        let player = 1u64 << 24; // a4
-        let opponent = (1u64 << 8) | (1u64 << 16); // a2, a3
-        let flipped = flips_for(0, player, opponent); // play a1
-        assert_eq!(flipped, (1u64 << 8) | (1u64 << 16));
-    }
-
-    #[test]
-    fn flips_for_no_wrap_left_edge() {
-        // Disc at h-file should not wrap to a-file via horizontal ray.
-        // player at bit 7 (h1), opponent at bit 8 (a2), play at bit 15 (h2).
-        // No diagonal or horizontal connection; vertical: player at h1, play at h2 separated by nothing.
-        let player = 1u64 << 7;
-        let opponent = 1u64 << 8;
-        // play at 15 (h2). Vertical ray down from 15: bit 7 = player. But opponent at 8 (a2) is not
-        // in the vertical column of h-file. So flip should be 0.
-        let flipped = flips_for(15, player, opponent);
-        assert_eq!(flipped, 0);
+    /// Flip mask for `player` playing at `sq` on a board whose other cells are
+    /// `opponent` — the reference the leaf solvers use directly.
+    fn flips_for(sq: u32, player: u64, opponent: u64) -> u64 {
+        Position::flip_mask(sq, player, opponent)
     }
 
     // --- solve_game_over ---------------------------------------------------

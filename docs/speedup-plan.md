@@ -168,6 +168,27 @@ allocation matters).
   the Step 8 baseline (a `const`-init thread-local is already a `%fs`-relative
   load/store, the same cost as a struct-field write) — done purely for clearer
   state ownership.
+- **Shared flip core**: the 8-direction flip computation, previously duplicated
+  between `Position::flipped` and a local `flips_for` in alphabeta.rs, is now a
+  single `Position::flip_mask(mv, player, opponent)`. `flipped` = occupied-square
+  check + `flip_mask`; the leaf solvers call `flip_mask` directly (they know `mv`
+  is empty, so they skip the check). Perf-neutral vs Step 14 (within noise);
+  removes the duplication and gives one place for Step 15 to optimize.
+
+## Next up — search-structure experiments (do these before the Remaining steps)
+
+### Step 15 — Per-square flip function array
+`Position::flip_mask` (the shared core behind `flipped`/`do_move` and the leaf
+solvers) computes flips with a general branchy 8-direction scan on every call —
+the most-invoked primitive in the search. Edax instead generates a *specialized
+flip function per square* and dispatches through an array (`flip[64]`), so each
+call runs only the directions that exist for that square with no runtime masking
+of edges. Replace `flip_mask` with such a per-square array (or a `match sq` over
+specialized bodies) and benchmark — one change now speeds up everything.
+
+Relationship to Step 11: Step 15 is the algorithmic/dispatch structure
+(per-square specialization); Step 11 is the instruction-set variants
+(BMI2/SSE/…). They compose — a per-square function can itself use SIMD.
 
 ## Remaining steps
 
