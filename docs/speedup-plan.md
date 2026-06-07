@@ -64,7 +64,7 @@ lowers reported nodes/s — ms/pos is the honest measure.
 | 18 | 55 | 2,864,005 | 269.5ms | 10.63M | 1.12× |
 | 20 | 8 | 23,721,405 | 2079.3ms | 11.41M | 1.15× |
 
-## Current baseline (after Step 12 — deep-search split)
+## Baseline after Step 12 (deep-search split)
 
 Leaf cases (≤4 empties) factored into `solve_leaf`; the general `≥5` search no
 longer re-tests them per node. Identical node counts; ~2% faster at every depth.
@@ -75,6 +75,19 @@ longer re-tests them per node. Identical node counts; ~2% faster at every depth.
 | 16 | 350 | 431,642 | 39.5ms | 10.94M | 1.02× |
 | 18 | 55 | 2,864,005 | 263.6ms | 10.87M | 1.02× |
 | 20 | 8 | 23,721,405 | 2029.3ms | 11.69M | 1.02× |
+
+## Current baseline (after Step 13 — skip ordering at 5 empties)
+
+Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
+(unordered empties-5 nodes re-search more under PVS) but each node is cheaper
+(no `get_moves`-per-child at empties 5), netting ~3% faster.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 12 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 71,882 | 5.7ms | 12.56M | 1.03× |
+| 16 | 350 | 469,604 | 38.3ms | 12.27M | 1.03× |
+| 18 | 55 | 3,108,566 | 256.7ms | 12.11M | 1.03× |
+| 20 | 8 | 25,561,308 | 1982.8ms | 12.89M | 1.02× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -119,6 +132,13 @@ longer re-tests them per node. Identical node counts; ~2% faster at every depth.
   dispatches via `search_exact` at the recursion boundary, so the hot
   internal-node path no longer re-tests the five leaf cases each visit.
   Identical node counts; ~2% faster at every depth.
+- **Step 13**: skip move ordering below `SORT_MIN_EMPTIES`. Swept N: N=6 (only
+  empties-5 nodes unordered) is best at ~3% over Step 12; N=7 is break-even and
+  N=8 is clearly worse (~+40% nodes, +12% time) — ordering pays for itself at
+  empties ≥ 6, but at empties 5 the `get_moves`-per-child outweighs the few
+  extra nodes from worse PVS ordering. Set `SORT_MIN_EMPTIES = 6`. This crossover
+  is empirical: re-tune it after Steps 6b / 10 / 11 (see notes on each), which
+  shift the ordering cost/benefit balance.
 
 ## Refactors (no perf change)
 
@@ -132,21 +152,13 @@ longer re-tests them per node. Identical node counts; ~2% faster at every depth.
 
 ## Next up — search-structure experiments (do these before the Remaining steps)
 
-These are sequenced: each depends on the previous one paying off. Do them first.
-
-### Step 13 — Skip move sorting below N empties
-In the general search, move ordering matters less near the leaves (small
-subtrees, less to prune). Only sort the move list when `empties >= N`; below
-that, iterate in natural board order. Benchmark several `N` (e.g. 6, 8, 10, 12)
-to find the crossover. Caveat: PVS relies on a good first move, so skipping the
-sort trades sort cost against *more* re-searches — the net is what the benchmark
-must show.
-
 ### Step 14 — Dedicated no-sort search function
-If Step 13 helps, remove the per-node `if empties >= N` branch by factoring a
-separate never-sorts routine used for `empties < N`, with the sorting routine
-dispatching into it at the boundary (mirroring Step 12's split). Only worth it
-if Step 13 shows a clear win.
+Step 13 landed with `SORT_MIN_EMPTIES = 6`, so the only unordered general level
+is empties = 5. Remove the per-node `if sort` branch (and the unused mobility
+tuple) by factoring a separate never-sorts routine for empties = 5, with the
+sorting search dispatching into it at the boundary (mirroring Step 12's split).
+Expected gain is small (empties-5 nodes are a minority); benchmark to confirm
+it's worth the extra code.
 
 ## Remaining steps
 
@@ -154,7 +166,8 @@ if Step 13 shows a clear win.
 PVS pays off in proportion to ordering quality. Add Edax's other ordering
 signals (square-weighted mobility, corner stability) and selectivity tricks to
 reduce re-searches. Mobility (the dominant term) is already in place, so expect
-modest gains. (Parity ordering is split out into Step 9.)
+modest gains. (Parity ordering is split out into Step 9.) Re-tune
+`SORT_MIN_EMPTIES` afterward — richer/costlier ordering shifts its crossover.
 
 ### Step 9 — Edax parity move ordering (TRIED, REVERTED)
 Order the empties so odd-parity regions are tried first. A quadrant's empties
@@ -173,7 +186,9 @@ not worth it versus Step 10. Left unimplemented.
 
 ### Step 10 — Transposition table (was "Step 5"/"Step 9")
 Previously attempted but had a correctness bug. Do this once the rest of the
-search is in its final shape.
+search is in its final shape. A hash move gives cheap good ordering, so this is
+the step most likely to let `SORT_MIN_EMPTIES` rise (skip the mobility sort at
+more levels) — re-tune it afterward.
 
 ### Step 11 — Alternative flip-computation variants
 Edax ships many implementations of the same flip primitive (`flip_*.c`,
@@ -181,7 +196,9 @@ Edax ships many implementations of the same flip primitive (`flip_*.c`,
 (PEXT/PDEP), `SSE`/`AVX2`, ARM `NEON`/`SVE`, etc. It selects one at *compile
 time* for the target CPU. We currently use one portable bitboard `flips_for`.
 Goal: implement a few alternatives, benchmark them, and pick the best per
-target. Several are CPU-feature dependent.
+target. Several are CPU-feature dependent. Faster `flips_for`/`get_moves` lowers
+the per-child ordering cost, which pushes `SORT_MIN_EMPTIES` down — re-tune it
+afterward.
 
 **Test/config strategy** (no new deps; `std::arch` intrinsics only):
 - All variants share one signature and are checked against the existing

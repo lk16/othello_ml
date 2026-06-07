@@ -27,6 +27,16 @@ pub fn exact_score_with_nodes(pos: &Position) -> (i32, u64) {
 const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
 
+/// Minimum empties at which the deep search orders moves (by opponent mobility).
+/// Below this, moves are searched in natural order — near the leaves the
+/// ordering work costs more than the pruning it buys.
+///
+/// This is an empirically tuned crossover (ordering cost vs. extra nodes from
+/// worse PVS ordering); re-tune it when anything shifts that balance — a
+/// transposition table's hash move could allow a higher value, cheaper
+/// flip/`get_moves` a lower one, richer ordering either way.
+const SORT_MIN_EMPTIES: u32 = 6;
+
 // ---------------------------------------------------------------------------
 // Leaf solvers (ported from Edax endgame.c)
 // ---------------------------------------------------------------------------
@@ -440,15 +450,26 @@ impl Search {
             return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
         }
 
+        // Near the leaves the subtrees are small, so the cost of move ordering
+        // (a `get_moves` per child plus the sort) can outweigh the pruning it
+        // buys. Only order when at least `SORT_MIN_EMPTIES` empties remain.
+        let sort = empties >= SORT_MIN_EMPTIES;
         let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            move_list.push((child.get_moves().count_ones(), child));
+            let mobility = if sort {
+                child.get_moves().count_ones()
+            } else {
+                0
+            };
+            move_list.push((mobility, child));
         }
-        move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
+        if sort {
+            move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
+        }
 
         // Principal Variation Search: search the first (best-ordered) move with the
         // full window, then probe each sibling with a null window and re-search only
