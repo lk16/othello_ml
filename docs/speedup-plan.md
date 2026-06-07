@@ -113,6 +113,35 @@ lowers reported nodes/s — ms/pos is the honest measure.
   load/store, the same cost as a struct-field write) — done purely for clearer
   state ownership.
 
+## Next up — search-structure experiments (do these before the Remaining steps)
+
+These three are sequenced: each depends on the previous one paying off. Do them
+first.
+
+### Step 12 — Factor out the deep-search path (empties > 4)
+`alphabeta_exact` tests `empties == 0/1/2/3/4` at the top of every node, so deep
+internal nodes pay ~5 comparisons per visit before reaching the general code.
+Split into a leaf dispatcher (`empties ≤ 4` → `solve_1..4`/`final_score`) and a
+general search for `empties ≥ 5`. The general search dispatches to the leaf
+solver at the recursion boundary — a single `empties - 1 <= 4` check at the call
+site — instead of re-testing all five cases at every node. Expected: small
+constant-factor win on the hottest (internal-node) path. Keep if it benchmarks
+faster; the later two assume it does.
+
+### Step 13 — Skip move sorting below N empties
+In the general search, move ordering matters less near the leaves (small
+subtrees, less to prune). Only sort the move list when `empties >= N`; below
+that, iterate in natural board order. Benchmark several `N` (e.g. 6, 8, 10, 12)
+to find the crossover. Caveat: PVS relies on a good first move, so skipping the
+sort trades sort cost against *more* re-searches — the net is what the benchmark
+must show.
+
+### Step 14 — Dedicated no-sort search function
+If Step 13 helps, remove the per-node `if empties >= N` branch by factoring a
+separate never-sorts routine used for `empties < N`, with the sorting routine
+dispatching into it at the boundary (mirroring Step 12's split). Only worth it
+if Step 13 shows a clear win.
+
 ## Remaining steps
 
 ### Step 6b — Move ordering: Edax tricks
