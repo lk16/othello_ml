@@ -14,10 +14,10 @@ for spec in "14 1000" "16 350" "18 55" "20 8"; do
 done
 ```
 
-## Current baseline (after Step 5b)
+## Baseline after Step 5b (larger sample)
 
-Measured over a larger sample to reduce noise. ~12.5–13.5M nodes/s, consistent
-across depth. This is the reference point for future optimizations.
+~12.5–13.5M nodes/s, consistent across depth. The reference point Step 6
+improves on.
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
@@ -25,6 +25,19 @@ across depth. This is the reference point for future optimizations.
 | 16 | 350 | 836,979 | 66.5ms | 12.60M |
 | 18 | 55 | 6,243,131 | 498.1ms | 12.53M |
 | 20 | 8 | 47,214,268 | 3492.0ms | 13.52M |
+
+## Current baseline (after Step 6 — PVS)
+
+Null-window (PVS) search. Gain grows with depth (the 20-empty row is only 8
+boards, so noisy). Move-ordering quality caps the win; better ordering would
+amplify it.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 5b |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 109,412 | 8.6ms | 12.71M | 1.06× |
+| 16 | 350 | 707,030 | 57.1ms | 12.39M | 1.16× |
+| 18 | 55 | 4,682,275 | 382.5ms | 12.24M | 1.30× |
+| 20 | 8 | 40,164,910 | 3036.1ms | 13.23M | 1.15× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -49,15 +62,18 @@ across depth. This is the reference point for future optimizations.
   window, so these are reimplemented as `solve_1` (exact, no window) and
   `solve_2` (fail-soft negamax). Step 3 ("special-case last 1 move") is
   subsumed by `solve_1`.
+- **Step 6**: Principal Variation Search in `alphabeta_exact` —
+  first (best-ordered) move full window, siblings probed with a null window
+  `(alpha, alpha+1)` and re-searched only on a fail-high. No empties gate (Edax
+  applies PVS at every node). `solve_2` stays general-window because the first
+  child along the PV calls it with a full window.
 
 ## Remaining steps
 
-### Step 6 — Null-window search + Edax-style tricks
-Switch the main search to null-window (PVS): search the first move with a full
-window, the rest with `(alpha, alpha+1)`, re-searching only on a fail-high.
-This also lets the leaf solvers (`solve_2` and future 3/4-empty) drop back to
-the cheaper null-window form Edax uses. Layer on other Edax tricks (e.g.
-better move ordering, stability-based cutoffs) as they pay off.
+### Step 6b — More Edax search tricks (follow-up to PVS)
+PVS pays off in proportion to move-ordering quality; ours (fastest-first
+mobility) is decent but not great. Improve ordering and add selectivity tricks
+Edax uses (e.g. hash-move first, stability-based cutoffs) to reduce re-searches.
 
 ### Step 7 — 3-empty and 4-empty special cases
 Port `search_solve_3` / `search_solve_4` from Edax for further speedup.

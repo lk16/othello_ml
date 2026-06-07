@@ -201,8 +201,22 @@ fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i
     }
     move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
 
+    // Principal Variation Search: search the first (best-ordered) move with the
+    // full window, then probe each sibling with a null window and re-search only
+    // on a fail-high. No empties gate — Edax applies this at every node.
+    let mut first = true;
     for (_, child) in &move_list {
-        let score = -alphabeta_exact(child, -beta, -alpha, empties - 1);
+        let score = if first {
+            -alphabeta_exact(child, -beta, -alpha, empties - 1)
+        } else {
+            let probe = -alphabeta_exact(child, -alpha - 1, -alpha, empties - 1);
+            if probe > alpha && probe < beta {
+                -alphabeta_exact(child, -beta, -alpha, empties - 1)
+            } else {
+                probe
+            }
+        };
+        first = false;
         if score > alpha {
             alpha = score;
             if alpha >= beta {
