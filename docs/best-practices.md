@@ -29,6 +29,8 @@ Each item should be descriptive enough that specific examples are unnecessary.
 - **Add tests when adding or modifying functions.** Correctness is critical — every new `pub fn` or behavior change should have at least a basic test.
 - Use **Table-driven tests** where appropriate: a function has many input/output pairs.
 - **Self-contained tests** — don't rely on files outside the repo. Add small sample files to `test_data/` when needed.
+- **No randomness in tests.** Don't drive tests with a PRNG (even a seeded one) — failures become noise that depends on the seed and the iteration count. For broad coverage, enumerate a deterministic, fixed set of inputs instead: cross every interesting position parameter (e.g. each empty-square index) with a small table of hand-chosen bit patterns. This is reproducible and the failing case is always the same.
+- **Cross-check fast paths against a simple reference.** When optimizing a function (e.g. the `solve_1`/`solve_2` endgame leaf solvers), keep an obviously-correct, unoptimized implementation in the test module (e.g. `naive_exact`) and assert the two agree over the enumerated inputs.
 
 ## Documentation
 

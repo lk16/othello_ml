@@ -34,12 +34,152 @@ pub fn exact_score(pos: &Position) -> i32 {
 const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
 
+// ---------------------------------------------------------------------------
+// Leaf solvers (ported from Edax endgame.c)
+// ---------------------------------------------------------------------------
+
+/// Standalone bitboard flip computation on raw u64s.
+/// Same 8-direction logic as `Position::flipped`; returns flipped-disc mask.
+fn flips_for(sq: u32, player: u64, opponent: u64) -> u64 {
+    let move_bit = 1u64 << sq;
+    const MC: u64 = 0x7E7E7E7E7E7E7E7E; // middle columns
+    let opp_h = opponent & MC;
+    let opp_d = opponent & MC;
+    let mut flipped: u64 = 0;
+
+    macro_rules! ray {
+        ($opp:expr, $seed:expr, $shift:literal, $dir:tt) => {{
+            let mut f = $opp & ($seed $dir $shift);
+            f |= $opp & (f $dir $shift);
+            f |= $opp & (f $dir $shift);
+            f |= $opp & (f $dir $shift);
+            f |= $opp & (f $dir $shift);
+            f |= $opp & (f $dir $shift);
+            if player & (f $dir $shift) != 0 { flipped |= f; }
+        }};
+    }
+
+    ray!(opp_h,  move_bit, 1, <<);
+    ray!(opp_h,  move_bit, 1, >>);
+    ray!(opponent, move_bit, 8, <<);
+    ray!(opponent, move_bit, 8, >>);
+    ray!(opp_d,  move_bit, 7, <<);
+    ray!(opp_d,  move_bit, 7, >>);
+    ray!(opp_d,  move_bit, 9, <<);
+    ray!(opp_d,  move_bit, 9, >>);
+
+    flipped
+}
+
+/// Game-over score when no moves remain: winner gets all empties.
+/// Port of `board_solve` from Edax.
+fn solve_game_over(player: u64, n_empties: u32) -> i32 {
+    let n = n_empties as i32;
+    let diff = 2 * player.count_ones() as i32 - 64 + n; // player_discs - opponent_discs
+    if diff > 0 {
+        diff + n
+    } else if diff < 0 {
+        diff - n
+    } else {
+        0
+    }
+}
+
+/// 1-empty leaf solver. Returns the exact score from `player`'s perspective
+/// for a full board with a single empty square at `sq`.
+///
+/// With one empty, every move is forced (the lone empty is the only candidate),
+/// so no search window is needed. Does NOT increment NODE_COUNT; the caller
+/// accounts for this node.
+fn solve_1(player: u64, sq: u32) -> i32 {
+    let opponent = !player & !(1u64 << sq);
+    // Differential after `player` places at `sq` before flips: +1 disc for the
+    // player. Each flipped disc then shifts the differential by a further 2.
+    let score_base = 2 * player.count_ones() as i32 - 62;
+
+    // The side to move is forced to play at `sq` whenever that move is legal.
+    let flipped = flips_for(sq, player, opponent);
+    if flipped != 0 {
+        return score_base + 2 * flipped.count_ones() as i32;
+    }
+
+    // Player cannot play, so it passes; the opponent is then forced to play.
+    let flipped_opp = flips_for(sq, opponent, player);
+    if flipped_opp != 0 {
+        return score_base - 2 - 2 * flipped_opp.count_ones() as i32;
+    }
+
+    // Neither side can play: game over with one empty square.
+    solve_game_over(player, 1)
+}
+
+/// 2-empty leaf solver: a negamax alpha-beta search over a full board with
+/// empties at `x1` and `x2`. Returns the score from `player`'s perspective.
+/// Increments NODE_COUNT once per 1-empty child visited.
+fn solve_2(player: u64, opponent: u64, mut alpha: i32, beta: i32, x1: u32, x2: u32) -> i32 {
+    const NONE: i32 = SCORE_MIN - 1; // below any real score
+    let mut best = NONE;
+    let mut nodes: u64 = 0;
+
+    // Player tries x1.
+    let f1 = flips_for(x1, player, opponent);
+    if f1 != 0 {
+        let moved = player | f1 | (1u64 << x1);
+        let child_player = opponent & !moved; // opponent to move, only x2 empty
+        best = -solve_1(child_player, x2);
+        nodes += 1;
+        if best > alpha {
+            alpha = best;
+        }
+    }
+
+    // Player tries x2 unless x1 already caused a beta cutoff.
+    if alpha < beta {
+        let f2 = flips_for(x2, player, opponent);
+        if f2 != 0 {
+            let moved = player | f2 | (1u64 << x2);
+            let child_player = opponent & !moved; // opponent to move, only x1 empty
+            let s = -solve_1(child_player, x1);
+            nodes += 1;
+            if s > best {
+                best = s;
+            }
+        }
+    }
+
+    NODE_COUNT.with(|c| c.set(c.get() + nodes));
+
+    if best != NONE {
+        return best;
+    }
+
+    // Player has no move and passes. If the opponent also has no move the game
+    // is over; otherwise search the opponent's reply and negate.
+    if flips_for(x1, opponent, player) == 0 && flips_for(x2, opponent, player) == 0 {
+        return solve_game_over(player, 2);
+    }
+    -solve_2(opponent, player, -beta, -alpha, x1, x2)
+}
+
 /// Negamax with alpha-beta pruning, searching to game end.
 fn alphabeta_exact(pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
     NODE_COUNT.with(|c| c.set(c.get() + 1));
 
     if empties == 0 {
         return pos.final_score();
+    }
+
+    if empties == 1 {
+        let sq = (!pos.occupied()).trailing_zeros();
+        return solve_1(pos.player, sq);
+    }
+
+    if empties == 2 {
+        let mut empty = !pos.occupied();
+        let x1 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x2 = empty.trailing_zeros();
+        return solve_2(pos.player, pos.opponent, alpha, beta, x1, x2);
     }
 
     let moves = pos.get_moves();
@@ -209,6 +349,270 @@ fn heuristic(pos: &Position, weights: &Weights, features: &Features) -> i32 {
 mod tests {
     use super::*;
     use std::fs;
+
+    // --- helpers -----------------------------------------------------------
+
+    // --- flips_for ---------------------------------------------------------
+
+    #[test]
+    fn flips_for_no_flip_isolated() {
+        // Empty board: no opponent discs, so no flip possible.
+        assert_eq!(flips_for(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn flips_for_horizontal_single() {
+        // player at bit 0, opponent at bit 1, player at bit 2 → playing at 0 wraps? No.
+        // player at bit 2, opponent at bit 1, play at 0 → should flip bit 1.
+        let player = 1u64 << 2;
+        let opponent = 1u64 << 1;
+        let flipped = flips_for(0, player, opponent);
+        assert_eq!(flipped, 1u64 << 1);
+    }
+
+    #[test]
+    fn flips_for_vertical_chain() {
+        // player at row3 col0, opponent at row2 and row1 col0, play at row0 col0 → flip rows 1,2.
+        let player = 1u64 << 24; // a4
+        let opponent = (1u64 << 8) | (1u64 << 16); // a2, a3
+        let flipped = flips_for(0, player, opponent); // play a1
+        assert_eq!(flipped, (1u64 << 8) | (1u64 << 16));
+    }
+
+    #[test]
+    fn flips_for_no_wrap_left_edge() {
+        // Disc at h-file should not wrap to a-file via horizontal ray.
+        // player at bit 7 (h1), opponent at bit 8 (a2), play at bit 15 (h2).
+        // No diagonal or horizontal connection; vertical: player at h1, play at h2 separated by nothing.
+        let player = 1u64 << 7;
+        let opponent = 1u64 << 8;
+        // play at 15 (h2). Vertical ray down from 15: bit 7 = player. But opponent at 8 (a2) is not
+        // in the vertical column of h-file. So flip should be 0.
+        let flipped = flips_for(15, player, opponent);
+        assert_eq!(flipped, 0);
+    }
+
+    // --- solve_game_over ---------------------------------------------------
+
+    #[test]
+    fn solve_game_over_player_wins() {
+        // 32 player discs, 30 opponent discs, 2 empties → player wins, gets empties
+        // score = (32+2) - 30 = 4  → diff+n = (32-30)+2 + 2 = 6
+        // player=32, opp=30, diff = 2*32-64+2=2, score = 2+2=4
+        let player: u64 = 0x00000000FFFFFFFF; // 32 bits
+                                              // opponent: 30 bits in upper half, leave 2 empty
+        let opponent: u64 = 0x3FFFFFFF00000000; // 30 bits
+        assert_eq!(player.count_ones(), 32);
+        assert_eq!(opponent.count_ones(), 30);
+        let score = solve_game_over(player, 2);
+        assert_eq!(score, 4); // diff=2, score=diff+n=4
+    }
+
+    #[test]
+    fn solve_game_over_opponent_wins() {
+        // 30 player, 32 opponent, 2 empties → opponent wins
+        // diff = 2*30-64+2 = -2, score = diff-n = -4
+        let player: u64 = 0x000000003FFFFFFF; // 30 bits
+        let opponent: u64 = 0xFFFFFFFF00000000; // 32 bits
+        assert_eq!(player.count_ones(), 30);
+        assert_eq!(opponent.count_ones(), 32);
+        let score = solve_game_over(player, 2);
+        assert_eq!(score, -4);
+    }
+
+    #[test]
+    fn solve_game_over_tie() {
+        // 31 each, 2 empties → tie
+        let player: u64 = 0x000000007FFFFFFF; // 31 bits
+        let opponent: u64 = 0x7FFFFFFF00000000; // 31 bits
+        assert_eq!(player.count_ones(), 31);
+        assert_eq!(opponent.count_ones(), 31);
+        let score = solve_game_over(player, 2);
+        assert_eq!(score, 0);
+    }
+
+    #[test]
+    fn solve_game_over_zero_empties_matches_final_score() {
+        // With 0 empties, solve_game_over should match Position::final_score.
+        let player: u64 = 0x00000000FFFFFFFF;
+        let opponent: u64 = 0xFFFFFFFF00000000;
+        let pos = Position { player, opponent };
+        assert_eq!(solve_game_over(player, 0), pos.final_score());
+    }
+
+    // --- leaf solver references --------------------------------------------
+
+    /// Independent exact negamax that never uses the `solve_1`/`solve_2`
+    /// fast paths, so it serves as ground truth for them.
+    fn naive_exact(pos: &Position) -> i32 {
+        if pos.empties() == 0 {
+            return pos.final_score();
+        }
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -naive_exact(&passed);
+        }
+        let mut best = SCORE_MIN - 1;
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let s = -naive_exact(&pos.do_move(cell));
+            if s > best {
+                best = s;
+            }
+        }
+        best
+    }
+
+    /// Empty-square indices exercising corners, edges, centre and both
+    /// board halves.
+    const SQUARES: &[u32] = &[0, 1, 7, 8, 9, 14, 27, 28, 35, 36, 49, 55, 56, 62, 63];
+
+    /// Deterministic disc-layout patterns (assigned to the player; the rest of
+    /// the board becomes the opponent). Chosen to vary density and adjacency:
+    /// empty, full, alternating bits, row/column/diagonal stripes.
+    const PATTERNS: &[u64] = &[
+        0x0000_0000_0000_0000,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xAAAA_AAAA_AAAA_AAAA,
+        0x5555_5555_5555_5555,
+        0xFF00_FF00_FF00_FF00,
+        0x00FF_00FF_00FF_00FF,
+        0xF0F0_F0F0_F0F0_F0F0,
+        0x0F0F_0F0F_0F0F_0F0F,
+        0x8040_2010_0804_0201,
+        0x0102_0408_1020_4080,
+        0xC3C3_C3C3_C3C3_C3C3,
+        0x1234_5678_9ABC_DEF0,
+    ];
+
+    // --- solve_1 -----------------------------------------------------------
+
+    #[test]
+    fn solve_1_player_forced_play() {
+        // Full board, empty at a1 (0); play a1 flips b1 (opponent) anchored on c1.
+        // player = {c1}, everything else opponent. After play: player 3, opp 61 → -58.
+        let sq = 0u32;
+        let player = 1u64 << 2; // c1
+        let pos = Position {
+            player,
+            opponent: !player & !(1u64 << sq),
+        };
+        assert_eq!(pos.empties(), 1);
+        assert_eq!(solve_1(player, sq), -58);
+        assert_eq!(solve_1(player, sq), naive_exact(&pos));
+    }
+
+    #[test]
+    fn solve_1_game_over_player_wins() {
+        // Full board, lone empty, opponent absent: nobody can flip → game over.
+        let sq = 0u32;
+        let player = !(1u64 << sq); // 63 discs
+        assert_eq!(solve_1(player, sq), 64);
+    }
+
+    #[test]
+    fn solve_1_matches_naive() {
+        // Cross every empty square with every disc pattern.
+        for &sq in SQUARES {
+            let empty = 1u64 << sq;
+            for &pat in PATTERNS {
+                let player = pat & !empty;
+                let opponent = !player & !empty;
+                let pos = Position { player, opponent };
+                assert_eq!(
+                    solve_1(player, sq),
+                    naive_exact(&pos),
+                    "player={player:#x} sq={sq}"
+                );
+            }
+        }
+    }
+
+    // --- solve_2 -----------------------------------------------------------
+
+    fn run_solve_2(player: u64, opponent: u64) -> i32 {
+        let mut empty = !(player | opponent);
+        let x1 = empty.trailing_zeros();
+        empty &= empty - 1;
+        let x2 = empty.trailing_zeros();
+        solve_2(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2)
+    }
+
+    /// Every ordered pair of distinct empty squares from [`SQUARES`], crossed
+    /// with every disc pattern. Returns the (player, opponent) layouts.
+    fn two_empty_layouts() -> impl Iterator<Item = (u64, u64)> {
+        SQUARES.iter().enumerate().flat_map(|(i, &s1)| {
+            SQUARES[i + 1..].iter().flat_map(move |&s2| {
+                let empty = (1u64 << s1) | (1u64 << s2);
+                PATTERNS.iter().map(move |&pat| {
+                    let player = pat & !empty;
+                    (player, !player & !empty)
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn solve_2_matches_naive() {
+        for (player, opponent) in two_empty_layouts() {
+            let pos = Position { player, opponent };
+            assert_eq!(pos.empties(), 2);
+            assert_eq!(
+                run_solve_2(player, opponent),
+                naive_exact(&pos),
+                "player={player:#x} opponent={opponent:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn solve_2_respects_window() {
+        // Full window equals the truth (checked above); narrow windows must
+        // fail soft on the correct side of the bound.
+        for (player, opponent) in two_empty_layouts() {
+            let truth = naive_exact(&Position { player, opponent });
+            let mut e = !(player | opponent);
+            let x1 = e.trailing_zeros();
+            e &= e - 1;
+            let x2 = e.trailing_zeros();
+
+            // Window entirely above the true score → fail low (result <= alpha).
+            let lo = truth + 1;
+            let r = solve_2(player, opponent, lo, lo + 1, x1, x2);
+            assert!(r <= lo, "fail-low: r={r} alpha={lo} truth={truth}");
+            // Window entirely below the true score → fail high (result >= beta).
+            let hi = truth - 1;
+            let r = solve_2(player, opponent, hi - 1, hi, x1, x2);
+            assert!(r >= hi, "fail-high: r={r} beta={hi} truth={truth}");
+        }
+    }
+
+    #[test]
+    fn solve_1_and_solve_2_drive_exact_score() {
+        // End-to-end: exact_score (which dispatches to the leaf solvers at
+        // 1 and 2 empties) agrees with the independent naive solver.
+        for &sq in SQUARES {
+            let empty = 1u64 << sq;
+            for &pat in PATTERNS {
+                let player = pat & !empty;
+                let opponent = !player & !empty;
+                let pos = Position { player, opponent };
+                assert_eq!(exact_score(&pos), naive_exact(&pos));
+            }
+        }
+        for (player, opponent) in two_empty_layouts() {
+            let pos = Position { player, opponent };
+            assert_eq!(exact_score(&pos), naive_exact(&pos));
+        }
+    }
+
+    // --- existing tests below ----------------------------------------------
 
     #[test]
     fn test_exact_score_game_end_full() {
