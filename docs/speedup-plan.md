@@ -116,6 +116,31 @@ Order the empties so odd-parity regions are tried first, in `solve_3`/`solve_4`
 (Edax's `sort3` / `parity_case` tables) and the main search. Speed-only;
 deferred from Step 7.
 
-### Step 10 — Transposition table (last; was "Step 5"/"Step 9")
-Previously attempted but had a correctness bug. Do this last, once the rest of
-the search is in its final shape.
+### Step 10 — Transposition table (was "Step 5"/"Step 9")
+Previously attempted but had a correctness bug. Do this once the rest of the
+search is in its final shape.
+
+### Step 11 — Alternative flip-computation variants
+Edax ships many implementations of the same flip primitive (`flip_*.c`,
+`count_last_flip_*.c`): portable bitboard (kindergarten / carry), `BMI2`
+(PEXT/PDEP), `SSE`/`AVX2`, ARM `NEON`/`SVE`, etc. It selects one at *compile
+time* for the target CPU. We currently use one portable bitboard `flips_for`.
+Goal: implement a few alternatives, benchmark them, and pick the best per
+target. Several are CPU-feature dependent.
+
+**Test/config strategy** (no new deps; `std::arch` intrinsics only):
+- All variants share one signature and are checked against the existing
+  portable reference (`flips_for` / `Position::flipped`) over the deterministic
+  square × pattern battery — a single `check_flip_impl(f)` harness.
+- Portable variants are always compiled and tested.
+- SIMD variants are `#[cfg(target_arch = "...")]`-compiled and written as
+  `#[target_feature(enable = "bmi2"|"avx2"|...)]` (so they build even when the
+  default target lacks the feature). Their tests guard the call with
+  `is_x86_feature_detected!(...)` and no-op (with an `eprintln!` note) when the
+  running CPU lacks it — so `cargo test` is correct on any machine; the variant
+  is exercised only where supported. Cross-arch variants (NEON/SVE) are only
+  testable on ARM/CI, not the x86_64 dev box.
+- Production selection: prefer compile-time `cfg(target_feature)` (one impl per
+  binary, like Edax) over a runtime function-pointer dispatcher — indirection
+  in this hot leaf op would cost more than it saves. `bench` can still exercise
+  each compiled variant for comparison.
