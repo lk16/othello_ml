@@ -52,7 +52,7 @@ lowers reported nodes/s — ms/pos is the honest measure.
 | 18 | 55 | 2,864,005 | 303.1ms | 9.45M | 1.26× |
 | 20 | 8 | 23,721,405 | 2388.0ms | 9.93M | 1.27× |
 
-## Current baseline (after Step 8 — flip table)
+## Baseline after Step 8 (flip table)
 
 `count_last_flip` table for `solve_1`. Identical node counts (search unchanged),
 ~1.13× faster per node.
@@ -63,6 +63,18 @@ lowers reported nodes/s — ms/pos is the honest measure.
 | 16 | 350 | 431,642 | 40.2ms | 10.75M | 1.13× |
 | 18 | 55 | 2,864,005 | 269.5ms | 10.63M | 1.12× |
 | 20 | 8 | 23,721,405 | 2079.3ms | 11.41M | 1.15× |
+
+## Current baseline (after Step 12 — deep-search split)
+
+Leaf cases (≤4 empties) factored into `solve_leaf`; the general `≥5` search no
+longer re-tests them per node. Identical node counts; ~2% faster at every depth.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 8 |
+|---------|--------|-----------|--------|---------|-----------|
+| 14 | 673 | 66,306 | 5.9ms | 11.29M | 1.02× |
+| 16 | 350 | 431,642 | 39.5ms | 10.94M | 1.02× |
+| 18 | 55 | 2,864,005 | 263.6ms | 10.87M | 1.02× |
+| 20 | 8 | 23,721,405 | 2029.3ms | 11.69M | 1.02× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -102,6 +114,11 @@ lowers reported nodes/s — ms/pos is the honest measure.
   masks are generated at compile time with `const` blocks (no hardcoded
   tables). `solve_2`/`solve_3`/`solve_4` keep `flips_for` since they need the
   full flip mask to build child positions.
+- **Step 12**: deep-search split — leaf cases (≤4 empties) factored into
+  `Search::solve_leaf`; `alphabeta_exact` now handles only `≥5` empties and
+  dispatches via `search_exact` at the recursion boundary, so the hot
+  internal-node path no longer re-tests the five leaf cases each visit.
+  Identical node counts; ~2% faster at every depth.
 
 ## Refactors (no perf change)
 
@@ -115,18 +132,7 @@ lowers reported nodes/s — ms/pos is the honest measure.
 
 ## Next up — search-structure experiments (do these before the Remaining steps)
 
-These three are sequenced: each depends on the previous one paying off. Do them
-first.
-
-### Step 12 — Factor out the deep-search path (empties > 4)
-`alphabeta_exact` tests `empties == 0/1/2/3/4` at the top of every node, so deep
-internal nodes pay ~5 comparisons per visit before reaching the general code.
-Split into a leaf dispatcher (`empties ≤ 4` → `solve_1..4`/`final_score`) and a
-general search for `empties ≥ 5`. The general search dispatches to the leaf
-solver at the recursion boundary — a single `empties - 1 <= 4` check at the call
-site — instead of re-testing all five cases at every node. Expected: small
-constant-factor win on the hottest (internal-node) path. Keep if it benchmarks
-faster; the later two assume it does.
+These are sequenced: each depends on the previous one paying off. Do them first.
 
 ### Step 13 — Skip move sorting below N empties
 In the general search, move ordering matters less near the leaves (small

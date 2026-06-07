@@ -11,16 +11,16 @@ use crate::training::weights::Weights;
 ///
 /// The score is bounded to [-64, 64].
 pub fn exact_score(pos: &Position) -> i32 {
-    Search::new().alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+    Search::new().search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
 }
 
 /// Exact score together with the number of search nodes visited. Used by the
 /// `bench` subcommand; `exact_score` runs the identical search without exposing
 /// the node count.
 pub fn exact_score_with_nodes(pos: &Position) -> (i32, u64) {
-    let mut search = Search::new();
-    let score = search.alphabeta_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
-    (score, search.nodes)
+    let mut searcher = Search::new();
+    let score = searcher.search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
+    (score, searcher.nodes)
 }
 
 /// Score bounds.
@@ -374,48 +374,62 @@ impl Search {
         -self.solve_4(opponent, player, -beta, -alpha, x1, x2, x3, x4)
     }
 
-    /// Negamax with alpha-beta pruning, searching to game end.
+    /// Dispatch to the right routine for `empties`: the leaf solver for four or
+    /// fewer empties, the general PVS search otherwise.
+    #[inline]
+    fn search_exact(&mut self, pos: &Position, alpha: i32, beta: i32, empties: u32) -> i32 {
+        if empties <= 4 {
+            self.solve_leaf(pos, alpha, beta, empties)
+        } else {
+            self.alphabeta_exact(pos, alpha, beta, empties)
+        }
+    }
+
+    /// Leaf dispatcher for positions with at most four empties, routing to the
+    /// dedicated `solve_1`..`solve_4` solvers (or `final_score` at game end).
+    fn solve_leaf(&mut self, pos: &Position, alpha: i32, beta: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+        match empties {
+            0 => pos.final_score(),
+            1 => {
+                let sq = (!pos.occupied()).trailing_zeros();
+                solve_1(pos.player, sq)
+            }
+            2 => {
+                let mut empty = !pos.occupied();
+                let x1 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x2 = empty.trailing_zeros();
+                self.solve_2(pos.player, pos.opponent, alpha, beta, x1, x2)
+            }
+            3 => {
+                let mut empty = !pos.occupied();
+                let x1 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x2 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x3 = empty.trailing_zeros();
+                self.solve_3(pos.player, pos.opponent, alpha, beta, x1, x2, x3)
+            }
+            _ => {
+                let mut empty = !pos.occupied();
+                let x1 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x2 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x3 = empty.trailing_zeros();
+                empty &= empty - 1;
+                let x4 = empty.trailing_zeros();
+                self.solve_4(pos.player, pos.opponent, alpha, beta, x1, x2, x3, x4)
+            }
+        }
+    }
+
+    /// Negamax with PVS for positions with five or more empties. Leaf cases
+    /// (≤ 4 empties) are handled by [`Search::solve_leaf`] at the recursion
+    /// boundary, so this hot path never re-tests them.
     fn alphabeta_exact(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
         self.nodes += 1;
-
-        if empties == 0 {
-            return pos.final_score();
-        }
-
-        if empties == 1 {
-            let sq = (!pos.occupied()).trailing_zeros();
-            return solve_1(pos.player, sq);
-        }
-
-        if empties == 2 {
-            let mut empty = !pos.occupied();
-            let x1 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x2 = empty.trailing_zeros();
-            return self.solve_2(pos.player, pos.opponent, alpha, beta, x1, x2);
-        }
-
-        if empties == 3 {
-            let mut empty = !pos.occupied();
-            let x1 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x2 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x3 = empty.trailing_zeros();
-            return self.solve_3(pos.player, pos.opponent, alpha, beta, x1, x2, x3);
-        }
-
-        if empties == 4 {
-            let mut empty = !pos.occupied();
-            let x1 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x2 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x3 = empty.trailing_zeros();
-            empty &= empty - 1;
-            let x4 = empty.trailing_zeros();
-            return self.solve_4(pos.player, pos.opponent, alpha, beta, x1, x2, x3, x4);
-        }
 
         let moves = pos.get_moves();
         if moves == 0 {
@@ -442,11 +456,11 @@ impl Search {
         let mut first = true;
         for (_, child) in &move_list {
             let score = if first {
-                -self.alphabeta_exact(child, -beta, -alpha, empties - 1)
+                -self.search_exact(child, -beta, -alpha, empties - 1)
             } else {
-                let probe = -self.alphabeta_exact(child, -alpha - 1, -alpha, empties - 1);
+                let probe = -self.search_exact(child, -alpha - 1, -alpha, empties - 1);
                 if probe > alpha && probe < beta {
-                    -self.alphabeta_exact(child, -beta, -alpha, empties - 1)
+                    -self.search_exact(child, -beta, -alpha, empties - 1)
                 } else {
                     probe
                 }
@@ -535,14 +549,14 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
     let mut alpha = SCORE_MIN;
     let mut best_cell = 0u32;
     let empties = pos.empties();
-    let mut search = Search::new();
+    let mut searcher = Search::new();
 
     let mut remaining = moves;
     while remaining != 0 {
         let cell = remaining.trailing_zeros();
         remaining &= remaining - 1;
         let child = pos.do_move(cell);
-        let score = -search.alphabeta_exact(&child, -SCORE_MAX, -alpha, empties - 1);
+        let score = -searcher.search_exact(&child, -SCORE_MAX, -alpha, empties - 1);
         if score > alpha {
             alpha = score;
             best_cell = cell;
