@@ -89,7 +89,7 @@ Order moves only when `empties >= 6` (`SORT_MIN_EMPTIES`). Node counts rise ~8%
 | 18 | 55 | 3,108,566 | 256.7ms | 12.11M | 1.03× |
 | 20 | 8 | 25,561,308 | 1982.8ms | 12.89M | 1.02× |
 
-## Current baseline (after Step 14 — dedicated no-sort search)
+## Baseline after Step 14 (dedicated no-sort search)
 
 `alphabeta_nosort` handles the unordered range (empties 5 here) iterating the
 moves bitboard directly — no move-list `Vec`, no mobility tuples. Identical node
@@ -102,6 +102,21 @@ allocation matters).
 | 16 | 350 | 469,604 | 36.3ms | 12.94M | 1.05× |
 | 18 | 55 | 3,108,566 | 242.0ms | 12.84M | 1.06× |
 | 20 | 8 | 25,561,308 | 1895.7ms | 13.49M | 1.05× |
+
+## Current baseline (after Step 15 — per-square flip table)
+
+`Position::flip_mask` dispatches through a 64-entry table of `flip_at::<SQ>`
+const-generic specializations. With the square constant the compiler folds the
+move bit and prunes off-board directions, roughly halving the flip work for
+edge/corner squares. Identical node counts; ~1.37× faster — flip computation was
+a major bottleneck, and the table-lookup cost is dwarfed by the savings.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 14 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 71,882 | 3.9ms | 18.43M | 1.38× |
+| 16 | 350 | 469,604 | 26.3ms | 17.85M | 1.36× |
+| 18 | 55 | 3,108,566 | 175.5ms | 17.71M | 1.36× |
+| 20 | 8 | 25,561,308 | 1314.1ms | 19.45M | 1.42× |
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -158,6 +173,13 @@ allocation matters).
   move-list `Vec` or mobility tuples; `search_exact` is now a 3-way dispatch
   (leaf / no-sort / sorted). Identical node counts; ~4–6% faster. The win grows
   if `SORT_MIN_EMPTIES` rises (more levels use this allocation-free path).
+- **Step 15**: per-square flip table. `Position::flip_mask` dispatches through
+  a 64-entry `FLIP` table of `flip_at::<SQ>` const-generic specializations; with
+  `SQ` constant the compiler folds the move bit and prunes off-board directions.
+  Identical node counts; ~1.37× faster — the biggest single win since the early
+  steps, confirming flip computation was a major bottleneck. The general 8-ray
+  body now lives once, in `flip_at`. Composes with Step 11 (a per-square body
+  could itself use SIMD).
 
 ## Refactors (no perf change)
 
@@ -174,21 +196,6 @@ allocation matters).
   check + `flip_mask`; the leaf solvers call `flip_mask` directly (they know `mv`
   is empty, so they skip the check). Perf-neutral vs Step 14 (within noise);
   removes the duplication and gives one place for Step 15 to optimize.
-
-## Next up — search-structure experiments (do these before the Remaining steps)
-
-### Step 15 — Per-square flip function array
-`Position::flip_mask` (the shared core behind `flipped`/`do_move` and the leaf
-solvers) computes flips with a general branchy 8-direction scan on every call —
-the most-invoked primitive in the search. Edax instead generates a *specialized
-flip function per square* and dispatches through an array (`flip[64]`), so each
-call runs only the directions that exist for that square with no runtime masking
-of edges. Replace `flip_mask` with such a per-square array (or a `match sq` over
-specialized bodies) and benchmark — one change now speeds up everything.
-
-Relationship to Step 11: Step 15 is the algorithmic/dispatch structure
-(per-square specialization); Step 11 is the instruction-set variants
-(BMI2/SSE/…). They compose — a per-square function can itself use SIMD.
 
 ## Remaining steps
 
