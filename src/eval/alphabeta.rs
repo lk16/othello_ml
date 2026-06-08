@@ -3,29 +3,150 @@
 use crate::othello::position::Position;
 use crate::training::features::Features;
 use crate::training::weights::Weights;
+
 /// Exact score for `pos` from the perspective of the side to move.
 ///
 /// Searches all legal move sequences to game end with alpha-beta pruning.
 /// Handles terminal positions (game over) and passes (no legal moves)
 /// directly, matching the semantics of the Edax evaluator.
 ///
-/// The score is bounded to [-64, 64].
+/// The score is bounded to [-64, 64]. A one-shot convenience wrapper: it
+/// allocates a fresh transposition table per call, so callers that evaluate
+/// many positions should instead reuse a single [`Solver`] (see its docs).
 pub fn exact_score(pos: &Position) -> i32 {
-    Search::new().search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+    Solver::new().exact_score(pos)
 }
 
 /// Exact score together with the number of search nodes visited. Used by the
 /// `bench` subcommand; `exact_score` runs the identical search without exposing
 /// the node count.
 pub fn exact_score_with_nodes(pos: &Position) -> (i32, u64) {
-    let mut searcher = Search::new();
-    let score = searcher.search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
-    (score, searcher.nodes)
+    Solver::new().exact_score_with_nodes(pos)
 }
 
 /// Score bounds.
 const SCORE_MIN: i32 = -64;
 const SCORE_MAX: i32 = 64;
+
+// ---------------------------------------------------------------------------
+// Transposition table
+// ---------------------------------------------------------------------------
+//
+// Maps a position to a [lower, upper] bound on its exact score (plus the best
+// move found, used for ordering). Because an exact endgame score is intrinsic
+// to the position — it never depends on the path taken to reach it — a stored
+// entry stays valid for the lifetime of the table, across every search. So the
+// table is never invalidated or cleared: it only accumulates and refines bounds
+// (and a warm table from earlier positions speeds up later ones).
+//
+// A single shared [`Search`]/[`Solver`] owns the table and is reused across
+// positions (see [`Solver`]); the table is allocated once and only the node
+// counter resets per search. We deliberately avoid a `thread_local!` for the
+// reuse — it reads worse than an explicit owner — and only because threading an
+// owned `Search` through the callers costs nothing per node (it is borrowed as
+// `&mut self`, never moved). Reach for `thread_local!` only if an explicit
+// owner ever turns out to carry a real performance penalty.
+
+/// Transposition table size as a power of two (number of slots). Swept 17..23:
+/// node counts barely move above ~2^19 (collisions are already rare at the
+/// benchmarked depths), so the win is cache locality — smaller is faster until
+/// collisions start adding nodes on the deepest searches (2^17 regressed the
+/// 20-empty level). 2^19 (a 12 MB table) is the knee: ~all of the locality win
+/// while keeping 2× the headroom of 2^18 for solves deeper than the benchmark.
+const TT_BITS: u32 = 19;
+const TT_SIZE: usize = 1 << TT_BITS;
+const TT_MASK: u64 = TT_SIZE as u64 - 1;
+
+/// Minimum empties at which the transposition table is consulted. Below this,
+/// transpositions are too rare for the probe/store to pay for itself, so the
+/// search runs without touching the table. (The TT is only wired into the
+/// ordered search, so the effective floor is `max(SORT_MIN_EMPTIES, this)`.)
+/// Swept 6..10: 6 and 7 are within noise of each other and both clearly beat
+/// 8/10; 7 (don't probe the very numerous empties-6 nodes, where the probe's
+/// overhead roughly cancels its node savings) edges ahead at the less-noisy
+/// 16/18-empty levels. Re-sweep when the search shape changes.
+const TT_MIN_EMPTIES: u32 = 7;
+
+/// Sentinel "no move" square (a real square is 0..64).
+const NO_MOVE: u8 = 64;
+
+/// One transposition-table slot: the position (stored in full for exact
+/// collision detection — a partial key risks returning a wrong score) and a
+/// `[lower, upper]` bound on its exact score, plus the best move for ordering.
+/// A slot is empty iff `player | opponent == 0` (the disc-free board never
+/// occurs as a real interior search node).
+#[derive(Clone, Copy)]
+struct TtEntry {
+    player: u64,
+    opponent: u64,
+    lower: i8,
+    upper: i8,
+    best_move: u8,
+}
+
+impl Default for TtEntry {
+    fn default() -> Self {
+        TtEntry {
+            player: 0,
+            opponent: 0,
+            lower: 0,
+            upper: 0,
+            best_move: NO_MOVE,
+        }
+    }
+}
+
+/// Hash a position to a table slot. A 64-bit mix of both bitboards, masked to
+/// the table size (a power of two).
+#[inline]
+fn tt_index(player: u64, opponent: u64) -> usize {
+    let mut h = player.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= opponent.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(32);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    (h & TT_MASK) as usize
+}
+
+/// Reusable exact solver: owns a transposition table shared across the
+/// positions it evaluates. Exact scores are position-intrinsic, so cross-
+/// position reuse is sound and warms the table. Construct once, evaluate many —
+/// callers that loop (the `bench` subcommand, cache workers, `batch_evaluate`)
+/// hold a single `Solver` so the multi-MB table is allocated only once.
+pub struct Solver {
+    search: Search,
+}
+
+impl Solver {
+    /// Allocate a solver with a fresh (empty) transposition table.
+    pub fn new() -> Self {
+        Solver {
+            search: Search::new(),
+        }
+    }
+
+    /// Exact score for `pos`, reusing this solver's transposition table.
+    pub fn exact_score(&mut self, pos: &Position) -> i32 {
+        self.search.nodes = 0;
+        self.search
+            .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+    }
+
+    /// Exact score plus the number of search nodes visited for this position.
+    pub fn exact_score_with_nodes(&mut self, pos: &Position) -> (i32, u64) {
+        self.search.nodes = 0;
+        let score = self
+            .search
+            .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
+        (score, self.search.nodes)
+    }
+}
+
+impl Default for Solver {
+    fn default() -> Self {
+        Solver::new()
+    }
+}
 
 /// Minimum empties at which the deep search orders moves (by opponent mobility).
 /// Below this, moves are searched in natural order — near the leaves the
@@ -182,16 +303,63 @@ fn solve_1(player: u64, sq: u32) -> i32 {
     solve_game_over(player, 1)
 }
 
-/// Mutable state for one exact search: the running count of nodes visited. The
-/// recursive search routines are methods so this state is explicit rather than
-/// a thread-local global.
+/// Mutable state for one exact search: the running count of nodes visited and
+/// the transposition table. The recursive search routines are methods so this
+/// state is explicit rather than a thread-local global.
 struct Search {
     nodes: u64,
+    tt: Vec<TtEntry>,
 }
 
 impl Search {
+    /// A searcher with a freshly allocated transposition table.
     fn new() -> Self {
-        Search { nodes: 0 }
+        Search {
+            nodes: 0,
+            tt: vec![TtEntry::default(); TT_SIZE],
+        }
+    }
+
+    /// Look up `pos` in the table. Returns a copy of the entry on an exact hit
+    /// (full position match), `None` otherwise. Caller must ensure the table is
+    /// non-empty.
+    #[inline]
+    fn tt_probe(&self, pos: &Position) -> Option<TtEntry> {
+        let e = self.tt[tt_index(pos.player, pos.opponent)];
+        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    /// Record a `[lower, upper]` bound (and best move) for `pos`. If the slot
+    /// already holds this position, the bounds are refined (intersected) and a
+    /// real best move is kept; otherwise the slot is overwritten (always-
+    /// replace). Both old and new bounds are valid for the intrinsic exact
+    /// score, so intersecting them is sound.
+    #[inline]
+    fn tt_store(&mut self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+        let e = &mut self.tt[tt_index(pos.player, pos.opponent)];
+        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
+            if lower > e.lower {
+                e.lower = lower;
+            }
+            if upper < e.upper {
+                e.upper = upper;
+            }
+            if best_move != NO_MOVE {
+                e.best_move = best_move;
+            }
+        } else {
+            *e = TtEntry {
+                player: pos.player,
+                opponent: pos.opponent,
+                lower,
+                upper,
+                best_move,
+            };
+        }
     }
 
     /// 2-empty leaf solver: a negamax alpha-beta search over a full board with
@@ -410,8 +578,48 @@ impl Search {
     /// Negamax with PVS and move ordering, for `empties >= SORT_MIN_EMPTIES`.
     /// Children dispatch through [`Search::search_exact`] at the recursion
     /// boundary, so this hot path never re-tests the leaf or unordered cases.
-    fn alphabeta_exact(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
+    ///
+    /// At `empties >= TT_MIN_EMPTIES` (and when a table is present) the node is
+    /// looked up in the transposition table first: a sufficient stored bound
+    /// returns immediately, otherwise the stored best move seeds the ordering
+    /// and the final bound is written back.
+    fn alphabeta_exact(
+        &mut self,
+        pos: &Position,
+        mut alpha: i32,
+        mut beta: i32,
+        empties: u32,
+    ) -> i32 {
         self.nodes += 1;
+
+        let use_tt = empties >= TT_MIN_EMPTIES;
+        let mut hash_move = NO_MOVE;
+        if use_tt {
+            if let Some(e) = self.tt_probe(pos) {
+                let (lo, hi) = (e.lower as i32, e.upper as i32);
+                if lo >= beta {
+                    return lo;
+                }
+                if hi <= alpha {
+                    return hi;
+                }
+                if lo == hi {
+                    return lo;
+                }
+                // Narrow the search window to the still-unknown interval.
+                if lo > alpha {
+                    alpha = lo;
+                }
+                if hi < beta {
+                    beta = hi;
+                }
+                hash_move = e.best_move;
+            }
+        }
+        // Window actually searched (after any TT narrowing); the result is
+        // classified against this to decide whether it is a bound or exact.
+        let search_alpha = alpha;
+        let search_beta = beta;
 
         let moves = pos.get_moves();
         if moves == 0 {
@@ -423,21 +631,31 @@ impl Search {
         }
 
         // Order children by opponent mobility (fewest replies first).
-        let mut move_list: Vec<(u32, Position)> = Vec::with_capacity(moves.count_ones() as usize);
+        let mut move_list: Vec<(u32, u32, Position)> =
+            Vec::with_capacity(moves.count_ones() as usize);
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            move_list.push((child.get_moves().count_ones(), child));
+            move_list.push((child.get_moves().count_ones(), cell, child));
         }
-        move_list.sort_unstable_by_key(|&(mobility, _)| mobility);
+        move_list.sort_unstable_by_key(|&(mobility, _, _)| mobility);
+
+        // A transposition-table best move is the strongest ordering signal:
+        // pull it to the front, keeping the mobility order of the rest.
+        if hash_move != NO_MOVE {
+            if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
+                move_list[..=i].rotate_right(1);
+            }
+        }
 
         // Principal Variation Search: search the first (best-ordered) move with the
         // full window, then probe each sibling with a null window and re-search only
         // on a fail-high. No empties gate — Edax applies this at every node.
+        let mut best_cell = NO_MOVE;
         let mut first = true;
-        for (_, child) in &move_list {
+        for &(_, cell, ref child) in &move_list {
             let score = if first {
                 -self.search_exact(child, -beta, -alpha, empties - 1)
             } else {
@@ -451,10 +669,25 @@ impl Search {
             first = false;
             if score > alpha {
                 alpha = score;
+                best_cell = cell as u8;
                 if alpha >= beta {
                     break;
                 }
             }
+        }
+
+        if use_tt {
+            // Classify the fail-hard result against the searched window: at or
+            // below `search_alpha` it is only an upper bound; at or above
+            // `search_beta` only a lower bound; strictly inside, exact.
+            let (lower, upper) = if alpha <= search_alpha {
+                (SCORE_MIN as i8, alpha as i8)
+            } else if alpha >= search_beta {
+                (alpha as i8, SCORE_MAX as i8)
+            } else {
+                (alpha as i8, alpha as i8)
+            };
+            self.tt_store(pos, lower, upper, best_cell);
         }
 
         alpha
@@ -508,7 +741,8 @@ impl Search {
 /// in the same order.  Handles game-end and pass positions without
 /// invoking the full search.
 pub fn batch_evaluate(positions: &[Position]) -> Vec<i32> {
-    positions.iter().map(exact_score).collect()
+    let mut solver = Solver::new();
+    positions.iter().map(|p| solver.exact_score(p)).collect()
 }
 
 /// Depth-limited evaluation for use in gameplay. Searches `depth` plies
@@ -812,12 +1046,16 @@ mod tests {
 
     // --- solve_2 -----------------------------------------------------------
 
-    fn run_solve_2(player: u64, opponent: u64) -> i32 {
+    // The solve_* helpers take a reused `Search`: the solver never touches the
+    // transposition table, but constructing a fresh `Search` allocates it, so
+    // reuse keeps these tight test loops from re-allocating it thousands of
+    // times.
+    fn run_solve_2(s: &mut Search, player: u64, opponent: u64) -> i32 {
         let mut empty = !(player | opponent);
         let x1 = empty.trailing_zeros();
         empty &= empty - 1;
         let x2 = empty.trailing_zeros();
-        Search::new().solve_2(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2)
+        s.solve_2(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2)
     }
 
     /// Every ordered pair of distinct empty squares from [`SQUARES`], crossed
@@ -836,11 +1074,12 @@ mod tests {
 
     #[test]
     fn solve_2_matches_naive() {
+        let mut s = Search::new();
         for (player, opponent) in two_empty_layouts() {
             let pos = Position { player, opponent };
             assert_eq!(pos.empties(), 2);
             assert_eq!(
-                run_solve_2(player, opponent),
+                run_solve_2(&mut s, player, opponent),
                 naive_exact(&pos),
                 "player={player:#x} opponent={opponent:#x}"
             );
@@ -851,6 +1090,7 @@ mod tests {
     fn solve_2_respects_window() {
         // Full window equals the truth (checked above); narrow windows must
         // fail soft on the correct side of the bound.
+        let mut s = Search::new();
         for (player, opponent) in two_empty_layouts() {
             let truth = naive_exact(&Position { player, opponent });
             let mut e = !(player | opponent);
@@ -860,11 +1100,11 @@ mod tests {
 
             // Window entirely above the true score → fail low (result <= alpha).
             let lo = truth + 1;
-            let r = Search::new().solve_2(player, opponent, lo, lo + 1, x1, x2);
+            let r = s.solve_2(player, opponent, lo, lo + 1, x1, x2);
             assert!(r <= lo, "fail-low: r={r} alpha={lo} truth={truth}");
             // Window entirely below the true score → fail high (result >= beta).
             let hi = truth - 1;
-            let r = Search::new().solve_2(player, opponent, hi - 1, hi, x1, x2);
+            let r = s.solve_2(player, opponent, hi - 1, hi, x1, x2);
             assert!(r >= hi, "fail-high: r={r} beta={hi} truth={truth}");
         }
     }
@@ -872,19 +1112,21 @@ mod tests {
     #[test]
     fn solve_1_and_solve_2_drive_exact_score() {
         // End-to-end: exact_score (which dispatches to the leaf solvers at
-        // 1 and 2 empties) agrees with the independent naive solver.
+        // 1 and 2 empties) agrees with the independent naive solver. One reused
+        // solver so the table is allocated once across the whole battery.
+        let mut solver = Solver::new();
         for &sq in SQUARES {
             let empty = 1u64 << sq;
             for &pat in PATTERNS {
                 let player = pat & !empty;
                 let opponent = !player & !empty;
                 let pos = Position { player, opponent };
-                assert_eq!(exact_score(&pos), naive_exact(&pos));
+                assert_eq!(solver.exact_score(&pos), naive_exact(&pos));
             }
         }
         for (player, opponent) in two_empty_layouts() {
             let pos = Position { player, opponent };
-            assert_eq!(exact_score(&pos), naive_exact(&pos));
+            assert_eq!(solver.exact_score(&pos), naive_exact(&pos));
         }
     }
 
@@ -900,17 +1142,17 @@ mod tests {
         })
     }
 
-    fn run_solve_3(player: u64, opponent: u64) -> i32 {
+    fn run_solve_3(s: &mut Search, player: u64, opponent: u64) -> i32 {
         let mut e = !(player | opponent);
         let x1 = e.trailing_zeros();
         e &= e - 1;
         let x2 = e.trailing_zeros();
         e &= e - 1;
         let x3 = e.trailing_zeros();
-        Search::new().solve_3(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3)
+        s.solve_3(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3)
     }
 
-    fn run_solve_4(player: u64, opponent: u64) -> i32 {
+    fn run_solve_4(s: &mut Search, player: u64, opponent: u64) -> i32 {
         let mut e = !(player | opponent);
         let x1 = e.trailing_zeros();
         e &= e - 1;
@@ -919,7 +1161,7 @@ mod tests {
         let x3 = e.trailing_zeros();
         e &= e - 1;
         let x4 = e.trailing_zeros();
-        Search::new().solve_4(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3, x4)
+        s.solve_4(player, opponent, SCORE_MIN, SCORE_MAX, x1, x2, x3, x4)
     }
 
     /// Smaller square set (includes all four corners) to bound the 4-empty
@@ -928,6 +1170,7 @@ mod tests {
 
     #[test]
     fn solve_3_matches_naive() {
+        let mut s = Search::new();
         let n = SQUARES.len();
         for i in 0..n {
             for j in (i + 1)..n {
@@ -937,7 +1180,7 @@ mod tests {
                         let pos = Position { player, opponent };
                         assert_eq!(pos.empties(), 3);
                         assert_eq!(
-                            run_solve_3(player, opponent),
+                            run_solve_3(&mut s, player, opponent),
                             naive_exact(&pos),
                             "player={player:#x} opponent={opponent:#x}"
                         );
@@ -949,6 +1192,7 @@ mod tests {
 
     #[test]
     fn solve_4_matches_naive() {
+        let mut s = Search::new();
         let n = SQUARES4.len();
         for i in 0..n {
             for j in (i + 1)..n {
@@ -959,7 +1203,7 @@ mod tests {
                             let pos = Position { player, opponent };
                             assert_eq!(pos.empties(), 4);
                             assert_eq!(
-                                run_solve_4(player, opponent),
+                                run_solve_4(&mut s, player, opponent),
                                 naive_exact(&pos),
                                 "player={player:#x} opponent={opponent:#x}"
                             );
@@ -980,6 +1224,9 @@ mod tests {
             let hi = truth - 1;
             assert!(solve(player, opponent, hi - 1, hi) >= hi, "fail-high");
         };
+        // `RefCell` so the `&dyn Fn` closure can reuse one `Search` (and its
+        // table) rather than allocate per call.
+        let s = std::cell::RefCell::new(Search::new());
         let solve3 = |p: u64, o: u64, a: i32, b: i32| {
             let mut e = !(p | o);
             let x1 = e.trailing_zeros();
@@ -987,7 +1234,7 @@ mod tests {
             let x2 = e.trailing_zeros();
             e &= e - 1;
             let x3 = e.trailing_zeros();
-            Search::new().solve_3(p, o, a, b, x1, x2, x3)
+            s.borrow_mut().solve_3(p, o, a, b, x1, x2, x3)
         };
         let n = SQUARES4.len();
         for i in 0..n {
@@ -1004,7 +1251,9 @@ mod tests {
 
     #[test]
     fn solve_3_and_4_drive_exact_score() {
-        // End-to-end through exact_score's empties==3 / ==4 dispatch.
+        // End-to-end through exact_score's empties==3 / ==4 dispatch. One reused
+        // solver so the table is allocated once across the whole battery.
+        let mut solver = Solver::new();
         let n = SQUARES4.len();
         for i in 0..n {
             for j in (i + 1)..n {
@@ -1012,14 +1261,14 @@ mod tests {
                     for (player, opponent) in layouts_for(&[SQUARES4[i], SQUARES4[j], SQUARES4[k]])
                     {
                         let pos = Position { player, opponent };
-                        assert_eq!(exact_score(&pos), naive_exact(&pos));
+                        assert_eq!(solver.exact_score(&pos), naive_exact(&pos));
                     }
                     for l in (k + 1)..n {
                         for (player, opponent) in
                             layouts_for(&[SQUARES4[i], SQUARES4[j], SQUARES4[k], SQUARES4[l]])
                         {
                             let pos = Position { player, opponent };
-                            assert_eq!(exact_score(&pos), naive_exact(&pos));
+                            assert_eq!(solver.exact_score(&pos), naive_exact(&pos));
                         }
                     }
                 }
@@ -1095,6 +1344,9 @@ mod tests {
         let path = "test_data/exact_scores.txt";
         let content = fs::read_to_string(path).expect("Failed to read reference file");
 
+        // One reused solver: also checks that a shared (warming) transposition
+        // table stays correct across many independent positions.
+        let mut solver = Solver::new();
         for (line_no, line) in content.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -1107,7 +1359,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("Line {}: invalid score", line_no + 1));
 
             let pos = parse_fen(fen);
-            let actual = exact_score(&pos);
+            let actual = solver.exact_score(&pos);
 
             assert_eq!(
                 actual,

@@ -118,6 +118,32 @@ a major bottleneck, and the table-lookup cost is dwarfed by the savings.
 | 18 | 55 | 3,108,566 | 175.5ms | 17.71M | 1.36× |
 | 20 | 8 | 25,561,308 | 1314.1ms | 19.45M | 1.42× |
 
+## Current baseline (after Step 10 — transposition table)
+
+A position→`[lower, upper]`-bound table (plus best move for ordering), consulted
+in the ordered search at `empties >= TT_MIN_EMPTIES`. Because an exact endgame
+score is intrinsic to the position, a stored entry never expires — the table is
+never cleared, only refined, and is reused across every position a thread
+evaluates (warming it). A stored best move seeds PVS ordering; sufficient stored
+bounds cut the node off outright. Node counts roughly halve at depth; ~1.30×
+(14e) growing to ~1.86× (20e) vs Step 15.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 15 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 51,414 | 3.0ms | 16.89M | 1.30× |
+| 16 | 350 | 293,857 | 18.1ms | 16.28M | 1.45× |
+| 18 | 55 | 1,744,944 | 108.0ms | 16.16M | 1.63× |
+| 20 | 8 | 12,552,838 | 708.4ms | 17.72M | 1.86× |
+
+Tuning (`TT_BITS`, `TT_MIN_EMPTIES`) — see the swept tables in the constant docs
+in `alphabeta.rs`: `TT_BITS = 19` (12 MB) is the cache-locality knee, `2^21+`
+adds memory without cutting nodes at these depths; `TT_MIN_EMPTIES = 7` (≈ "on
+for the whole ordered search" — the floor is `SORT_MIN_EMPTIES = 6`). Note
+`SORT_MIN_EMPTIES` was *not* raised: the hash move only helps levels that probe
+the TT (`empties >= 7`), whereas `SORT_MIN_EMPTIES` governs whether to pay the
+mobility sort at empties 5 — the TT does not touch that crossover, so it stays
+at 6.
+
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
 | Step | nodes/pos | ms/pos | speedup vs baseline |
@@ -173,6 +199,24 @@ a major bottleneck, and the table-lookup cost is dwarfed by the savings.
   move-list `Vec` or mobility tuples; `search_exact` is now a 3-way dispatch
   (leaf / no-sort / sorted). Identical node counts; ~4–6% faster. The win grows
   if `SORT_MIN_EMPTIES` rises (more levels use this allocation-free path).
+- **Step 10**: transposition table. A `[lower, upper]`-bound table keyed on the
+  full position (stored in full — a partial key risks returning a wrong score,
+  the bug that sank the earlier attempt), with the best move kept for ordering.
+  Exact endgame scores are path-independent, so an entry never expires: the
+  table is never cleared, only refined (bounds intersected on re-store), and is
+  reused across all positions a thread solves. Owned by a reusable `Search`
+  exposed via the public `Solver` (one per `bench` run / cache worker / batch),
+  so the multi-MB table is allocated once, not per call. Wired only into the
+  ordered search (`alphabeta_exact`) at `empties >= TT_MIN_EMPTIES`: a probe
+  returns on a sufficient stored bound, narrows the window otherwise, and seeds
+  PVS with the stored best move; the fail-hard result is classified against the
+  searched window and written back. We deliberately avoid a `thread_local!` for
+  the per-thread reuse (less readable) — affordable only because threading an
+  owned `Search` through callers is free per node (`&mut self`, never moved);
+  reach for `thread_local!` only if an explicit owner ever costs real
+  performance. `TT_BITS = 19`, `TT_MIN_EMPTIES = 7` (both swept — see the
+  constant docs). ~1.30× (14e) to ~1.86× (20e). `SORT_MIN_EMPTIES` left at 6
+  (the hash move helps only TT-probing levels, not the empties-5 sort crossover).
 - **Step 15**: per-square flip table. `Position::flip_mask` dispatches through
   a 64-entry `FLIP` table of `flip_at::<SQ>` const-generic specializations; with
   `SQ` constant the compiler folds the move bit and prunes off-board directions.
@@ -224,12 +268,6 @@ Edax avoids this overhead with precomputed `sort3`/`parity_case` table lookups
 (O(1) reorder) plus *incremental* parity (one XOR per ply). Replicating that
 full machinery is the only way to make parity pay here, for a ~2% node ceiling —
 not worth it versus Step 10. Left unimplemented.
-
-### Step 10 — Transposition table (was "Step 5"/"Step 9")
-Previously attempted but had a correctness bug. Do this once the rest of the
-search is in its final shape. A hash move gives cheap good ordering, so this is
-the step most likely to let `SORT_MIN_EMPTIES` rise (skip the mobility sort at
-more levels) — re-tune it afterward.
 
 ### Step 11 — Alternative flip-computation variants
 Edax ships many implementations of the same flip primitive (`flip_*.c`,

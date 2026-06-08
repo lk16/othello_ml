@@ -285,11 +285,14 @@ fn evaluate_positions_parallel(
         let start = chunk_idx * chunk_size;
         let interrupt = Arc::clone(interrupt);
         std::thread::spawn(move || {
+            // One solver (and transposition table) per worker, reused across the
+            // whole chunk so the table is allocated once and warms up.
+            let mut solver = alphabeta::Solver::new();
             for (i, pos) in chunk.iter().enumerate() {
                 if interrupt.load(Ordering::Relaxed) {
                     return;
                 }
-                let score = alphabeta::exact_score(pos);
+                let score = solver.exact_score(pos);
                 if tx.send((start + i, score)).is_err() {
                     return;
                 }

@@ -14,6 +14,7 @@ Each item should be descriptive enough that specific examples are unnecessary.
 - **Prefer associated functions** on structs over free functions that take the struct as their first argument.
 - **Prefer `Option` or `Result`** over including an error or sentinel variant in an enum.
 - **Avoid wrapper structs** that only delegate to another type (e.g. `WeightIO`). Put the functions directly on the owning struct.
+- **Avoid `thread_local!`** — it reads worse than passing explicit state. Reach for it only when an explicit owner threaded through the call sites would cost real performance (e.g. it forces re-allocating a large reusable buffer per call). Prefer an owned struct borrowed as `&mut self` through the recursion (which is free per node), as the exact search does with its transposition table (see `Solver`/`Search` in `eval/alphabeta.rs`).
 
 ## Commands
 

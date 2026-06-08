@@ -1,6 +1,6 @@
 use othello_eval::{
-    best_move, build_examples, exact_score_with_nodes, load_games, Board, Features, Position,
-    Trainer, TrainingConfig, Weights,
+    best_move, build_examples, load_games, Board, Features, Position, Solver, Trainer,
+    TrainingConfig, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -460,10 +460,11 @@ fn run_bench(args: BenchArgs) {
     );
 
     let mut total_nodes: u64 = 0;
+    let mut solver = Solver::new();
     let start = Instant::now();
 
     for board in &positions {
-        let (_, nodes) = exact_score_with_nodes(&board.position);
+        let (_, nodes) = solver.exact_score_with_nodes(&board.position);
         total_nodes += nodes;
     }
 
