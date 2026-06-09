@@ -125,6 +125,21 @@ sort + per-child `get_moves().count_ones()`) and cheap incremental parity — bo
 **ordering** levers, so their payoff belongs with Step 6b / Step 9, measured in
 node count, not enumeration speed. Revisit only as part of an ordering rework.
 
+### Step 20 — TT-free `alphabeta_exact` variant for sub-`TT_MIN_EMPTIES` nodes
+`alphabeta_exact` runs at `empties >= SORT_MIN_EMPTIES` (6) but only touches the
+TT at `empties >= TT_MIN_EMPTIES` (7), so the empties-6 level already runs with
+`use_tt = false` at runtime — yet the TT probe/store, ETC, hash-move ordering, and
+`search_alpha/beta` classification are all still compiled into its body (guarded
+by a runtime branch). Specialize them away with a `const USE_TT: bool` on
+`alphabeta_exact` (and the `_nws` twin), dispatched by `search_exact`/
+`search_exact_nws` from the child's empties. The `USE_TT = false` body keeps only
+the node count, stability cutoff, move-gen, mobility sort, and PVS loop — leaner
+for the frequent empties-6 nodes. Unlike the Step 18 const-generic misfire, this
+is pure dead-code elimination gated on a `const` (no runtime value to fold), so
+the generic should match a hand-written separate function — prefer the generic if
+so. Node counts must be identical (empties-6 already skips the TT); the question
+is whether removing the dead code measurably helps. Expect a small gain at best.
+
 ### Step 11 — Alternative flip-computation variants
 Edax ships many implementations of the flip primitive (kindergarten/carry, BMI2
 PEXT/PDEP, SSE/AVX2, NEON/SVE), selected at compile time per target. We use one
