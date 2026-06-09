@@ -96,6 +96,28 @@ re-searches. Mobility (the dominant term) is already in place, so expect modest
 gains. Re-tune `SORT_MIN_EMPTIES` afterward — richer/costlier ordering shifts its
 crossover.
 
+### Step 19 — Incremental empties list (Edax `SquareList`)
+Edax never recomputes the set of empty squares: `search_setup` builds a doubly-
+linked list (`SquareList empties[66]`, `u8` previous/next per square + `NOMOVE`/
+`PASS` sentinels) once, then `empty_remove`/`empty_restore` unlink/relink the
+played square in O(1) on make/undo, and `foreach_empty` walks it. The list is
+built in a *presorted* square order (corners → edge classes → center), so walking
+it yields a static quality move order with no per-node sort, and parity is updated
+incrementally (`parity ^= QUADRANT_ID[x]`) alongside.
+
+For us this would replace the repeated `get_moves()` + `trailing_zeros()`/
+`x &= x-1` empty-enumeration in the leaf solvers (`solve_leaf` extracts `x1..x4`
+this way every visit) and the hot search loops, threading the list through the
+already-mutable `Search`. Wins: no popcount/tzcnt to enumerate empties per node;
+a cheap *static* ordering that could replace (or feed) the mobility sort; and it
+makes Edax-style parity ordering (Step 9, reverted for its sort cost) essentially
+free, reviving that ~2% node ceiling. Caveats: it changes move generation to
+"walk all empties, test legality via flip" rather than computing the legal-move
+bitboard up front (flips are still needed to build children); and it adds
+make/undo bookkeeping to a search that is currently stateless per node (passes
+`Position` by value). Needs benchmarking against our current bitboard enumeration
+— the win is real for Edax but our `flip_mask`/`get_moves` are already fast.
+
 ### Step 11 — Alternative flip-computation variants
 Edax ships many implementations of the flip primitive (kindergarten/carry, BMI2
 PEXT/PDEP, SSE/AVX2, NEON/SVE), selected at compile time per target. We use one
