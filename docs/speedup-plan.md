@@ -86,20 +86,6 @@ One line each; see the code and `git log` for detail.
   Edax only makes this pay via precomputed `sort3`/`parity_case` lookups plus
   *incremental* parity (one XOR per ply); replicating that for a ~2% node ceiling
   isn't worth it.
-- **Step 18 first attempt — `const PV: bool` generic (reverted).** Threading
-  `beta` through a generic gave no gain (slightly worse, from a second
-  monomorphization of a large function): the compiler can't fold a *runtime*
-  `beta` to `alpha + 1`. The win only appeared once `beta` was dropped from the
-  signature entirely (the committed Step 18).
-- **NWS-specialized leaf solvers (declined).** `solve_2`/`solve_3`/`solve_4` are
-  already lean fail-soft solvers; an NWS-only copy saves too few ops to justify
-  the duplication.
-- **Edax null-window structure (reference).** Edax searches almost every node
-  with a null window — the full window is the *exception*, used only along the
-  principal variation. ETC and stability are its null-window cutoffs; we found
-  both are actually valid for any window (one-sided bound tests), so they live in
-  the general-window search and fire on the null-window siblings as a special
-  case.
 
 ## Remaining steps
 
