@@ -295,3 +295,80 @@ afterward.
   binary, like Edax) over a runtime function-pointer dispatcher — indirection
   in this hot leaf op would cost more than it saves. `bench` can still exercise
   each compiled variant for comparison.
+
+## Null-window cutoffs (Steps 16–18)
+
+These three steps come from studying how Edax uses null windows. The key
+finding, which corrects a common misconception: **Edax does not reserve null
+windows for the last few empties — null windows are its default search mode at
+essentially every node.** The full `[alpha, beta]` window is the *exception*,
+used only along the principal variation (`PVS_midgame`). Every non-PV node, and
+the entire exact endgame (`NWS_endgame`), runs at a null window (β = α+1). The
+last-4-empties solvers (`board_score_1`/`board_solve_2`/`search_solve_3/4`) are
+null-window-only as a *consequence* of being called from that search, not
+because those depths are special.
+
+We already match the PV side of this: our `alphabeta_exact`/`alphabeta_nosort`
+do textbook PVS (first child full window, siblings probed at `(-alpha-1,
+-alpha)` with a re-search on fail-high). What we *don't* yet exploit is that a
+single bound unlocks cutoffs a general window cannot use. Edax layers three onto
+its NWS paths (`USE_TC`/`USE_ETC`/`USE_SC`). We have the two-bound transposition
+narrowing (Step 10) but neither ETC nor a stability cutoff, and no dedicated
+null-window code path.
+
+### Step 16 — Enhanced Transposition Cutoff (ETC) [recommended next]
+Before the move loop in `alphabeta_exact`, probe each *child* in the existing
+transposition table: if any child has a stored upper bound giving `-upper >
+alpha` (a guaranteed fail-high), return immediately without recursing into it.
+Builds directly on Step 10's table — no new machinery — and is a pure win on a
+null window, which our siblings already are. Edax's `search_ETC_NWS`
+(`src/search.c`) also folds in a per-child stability probe; we add only the TT
+half until Step 17 exists. Gate it on an `ETC_MIN_EMPTIES` constant (see tuning
+below). Lowest-risk, highest-leverage of the three given what we already have.
+
+**Implementation order within the step (tune last, never mid-flight):**
+1. Implement the cutoff and verify *identical* exact scores on the reference
+   set — sweep a threshold only against a search whose results don't move.
+2. *Then* sweep `ETC_MIN_EMPTIES`, with the standard bench at 14/16/18/20
+   empties, picking the ms/pos knee. Record the swept table in the constant's
+   doc comment in `alphabeta.rs`, matching the `TT_MIN_EMPTIES`/`SORT_MIN_EMPTIES`
+   style.
+
+**Tuning `ETC_MIN_EMPTIES` — do not copy Edax's `ETC_MIN_DEPTH = 5` blindly:**
+that value is on a different scale (disc-difference search depth, not our
+empties count), so it isn't a like-for-like number. The constant also has a hard
+structural floor: ETC reads *children's* TT entries, so it can only pay off
+where the children were actually stored — i.e. it is bounded below by
+`TT_MIN_EMPTIES + 1` (a child at `e-1` must be ≥ `TT_MIN_EMPTIES`). It runs only
+in the ordered path, so the effective floor is also `max(SORT_MIN_EMPTIES, …)`.
+With `TT_MIN_EMPTIES = 7` and `SORT_MIN_EMPTIES = 6` settled, sweep roughly
+`7..=12`. Expect a low-empties crossover (the per-node probe loop vs. the
+recursions it saves), so the cheap levels (14e) are most sensitive. **Re-tune
+triggers:** `ETC_MIN_EMPTIES` is coupled to `TT_MIN_EMPTIES` — if that is ever
+re-swept after ETC lands, re-sweep ETC too (ideally jointly); and Step 17's
+per-child stability probe overlaps ETC's payoff, so re-tune after it lands
+(same pattern as the existing "re-tune `SORT_MIN_EMPTIES` after Steps 6b/10/11"
+notes).
+
+### Step 17 — Stability cutoff (NWS)
+Port Edax's `search_SC_NWS`: when `alpha >= STABILITY_THRESHOLD[empties]`, count
+the opponent's stable discs; the best the player can reach is `SCORE_MAX - 2 *
+stable_opp`, so if that `<= alpha`, cut off. Sound only on a null window (a
+single upper bound). Highest node-count payoff of the three (Edax reports ~7%
+of nodes cut), but the most work: it needs corner-anchored stable-disc counting
+(`get_stability` — an edge-stability table plus corner propagation), and the
+threshold table (Edax's `NWS_STABILITY_THRESHOLD`, `src/search.c`) must be
+re-tuned to our score scale rather than copied. Pairs naturally with Step 18.
+
+### Step 18 — Dedicated null-window endgame path
+Add `nws_exact(pos, alpha, empties)` (β = α+1 implicit) mirroring Edax's
+`NWS_endgame`, and NWS-specialize `solve_2`/`solve_3`/`solve_4` to match Edax's
+single-bound solvers (Step 5b already flagged that ours are general-window
+fail-soft where Edax's are NWS-only). Leaner per node — single-bound cutoffs, no
+re-search bookkeeping on the null path — and the natural home for the Step 16/17
+cutoffs. Modest direct gain; its real value is as the structural enabler for the
+other two.
+
+**Suggested order:** Step 16 first (small, leverages the existing TT). Step 18
+next if pursuing 17, as the prerequisite that gives the cutoffs a clean home.
+Step 17 last — the biggest prize but the meatiest implementation.
