@@ -771,7 +771,8 @@ impl Search {
 
     /// Dispatch to the right routine for `empties`: the leaf solver for four or
     /// fewer empties, the unordered PVS search below `SORT_MIN_EMPTIES`, the
-    /// ordered PVS search above it.
+    /// ordered PVS search above it. Full-window (PV) path — see
+    /// [`Search::search_exact_nws`] for the null-window dispatch.
     #[inline]
     fn search_exact(&mut self, pos: &Position, alpha: i32, beta: i32, empties: u32) -> i32 {
         if empties <= 4 {
@@ -780,6 +781,22 @@ impl Search {
             self.alphabeta_nosort(pos, alpha, beta, empties)
         } else {
             self.alphabeta_exact(pos, alpha, beta, empties)
+        }
+    }
+
+    /// Null-window dispatch: the window is implicitly `[alpha, alpha + 1]`, so
+    /// `beta` is not passed. Used for every non-PV node — the bulk of the tree —
+    /// where it lets the compiler specialize away the PVS re-search machinery and
+    /// fold `beta` to `alpha + 1`. The leaf solvers are window-agnostic, so the
+    /// leaf case reuses them with an explicit `alpha + 1`.
+    #[inline]
+    fn search_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+        if empties <= 4 {
+            self.solve_leaf(pos, alpha, alpha + 1, empties)
+        } else if empties < SORT_MIN_EMPTIES {
+            self.alphabeta_nosort_nws(pos, alpha, empties)
+        } else {
+            self.alphabeta_exact_nws(pos, alpha, empties)
         }
     }
 
@@ -940,7 +957,7 @@ impl Search {
             let score = if first {
                 -self.search_exact(child, -beta, -alpha, empties - 1)
             } else {
-                let probe = -self.search_exact(child, -alpha - 1, -alpha, empties - 1);
+                let probe = -self.search_exact_nws(child, -alpha - 1, empties - 1);
                 if probe > alpha && probe < beta {
                     -self.search_exact(child, -beta, -alpha, empties - 1)
                 } else {
@@ -998,7 +1015,7 @@ impl Search {
             let score = if first {
                 -self.search_exact(&child, -beta, -alpha, empties - 1)
             } else {
-                let probe = -self.search_exact(&child, -alpha - 1, -alpha, empties - 1);
+                let probe = -self.search_exact_nws(&child, -alpha - 1, empties - 1);
                 if probe > alpha && probe < beta {
                     -self.search_exact(&child, -beta, -alpha, empties - 1)
                 } else {
@@ -1015,6 +1032,147 @@ impl Search {
         }
 
         alpha
+    }
+
+    /// Null-window counterpart of [`Search::alphabeta_exact`]: the window is
+    /// implicitly `[alpha, alpha + 1]`. Not passing `beta` lets the compiler fold
+    /// it to `alpha + 1`, which removes work the general-window version must keep:
+    /// the TT probe never narrows (any entry that would narrow a width-1 window
+    /// already hits one of the early returns), ETC's `value >= beta` becomes
+    /// `value > alpha`, and the PVS first-move/re-search structure collapses to a
+    /// single null-window probe per child that cuts on the first fail-high.
+    /// Behaviour (and node count) is identical to calling `alphabeta_exact` with
+    /// `beta = alpha + 1`.
+    fn alphabeta_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+        let beta = alpha + 1;
+
+        let use_tt = empties >= TT_MIN_EMPTIES;
+        let mut hash_move = NO_MOVE;
+        if use_tt {
+            if let Some(e) = self.tt_probe(pos) {
+                let (lo, hi) = (e.lower as i32, e.upper as i32);
+                if lo >= beta {
+                    return lo;
+                }
+                if hi <= alpha {
+                    return hi;
+                }
+                if lo == hi {
+                    return lo;
+                }
+                // No window narrowing: a width-1 window that survives the checks
+                // above is already as narrow as the stored bounds permit.
+                hash_move = e.best_move;
+            }
+        }
+
+        // Stability cutoff (see `alphabeta_exact`).
+        if alpha >= STABILITY_THRESHOLD[empties as usize] {
+            let stable = get_stability(self.edge_stability, pos.opponent, pos.player) as i32;
+            let bound = SCORE_MAX - 2 * stable;
+            if bound <= alpha {
+                return bound;
+            }
+        }
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.alphabeta_exact_nws(&passed, -beta, empties);
+        }
+
+        let mut move_list: Vec<(u32, u32, Position)> =
+            Vec::with_capacity(moves.count_ones() as usize);
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            move_list.push((child.get_moves().count_ones(), cell, child));
+        }
+
+        // Enhanced Transposition Cutoff (see `alphabeta_exact`); `value >= beta`
+        // is `value > alpha` on the null window.
+        if empties >= ETC_MIN_EMPTIES {
+            for &(_, cell, ref child) in &move_list {
+                if let Some(e) = self.tt_probe(child) {
+                    let value = -(e.upper as i32);
+                    if value >= beta {
+                        self.tt_store(pos, value as i8, SCORE_MAX as i8, cell as u8);
+                        return value;
+                    }
+                }
+            }
+        }
+
+        move_list.sort_unstable_by_key(|&(mobility, _, _)| mobility);
+        if hash_move != NO_MOVE {
+            if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
+                move_list[..=i].rotate_right(1);
+            }
+        }
+
+        // Null window: every child is probed with the same window; the first
+        // fail-high (`score > alpha`, i.e. `score >= beta`) cuts the node off.
+        let mut best = alpha;
+        let mut best_cell = NO_MOVE;
+        for &(_, cell, ref child) in &move_list {
+            let score = -self.search_exact_nws(child, -beta, empties - 1);
+            if score > best {
+                best = score;
+                best_cell = cell as u8;
+                break;
+            }
+        }
+
+        if use_tt {
+            // A null-window result is never exact (no integer lies strictly inside
+            // a width-1 window): it is a lower bound on a fail-high, else an upper.
+            let (lower, upper) = if best > alpha {
+                (best as i8, SCORE_MAX as i8)
+            } else {
+                (SCORE_MIN as i8, best as i8)
+            };
+            self.tt_store(pos, lower, upper, best_cell);
+        }
+
+        best
+    }
+
+    /// Null-window counterpart of [`Search::alphabeta_nosort`] for the
+    /// `5 ..< SORT_MIN_EMPTIES` range: natural move order, no `beta`, no
+    /// re-search — every child is a null-window probe and the first fail-high cuts.
+    fn alphabeta_nosort_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+        let beta = alpha + 1;
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.alphabeta_nosort_nws(&passed, -beta, empties);
+        }
+
+        let mut best = alpha;
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            let score = -self.search_exact_nws(&child, -beta, empties - 1);
+            if score > best {
+                best = score;
+                break;
+            }
+        }
+
+        best
     }
 }
 

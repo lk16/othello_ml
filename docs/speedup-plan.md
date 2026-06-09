@@ -300,6 +300,21 @@ Re-tune if move ordering or the stability estimate itself changes.
   store. ~1.07× (14e) to ~1.55× (20e) vs Step 16 — node counts nearly halve at
   20e, the biggest win since the flip table. Correctness rests on the unchanged
   Edax reference-score test plus stability unit tests.
+- **Step 18**: dedicated null-window search path. `search_exact_nws` /
+  `alphabeta_exact_nws` / `alphabeta_nosort_nws` take `alpha` only — the window is
+  implicitly `[alpha, alpha + 1]`. The PV functions call them for sibling probes;
+  the NWS functions call only each other. *Not passing `beta`* (vs the first,
+  reverted attempt — a `const PV: bool` generic that still threaded `beta`) is
+  what unlocks the win: the compiler folds `beta` to `alpha + 1`, so the TT-probe
+  narrowing branches become dead (any entry that would narrow a width-1 window
+  already early-returns), ETC's `value >= beta` reduces to `value > alpha`, and
+  the PVS first-move/re-search structure collapses to one probe per child that
+  cuts on the first fail-high. Node counts identical to Step 17 (a pure
+  structural split); ~1.0× at 14–18e, ~1.02× at 20e in a same-session A/B (Step 17
+  ~409ms vs NWS ~401ms, every NWS run faster) — the win grows with depth as more
+  of the tree is null-window. The leaf solvers stay window-agnostic (NWS-
+  specializing them, as the plan floated, is not worth the duplication for the few
+  ops it would save).
 
 ## Refactors (no perf change)
 
@@ -389,8 +404,9 @@ narrowing (Step 10). Steps 16 (ETC) and 17 (stability) add the other two —
 general-window search, not just on null windows**: each is a one-sided bound
 test (`-upper >= beta` for ETC, `64 - 2*stable <= alpha` for stability) that is a
 valid cutoff for any `[alpha, beta]`, firing on the null-window siblings as a
-special case. Step 18 (a dedicated null-window path) therefore remains optional —
-a leaner per-node path rather than a source of new cuts.
+special case. Step 18 (a dedicated null-window path) was therefore never about new
+cuts but a leaner per-node path; it landed as a small win (~1.02× at 20e) once
+`beta` was dropped from the signature so the compiler could fold it away.
 
 ### Step 16 — Enhanced Transposition Cutoff (ETC) [DONE — see Committed steps]
 Implemented and committed; `ETC_MIN_EMPTIES = 8` after sweeping 7..=12 (the
@@ -410,16 +426,14 @@ global offset moved nodes <0.1% (see the "after Step 17" baseline). Stability us
 the full Edax `get_stability` (exact edge table + full lines + central spread),
 not just the corner estimate the plan guessed at.
 
-### Step 18 — Dedicated null-window endgame path
-Add `nws_exact(pos, alpha, empties)` (β = α+1 implicit) mirroring Edax's
-`NWS_endgame`, and NWS-specialize `solve_2`/`solve_3`/`solve_4` to match Edax's
-single-bound solvers (Step 5b already flagged that ours are general-window
-fail-soft where Edax's are NWS-only). Leaner per node — single-bound cutoffs, no
-re-search bookkeeping on the null path — and the natural home for the Step 16/17
-cutoffs. Modest direct gain; its real value is as the structural enabler for the
-other two.
+### Step 18 — Dedicated null-window endgame path [DONE — see Committed steps]
+Implemented and committed as `*_nws` functions taking `alpha` only. Two findings
+worth recording: (1) a first attempt using a `const PV: bool` generic that still
+*passed* `beta` was reverted — it gave no gain (slightly worse, from a second
+monomorphization of a large function) because the compiler can't fold a runtime
+`beta` to `alpha + 1`; the win only appears when `beta` is dropped from the
+signature. (2) `solve_2`/`solve_3`/`solve_4` were *not* NWS-specialized (the plan
+floated it): they are already lean fail-soft solvers and the duplication isn't
+worth the few ops. Net ~1.02× at 20e, neutral shallower.
 
-**Status:** Steps 16 and 17 are done (committed). Step 18 remains — now the only
-open item in this group, and optional: its cutoffs (ETC, stability) already live
-in the general-window search, so it would buy a leaner per-node path rather than
-new pruning.
+**Status:** Steps 16, 17, and 18 are all done (committed). This group is closed.
