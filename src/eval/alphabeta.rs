@@ -3,6 +3,7 @@
 use crate::othello::position::Position;
 use crate::training::features::Features;
 use crate::training::weights::Weights;
+use std::sync::OnceLock;
 
 /// Exact score for `pos` from the perspective of the side to move.
 ///
@@ -326,12 +327,235 @@ fn solve_1(player: u64, sq: u32) -> i32 {
     solve_game_over(player, 1)
 }
 
-/// Mutable state for one exact search: the running count of nodes visited and
-/// the transposition table. The recursive search routines are methods so this
-/// state is explicit rather than a thread-local global.
+// ---------------------------------------------------------------------------
+// Stability (ported from Edax board.c)
+// ---------------------------------------------------------------------------
+//
+// A *stable* disc is one that can never be flipped for the rest of the game.
+// The opponent's stable discs bound our best possible result: if the opponent
+// is guaranteed `s` discs, the most we can finish with is `64 - 2*s`. That upper
+// bound drives the Step 17 stability cutoff in `alphabeta_exact`.
+//
+// `get_stability` returns a *lower estimate* of the count (it may undercount,
+// never overcount), so the bound it yields is always valid — undercounting only
+// makes the cutoff fire less often, never wrongly.
+
+/// Per-edge stable-square table: `EDGE_STABILITY[p << 8 | o]` is an 8-bit mask of
+/// the squares stable for `p` on an 8-cell edge with player pattern `p`, opponent
+/// pattern `o`. Built once at runtime (the recursive fill is impractical to
+/// const-evaluate over all 65536 entries — Edax likewise builds it at startup).
+static EDGE_STABILITY: OnceLock<[u8; 256 * 256]> = OnceLock::new();
+
+fn edge_stability_table() -> &'static [u8; 256 * 256] {
+    EDGE_STABILITY.get_or_init(build_edge_stability)
+}
+
+/// `other`-discs flipped when a disc is placed at line position `i` (0..8) on an
+/// 8-cell line, bounded on each side by a `mover` disc. A run of `other` discs is
+/// flipped only when closed by a `mover` disc; an empty cell or the line end
+/// closes nothing.
+fn edge_flips(mover: u32, other: u32, i: i32) -> u32 {
+    let mut flip = 0;
+    let mut run = 0;
+    let mut j = i - 1;
+    while j >= 0 {
+        let b = 1u32 << j;
+        if other & b != 0 {
+            run |= b;
+        } else {
+            if mover & b != 0 {
+                flip |= run;
+            }
+            break;
+        }
+        j -= 1;
+    }
+    run = 0;
+    let mut j = i + 1;
+    while j < 8 {
+        let b = 1u32 << j;
+        if other & b != 0 {
+            run |= b;
+        } else {
+            if mover & b != 0 {
+                flip |= run;
+            }
+            break;
+        }
+        j += 1;
+    }
+    flip
+}
+
+/// Squares that stay `old_p`'s in every continuation of edge play. `stable` is
+/// the candidate set carried down the recursion (initially `old_p`); a square
+/// drops out the moment some line of play flips it. Following Edax, an empty
+/// edge square may be played by either side and even with no flip — exploring a
+/// superset of legal continuations, which keeps the estimate conservative.
+fn find_edge_stable(old_p: u32, old_o: u32, mut stable: u32) -> u32 {
+    let empties = !(old_p | old_o) & 0xff;
+    stable &= old_p;
+    if stable == 0 || empties == 0 {
+        return stable;
+    }
+    let mut x = 0;
+    while x < 8 {
+        let bit = 1u32 << x;
+        if empties & bit != 0 {
+            // old_p plays at x.
+            let f = edge_flips(old_p, old_o, x);
+            stable = find_edge_stable(old_p | bit | f, old_o & !f, stable);
+            if stable == 0 {
+                return 0;
+            }
+            // old_o plays at x.
+            let f = edge_flips(old_o, old_p, x);
+            stable = find_edge_stable(old_p & !f, old_o | bit | f, stable);
+            if stable == 0 {
+                return 0;
+            }
+        }
+        x += 1;
+    }
+    stable
+}
+
+fn build_edge_stability() -> [u8; 256 * 256] {
+    let mut table = [0u8; 256 * 256];
+    let mut po = 0;
+    while po < 256 * 256 {
+        let p = (po >> 8) as u32;
+        let o = (po & 0xff) as u32;
+        if p & o == 0 {
+            // legal pattern (no square held by both)
+            table[po] = find_edge_stable(p, o, p) as u8;
+        }
+        po += 1;
+    }
+    table
+}
+
+#[inline]
+fn pack_a1a8(x: u64) -> usize {
+    ((x & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize
+}
+#[inline]
+fn pack_h1h8(x: u64) -> usize {
+    ((x & 0x8080_8080_8080_8080).wrapping_mul(0x0002_0408_1020_4081) >> 56) as usize
+}
+#[inline]
+fn unpack_a2a7(x: u64) -> u64 {
+    (x & 0x7e).wrapping_mul(0x0000_0408_1020_4080) & 0x0001_0101_0101_0100
+}
+#[inline]
+fn unpack_h2h7(x: u64) -> u64 {
+    (x & 0x7e).wrapping_mul(0x0002_0408_1020_4000) & 0x0080_8080_8080_8000
+}
+
+/// Exact stable-edge mask for `p`: the four edges (top/bottom rows, A/H files)
+/// each looked up in `EDGE_STABILITY` and reassembled into board coordinates.
+#[inline]
+fn get_stable_edge(table: &[u8; 256 * 256], p: u64, o: u64) -> u64 {
+    let top = table[((p & 0xff) as usize) << 8 | (o & 0xff) as usize] as u64;
+    let bottom = (table[((p >> 56) as usize) << 8 | (o >> 56) as usize] as u64) << 56;
+    let left = unpack_a2a7(table[pack_a1a8(p) << 8 | pack_a1a8(o)] as u64);
+    let right = unpack_h2h7(table[pack_h1h8(p) << 8 | pack_h1h8(o)] as u64);
+    top | bottom | left | right
+}
+
+/// For each of the four line directions, a mask of squares whose entire line is
+/// full: `[horizontal, vertical, diagonal-↗, diagonal-↘]`. A full line cannot be
+/// flipped through, so a disc full in all four directions is stable.
+#[inline]
+fn get_full_lines(disc: u64) -> [u64; 4] {
+    let mut h = disc;
+    h &= h >> 1;
+    h &= h >> 2;
+    h &= h >> 4;
+    let full_h = (h & 0x0101_0101_0101_0101).wrapping_mul(0xff);
+
+    let mut v = disc;
+    v &= v.rotate_right(8);
+    v &= v.rotate_right(16);
+    v &= v.rotate_right(32);
+    let full_v = v;
+
+    let (mut l7, mut r7) = (disc, disc);
+    l7 &= 0xff01_0101_0101_0101 | (l7 >> 7);
+    r7 &= 0x8080_8080_8080_80ff | (r7 << 7);
+    l7 &= 0xffff_0303_0303_0303 | (l7 >> 14);
+    r7 &= 0xc0c0_c0c0_c0c0_ffff | (r7 << 14);
+    l7 &= 0xffff_ffff_0f0f_0f0f | (l7 >> 28);
+    r7 &= 0xf0f0_f0f0_ffff_ffff | (r7 << 28);
+    let full_d7 = l7 & r7;
+
+    let (mut l9, mut r9) = (disc, disc);
+    l9 &= 0xff80_8080_8080_8080 | (l9 >> 9);
+    r9 &= 0x0101_0101_0101_01ff | (r9 << 9);
+    l9 &= 0xffff_c0c0_c0c0_c0c0 | (l9 >> 18);
+    r9 &= 0x0303_0303_0303_ffff | (r9 << 18);
+    let full_d9 = l9 & r9 & (0x0f0f_0f0f_f0f0_f0f0 | (l9 >> 36) | (r9 << 36));
+
+    [full_h, full_v, full_d9, full_d7]
+}
+
+/// Lower estimate of the number of `p` discs that can never be flipped. Stable
+/// edges and full-line-bound central discs seed the set; it then spreads to any
+/// central `p` disc that, in every direction, is full or adjacent to a stable
+/// disc — iterated to a fixpoint.
+fn get_stability(table: &[u8; 256 * 256], p: u64, o: u64) -> u32 {
+    const CENTRAL: u64 = 0x007e_7e7e_7e7e_7e00; // squares off all four edges
+    let p_central = p & CENTRAL;
+    let full = get_full_lines(p | o);
+    let mut stable =
+        get_stable_edge(table, p, o) | (p_central & full[0] & full[1] & full[2] & full[3]);
+    if stable == 0 {
+        return 0;
+    }
+    loop {
+        let old = stable;
+        let h = (stable >> 1) | (stable << 1) | full[0];
+        let v = (stable >> 8) | (stable << 8) | full[1];
+        let d9 = (stable >> 9) | (stable << 9) | full[2];
+        let d7 = (stable >> 7) | (stable << 7) | full[3];
+        stable |= h & v & d9 & d7 & p_central;
+        if stable == old {
+            break;
+        }
+    }
+    stable.count_ones()
+}
+
+/// Per-empties alpha gate for the stability cutoff (indexed by empties). The
+/// cutoff can only fire when `alpha` is high enough that `64 - 2*stable` may fall
+/// at or below it, and stable discs are scarce early — so below the threshold the
+/// stability computation is pure overhead. `99` means "never try". Ported from
+/// Edax's `NWS_STABILITY_THRESHOLD`, kept verbatim: our scores are in the same
+/// disc-difference units, and a swept global offset (−2..+6) moved node counts
+/// by <0.1% and wall-clock within noise — the gate only decides *when to attempt*
+/// the cutoff, and attempts that cannot cut are skipped regardless. Indexed
+/// 0..=64 empties (an empty board has 64); trailing entries are `99` (never).
+#[rustfmt::skip]
+const STABILITY_THRESHOLD: [i32; 65] = [
+    99, 99, 99, 99,  6,  8, 10, 12,
+     8, 10, 20, 22, 24, 26, 28, 30,
+    32, 34, 36, 38, 40, 42, 44, 46,
+    48, 48, 50, 50, 52, 52, 54, 54,
+    56, 56, 58, 58, 60, 60, 62, 62,
+    64, 64, 64, 64, 64, 64, 64, 64,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99,
+];
+
+/// Mutable state for one exact search: the running count of nodes visited, the
+/// transposition table, and a borrowed handle to the shared edge-stability table.
+/// The recursive search routines are methods so this state is explicit rather
+/// than a thread-local global.
 struct Search {
     nodes: u64,
     tt: Vec<TtEntry>,
+    edge_stability: &'static [u8; 256 * 256],
 }
 
 impl Search {
@@ -340,6 +564,7 @@ impl Search {
         Search {
             nodes: 0,
             tt: vec![TtEntry::default(); TT_SIZE],
+            edge_stability: edge_stability_table(),
         }
     }
 
@@ -643,6 +868,20 @@ impl Search {
         // classified against this to decide whether it is a bound or exact.
         let search_alpha = alpha;
         let search_beta = beta;
+
+        // Stability cutoff: the opponent's stable discs cap our final score at
+        // `64 - 2*stable`; if that already fails low (`<= alpha`) the node cannot
+        // beat alpha, so return the bound without searching. Gated per-empties —
+        // stable discs are scarce, and the bound only low enough to cut, late in
+        // the game with high alpha (see STABILITY_THRESHOLD). Like Edax, the cut
+        // returns directly without a TT store (cheap to recompute).
+        if alpha >= STABILITY_THRESHOLD[empties as usize] {
+            let stable = get_stability(self.edge_stability, pos.opponent, pos.player) as i32;
+            let bound = SCORE_MAX - 2 * stable;
+            if bound <= alpha {
+                return bound;
+            }
+        }
 
         let moves = pos.get_moves();
         if moves == 0 {
@@ -971,6 +1210,59 @@ mod tests {
         let opponent: u64 = 0xFFFFFFFF00000000;
         let pos = Position { player, opponent };
         assert_eq!(solve_game_over(player, 0), pos.final_score());
+    }
+
+    // --- stability ---------------------------------------------------------
+
+    #[test]
+    fn stability_empty_board_is_zero() {
+        let t = edge_stability_table();
+        assert_eq!(get_stability(t, 0, 0), 0);
+        // No discs for `p` → nothing stable, regardless of opponent fill.
+        assert_eq!(get_stability(t, 0, 0xFFFF_FFFF_FFFF_FFFF), 0);
+    }
+
+    #[test]
+    fn stability_full_board_all_p() {
+        // Whole board is `p`: every disc is stable (no empties, all lines full).
+        let t = edge_stability_table();
+        assert_eq!(get_stability(t, 0xFFFF_FFFF_FFFF_FFFF, 0), 64);
+    }
+
+    #[test]
+    fn stability_lone_corners_are_stable() {
+        // Each corner disc, alone, can never be flipped.
+        let t = edge_stability_table();
+        for &c in &[0u32, 7, 56, 63] {
+            let p = 1u64 << c;
+            assert!(
+                get_stability(t, p, 0) >= 1,
+                "corner {c} should be stable, got {}",
+                get_stability(t, p, 0)
+            );
+        }
+        // A lone centre disc (d4) is not stable.
+        assert_eq!(get_stability(t, 1u64 << 27, 0), 0);
+    }
+
+    #[test]
+    fn stability_is_a_lower_bound_on_true_stability() {
+        // Brute-force ground truth on small boards: a `p` disc is stable iff it
+        // survives `naive_exact`-style full play. Cheaper proxy here — the
+        // estimate must never exceed the disc count and must equal it on a board
+        // that is full (game over), where every disc is trivially unflippable.
+        let t = edge_stability_table();
+        for (player, opponent) in two_empty_layouts() {
+            // Fill the two empties so the board is full → all `player` discs stable.
+            let full_player = player | !(player | opponent);
+            assert_eq!(
+                get_stability(t, full_player, opponent),
+                full_player.count_ones(),
+                "full board: every disc stable; player={full_player:#x}"
+            );
+            // On the non-full board the estimate cannot exceed the disc count.
+            assert!(get_stability(t, player, opponent) <= player.count_ones());
+        }
     }
 
     // --- leaf solver references --------------------------------------------

@@ -144,7 +144,7 @@ the TT (`empties >= 7`), whereas `SORT_MIN_EMPTIES` governs whether to pay the
 mobility sort at empties 5 — the TT does not touch that crossover, so it stays
 at 6.
 
-## Current baseline (after Step 16 — Enhanced Transposition Cutoff)
+## Baseline after Step 16 (Enhanced Transposition Cutoff)
 
 Before searching any child in the ordered search, probe every child in the
 transposition table; if one already has a stored upper bound proving the move
@@ -166,6 +166,31 @@ Tuning (`ETC_MIN_EMPTIES`) — see the swept table in the constant doc in
 empties-7 probes hit unstored empties-6 children, so they never cut) but is
 slower — confirming the `TT_MIN_EMPTIES + 1` floor. 8 and 9 tie on wall-clock; 8
 prunes strictly more nodes, so it wins for deeper-than-bench robustness.
+
+## Current baseline (after Step 17 — stability cutoff)
+
+The opponent's *stable* discs (those that can never be flipped) cap our score at
+`64 - 2*stable`; when that upper bound already fails low (`<= alpha`) the node
+returns it without searching. Stability is Edax's exact-edge table (built once at
+runtime) plus full-line and an iterative central "spread" — a conservative lower
+estimate, so the bound is always valid. Gated per-empties by `STABILITY_THRESHOLD`
+(only worth computing when alpha is high enough to possibly cut). The biggest win
+since the flip table, and it grows sharply with depth: ~1.07× (14e) to ~1.55×
+(20e) vs Step 16, node counts nearly halving at 20e.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 16 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 43,478 | 2.7ms | 16.10M | 1.07× |
+| 16 | 350 | 234,963 | 15.0ms | 15.71M | 1.14× |
+| 18 | 55 | 1,266,005 | 82.1ms | 15.42M | 1.23× |
+| 20 | 8 | 6,407,984 | 408.3ms | 15.69M | 1.55× |
+
+Per-node throughput dips slightly (each gated node now computes stability), but
+the node savings dominate. Tuning: `STABILITY_THRESHOLD` is Edax's table kept
+verbatim — a swept global offset (−2..+6) changed node counts <0.1% and time
+within noise (the gate only decides *when to attempt* a cut; attempts that cannot
+cut are skipped regardless), and our scores share Edax's disc-difference units.
+Re-tune if move ordering or the stability estimate itself changes.
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -262,6 +287,19 @@ prunes strictly more nodes, so it wins for deeper-than-bench robustness.
   on time, 8 prunes more nodes. ~1.03× (14e) to ~1.12× (20e) vs Step 10; node
   savings grow with depth (~4%→~11%). The cut condition uses `>= beta` (not Edax's
   `> alpha`) so it is correct for our general-window nodes, not only null windows.
+- **Step 17**: stability cutoff. The opponent's stable-disc count `s` bounds our
+  score at `64 - 2s`; if that `<= alpha` the node fails low and returns the bound
+  without searching. Stability ported from Edax `board.c`: exact stable edges via
+  a 64K `EDGE_STABILITY` table (built once at runtime through a `OnceLock` — the
+  recursive fill is impractical to const-evaluate over 65536 entries, and Edax
+  likewise builds it at startup), plus full-line detection and an iterative
+  central "spread", giving a conservative lower estimate (never overcounts, so the
+  bound stays valid). Placed in `alphabeta_exact` after the TT narrowing, gated by
+  `STABILITY_THRESHOLD[empties]` (Edax's table, kept verbatim — see the "after
+  Step 17" baseline for the offset sweep). Like Edax the cut returns without a TT
+  store. ~1.07× (14e) to ~1.55× (20e) vs Step 16 — node counts nearly halve at
+  20e, the biggest win since the flip table. Correctness rests on the unchanged
+  Edax reference-score test plus stability unit tests.
 
 ## Refactors (no perf change)
 
@@ -344,11 +382,15 @@ because those depths are special.
 
 We already match the PV side of this: our `alphabeta_exact`/`alphabeta_nosort`
 do textbook PVS (first child full window, siblings probed at `(-alpha-1,
--alpha)` with a re-search on fail-high). What we *don't* yet exploit is that a
-single bound unlocks cutoffs a general window cannot use. Edax layers three onto
-its NWS paths (`USE_TC`/`USE_ETC`/`USE_SC`). We have the two-bound transposition
-narrowing (Step 10) but neither ETC nor a stability cutoff, and no dedicated
-null-window code path.
+-alpha)` with a re-search on fail-high). Edax layers three extra cutoffs onto its
+NWS paths (`USE_TC`/`USE_ETC`/`USE_SC`); we had only the two-bound transposition
+narrowing (Step 10). Steps 16 (ETC) and 17 (stability) add the other two —
+**and, contrary to the initial framing here, both turned out to be correct in our
+general-window search, not just on null windows**: each is a one-sided bound
+test (`-upper >= beta` for ETC, `64 - 2*stable <= alpha` for stability) that is a
+valid cutoff for any `[alpha, beta]`, firing on the null-window siblings as a
+special case. Step 18 (a dedicated null-window path) therefore remains optional —
+a leaner per-node path rather than a source of new cuts.
 
 ### Step 16 — Enhanced Transposition Cutoff (ETC) [DONE — see Committed steps]
 Implemented and committed; `ETC_MIN_EMPTIES = 8` after sweeping 7..=12 (the
@@ -358,15 +400,15 @@ Edax cuts on `-upper > alpha` (valid because its NWS callers have `beta =
 alpha + 1`); we cut on `-upper >= beta` so the cutoff is correct in our
 general-window nodes too, while still firing on the null-window siblings.
 
-### Step 17 — Stability cutoff (NWS)
-Port Edax's `search_SC_NWS`: when `alpha >= STABILITY_THRESHOLD[empties]`, count
-the opponent's stable discs; the best the player can reach is `SCORE_MAX - 2 *
-stable_opp`, so if that `<= alpha`, cut off. Sound only on a null window (a
-single upper bound). Highest node-count payoff of the three (Edax reports ~7%
-of nodes cut), but the most work: it needs corner-anchored stable-disc counting
-(`get_stability` — an edge-stability table plus corner propagation), and the
-threshold table (Edax's `NWS_STABILITY_THRESHOLD`, `src/search.c`) must be
-re-tuned to our score scale rather than copied. Pairs naturally with Step 18.
+### Step 17 — Stability cutoff [DONE — see Committed steps]
+Implemented and committed. Ended up the single biggest win of the three (~1.55×
+at 20e). Two notes versus the original plan: (1) the cutoff is correct for our
+general windows, not "sound only on a null window" — `64 - 2*stable <= alpha` is
+a valid fail-low for any window; (2) the threshold table did *not* need re-tuning
+to our scale — our scores are already in Edax's disc-difference units, and a swept
+global offset moved nodes <0.1% (see the "after Step 17" baseline). Stability uses
+the full Edax `get_stability` (exact edge table + full lines + central spread),
+not just the corner estimate the plan guessed at.
 
 ### Step 18 — Dedicated null-window endgame path
 Add `nws_exact(pos, alpha, empties)` (β = α+1 implicit) mirroring Edax's
@@ -377,6 +419,7 @@ re-search bookkeeping on the null path — and the natural home for the Step 16/
 cutoffs. Modest direct gain; its real value is as the structural enabler for the
 other two.
 
-**Suggested order:** Step 16 first (small, leverages the existing TT). Step 18
-next if pursuing 17, as the prerequisite that gives the cutoffs a clean home.
-Step 17 last — the biggest prize but the meatiest implementation.
+**Status:** Steps 16 and 17 are done (committed). Step 18 remains — now the only
+open item in this group, and optional: its cutoffs (ETC, stability) already live
+in the general-window search, so it would buy a leaner per-node path rather than
+new pruning.
