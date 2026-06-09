@@ -118,7 +118,7 @@ a major bottleneck, and the table-lookup cost is dwarfed by the savings.
 | 18 | 55 | 3,108,566 | 175.5ms | 17.71M | 1.36× |
 | 20 | 8 | 25,561,308 | 1314.1ms | 19.45M | 1.42× |
 
-## Current baseline (after Step 10 — transposition table)
+## Baseline after Step 10 (transposition table)
 
 A position→`[lower, upper]`-bound table (plus best move for ordering), consulted
 in the ordered search at `empties >= TT_MIN_EMPTIES`. Because an exact endgame
@@ -143,6 +143,29 @@ for the whole ordered search" — the floor is `SORT_MIN_EMPTIES = 6`). Note
 the TT (`empties >= 7`), whereas `SORT_MIN_EMPTIES` governs whether to pay the
 mobility sort at empties 5 — the TT does not touch that crossover, so it stays
 at 6.
+
+## Current baseline (after Step 16 — Enhanced Transposition Cutoff)
+
+Before searching any child in the ordered search, probe every child in the
+transposition table; if one already has a stored upper bound proving the move
+fails high (`-upper >= beta`), return that bound without searching. Builds
+directly on the Step 10 table — no new state. Gated at `ETC_MIN_EMPTIES = 8`
+(the structural floor `TT_MIN_EMPTIES + 1`, since a child at `empties - 1` must
+itself be stored to cut). Node savings grow with depth: ~4% (14e) to ~11% (20e),
+for ~1.03× (14e) to ~1.12× (20e) vs Step 10.
+
+| empties | boards | nodes/pos | ms/pos | nodes/s | vs Step 10 |
+|---------|--------|-----------|--------|---------|------------|
+| 14 | 673 | 49,276 | 2.9ms | 16.78M | 1.03× |
+| 16 | 350 | 275,165 | 17.1ms | 16.11M | 1.06× |
+| 18 | 55 | 1,620,128 | 100.7ms | 16.09M | 1.07× |
+| 20 | 8 | 11,210,978 | 631.0ms | 17.77M | 1.12× |
+
+Tuning (`ETC_MIN_EMPTIES`) — see the swept table in the constant doc in
+`alphabeta.rs`: swept 7..=12, knee at 8. 7 has *identical* node counts to 8 (its
+empties-7 probes hit unstored empties-6 children, so they never cut) but is
+slower — confirming the `TT_MIN_EMPTIES + 1` floor. 8 and 9 tie on wall-clock; 8
+prunes strictly more nodes, so it wins for deeper-than-bench robustness.
 
 ## History (early benchmark — 14 empties, only 20 boards, noisy)
 
@@ -228,6 +251,17 @@ at 6.
   indexed as `FLIP[(mv & 63) as usize]` so no bounds check is emitted (the `&63`
   compiles to a single `and`, dropping the lib's `panic_bounds_check` count from
   36 to 22); perf-neutral since that branch was predicted-not-taken anyway.
+- **Step 16**: Enhanced Transposition Cutoff (ETC). In `alphabeta_exact`, before
+  searching any child, probe every child in the Step 10 transposition table; if
+  one has a stored upper bound proving the move fails high (`-upper >= beta`),
+  return that bound without recursing. Reuses the existing table — no new state.
+  Gated at `ETC_MIN_EMPTIES = 8`, the structural floor `TT_MIN_EMPTIES + 1` (a
+  child at `empties - 1` must be ≥ `TT_MIN_EMPTIES` to have been stored). Swept
+  7..=12: 7 matches 8's node counts exactly (empties-7 probes hit unstored
+  empties-6 children, never cut) but is slower, confirming the floor; 8 and 9 tie
+  on time, 8 prunes more nodes. ~1.03× (14e) to ~1.12× (20e) vs Step 10; node
+  savings grow with depth (~4%→~11%). The cut condition uses `>= beta` (not Edax's
+  `> alpha`) so it is correct for our general-window nodes, not only null windows.
 
 ## Refactors (no perf change)
 
@@ -316,39 +350,13 @@ its NWS paths (`USE_TC`/`USE_ETC`/`USE_SC`). We have the two-bound transposition
 narrowing (Step 10) but neither ETC nor a stability cutoff, and no dedicated
 null-window code path.
 
-### Step 16 — Enhanced Transposition Cutoff (ETC) [recommended next]
-Before the move loop in `alphabeta_exact`, probe each *child* in the existing
-transposition table: if any child has a stored upper bound giving `-upper >
-alpha` (a guaranteed fail-high), return immediately without recursing into it.
-Builds directly on Step 10's table — no new machinery — and is a pure win on a
-null window, which our siblings already are. Edax's `search_ETC_NWS`
-(`src/search.c`) also folds in a per-child stability probe; we add only the TT
-half until Step 17 exists. Gate it on an `ETC_MIN_EMPTIES` constant (see tuning
-below). Lowest-risk, highest-leverage of the three given what we already have.
-
-**Implementation order within the step (tune last, never mid-flight):**
-1. Implement the cutoff and verify *identical* exact scores on the reference
-   set — sweep a threshold only against a search whose results don't move.
-2. *Then* sweep `ETC_MIN_EMPTIES`, with the standard bench at 14/16/18/20
-   empties, picking the ms/pos knee. Record the swept table in the constant's
-   doc comment in `alphabeta.rs`, matching the `TT_MIN_EMPTIES`/`SORT_MIN_EMPTIES`
-   style.
-
-**Tuning `ETC_MIN_EMPTIES` — do not copy Edax's `ETC_MIN_DEPTH = 5` blindly:**
-that value is on a different scale (disc-difference search depth, not our
-empties count), so it isn't a like-for-like number. The constant also has a hard
-structural floor: ETC reads *children's* TT entries, so it can only pay off
-where the children were actually stored — i.e. it is bounded below by
-`TT_MIN_EMPTIES + 1` (a child at `e-1` must be ≥ `TT_MIN_EMPTIES`). It runs only
-in the ordered path, so the effective floor is also `max(SORT_MIN_EMPTIES, …)`.
-With `TT_MIN_EMPTIES = 7` and `SORT_MIN_EMPTIES = 6` settled, sweep roughly
-`7..=12`. Expect a low-empties crossover (the per-node probe loop vs. the
-recursions it saves), so the cheap levels (14e) are most sensitive. **Re-tune
-triggers:** `ETC_MIN_EMPTIES` is coupled to `TT_MIN_EMPTIES` — if that is ever
-re-swept after ETC lands, re-sweep ETC too (ideally jointly); and Step 17's
-per-child stability probe overlaps ETC's payoff, so re-tune after it lands
-(same pattern as the existing "re-tune `SORT_MIN_EMPTIES` after Steps 6b/10/11"
-notes).
+### Step 16 — Enhanced Transposition Cutoff (ETC) [DONE — see Committed steps]
+Implemented and committed; `ETC_MIN_EMPTIES = 8` after sweeping 7..=12 (the
+`TT_MIN_EMPTIES + 1` structural floor — see the "after Step 16" baseline table
+and the constant doc in `alphabeta.rs`). One deviation from Edax worth recording:
+Edax cuts on `-upper > alpha` (valid because its NWS callers have `beta =
+alpha + 1`); we cut on `-upper >= beta` so the cutoff is correct in our
+general-window nodes too, while still firing on the null-window siblings.
 
 ### Step 17 — Stability cutoff (NWS)
 Port Edax's `search_SC_NWS`: when `alpha >= STABILITY_THRESHOLD[empties]`, count

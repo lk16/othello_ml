@@ -67,6 +67,29 @@ const TT_MASK: u64 = TT_SIZE as u64 - 1;
 /// 16/18-empty levels. Re-sweep when the search shape changes.
 const TT_MIN_EMPTIES: u32 = 7;
 
+/// Minimum empties at which the ordered search runs Enhanced Transposition
+/// Cutoff (ETC): before searching any child, probe every child in the table and
+/// cut immediately if one already proves a fail-high (see [`Search::alphabeta_exact`]).
+/// ETC reads *children's* entries, so a child at `empties - 1` must itself be
+/// stored — the structural floor is `TT_MIN_EMPTIES + 1` (= 8). Below this the
+/// per-child probe loop costs more than the recursions it saves.
+///
+/// Swept 7..=12 (`bench`, ms/pos · nodes/pos at 16e / 18e):
+///   off → 18.5·293857 / 107.4·1744944
+///   7   → 17.3·275165 / 104.5·1620128
+///   8   → 17.1·275165 / 100.7·1620128
+///   9   → 17.0·278235 / 100.2·1637899
+///   10  → 17.5·282486 / 102.4·1661477
+///   12  → 17.6·288473 / 105.4·1695917
+/// 8 is the structural floor `TT_MIN_EMPTIES + 1`. 7 confirms it: its node counts
+/// are *identical* to 8 (the empties-7 probes hit children at empties 6, which are
+/// never stored, so they never cut) yet it is slower — pure probe overhead. 8 and
+/// 9 tie on wall-clock (within noise); 8 prunes strictly more nodes (its empties-8
+/// probes do cut), so it is preferred for robustness on solves deeper than the
+/// bench. Coupled to [`TT_MIN_EMPTIES`] — re-sweep jointly if it moves — and to a
+/// future stability cutoff (its per-child stability probe overlaps this).
+const ETC_MIN_EMPTIES: u32 = 8;
+
 /// Sentinel "no move" square (a real square is 0..64).
 const NO_MOVE: u8 = 64;
 
@@ -640,6 +663,25 @@ impl Search {
             let child = pos.do_move(cell);
             move_list.push((child.get_moves().count_ones(), cell, child));
         }
+
+        // Enhanced Transposition Cutoff: if any child already has a stored upper
+        // bound, our value for that move is at least `-upper`; if that meets beta
+        // the node fails high, so return it without searching any child. Valid for
+        // any window (the move-value lower bound `-upper` itself reaches beta);
+        // gated at `ETC_MIN_EMPTIES` so the children are deep enough to be in the
+        // table and the per-child probe pays for itself.
+        if empties >= ETC_MIN_EMPTIES {
+            for &(_, cell, ref child) in &move_list {
+                if let Some(e) = self.tt_probe(child) {
+                    let value = -(e.upper as i32);
+                    if value >= beta {
+                        self.tt_store(pos, value as i8, SCORE_MAX as i8, cell as u8);
+                        return value;
+                    }
+                }
+            }
+        }
+
         move_list.sort_unstable_by_key(|&(mobility, _, _)| mobility);
 
         // A transposition-table best move is the strongest ordering signal:
