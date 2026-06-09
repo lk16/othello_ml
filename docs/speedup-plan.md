@@ -9,8 +9,11 @@ comments in `alphabeta.rs`, not here.
 ## Benchmark
 
 Pulls positions with exactly `--empties` discs free from a fixed set of PGN
-files and solves each. `bench` prints to stderr; `ms/pos` is the honest measure
-(node counts shift across steps as leaf solvers stop counting internal nodes).
+files and solves each. `bench` prints to stderr. Node counting is now consistent
+— one node per visited position across all solvers — so `nodes/s` is meaningful
+(~27M); `ms/pos` remains the bottom-line measure. Historical baseline tables in
+git predate the counting fix and undercounted leaf nodes, so their node figures
+aren't comparable to these.
 
 ```
 G="training_data/playok_pgn_7500?000.pgn"   # 10 files
@@ -30,11 +33,11 @@ only prints at the end, so an over-long run is killed with no output.
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
-| 14 | 2000 | 44,534 | 2.7ms | 16.5M |
-| 16 | 1000 | 241,518 | 15.1ms | 16.0M |
-| 18 | 250 | 1,279,523 | 82.9ms | 15.4M |
-| 20 | 50 | 7,443,301 | 486.1ms | 15.3M |
-| 22 | 8 | 42,831,323 | 2895.6ms | 14.8M |
+| 14 | 2000 | 81,727 | 2.8ms | 29.2M |
+| 16 | 1000 | 440,253 | 15.2ms | 29.0M |
+| 18 | 250 | 2,315,881 | 83.8ms | 27.6M |
+| 20 | 50 | 13,458,017 | 487.0ms | 27.6M |
+| 22 | 8 | 76,628,791 | 2943.4ms | 26.0M |
 
 The big wins, in order of impact: the per-square flip table (Step 15, ~1.37×),
 the transposition table (Step 10), and the stability cutoff (Step 17, ~1.55× at

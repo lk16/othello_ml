@@ -612,7 +612,8 @@ impl Search {
 
     /// 2-empty leaf solver: a negamax alpha-beta search over a full board with
     /// empties at `x1` and `x2`. Returns the score from `player`'s perspective.
-    /// Counts one node per 1-empty child visited.
+    /// Counts one node for itself plus one per `solve_1` child it visits (every
+    /// visited position counts exactly once across the solvers).
     fn solve_2(
         &mut self,
         player: u64,
@@ -622,6 +623,7 @@ impl Search {
         x1: u32,
         x2: u32,
     ) -> i32 {
+        self.nodes += 1;
         const NONE: i32 = SCORE_MIN - 1; // below any real score
         let mut best = NONE;
 
@@ -630,8 +632,8 @@ impl Search {
         if f1 != 0 {
             let moved = player | f1 | (1u64 << x1);
             let child_player = opponent & !moved; // opponent to move, only x2 empty
+            self.nodes += 1; // solve_1 leaf (x2)
             best = -solve_1(child_player, x2);
-            self.nodes += 1;
             if best > alpha {
                 alpha = best;
             }
@@ -643,8 +645,8 @@ impl Search {
             if f2 != 0 {
                 let moved = player | f2 | (1u64 << x2);
                 let child_player = opponent & !moved; // opponent to move, only x1 empty
+                self.nodes += 1; // solve_1 leaf (x1)
                 let s = -solve_1(child_player, x1);
-                self.nodes += 1;
                 if s > best {
                     best = s;
                 }
@@ -667,7 +669,8 @@ impl Search {
 
     /// 3-empty leaf solver: a fail-soft negamax alpha-beta over the three empties
     /// at `x1`, `x2`, `x3`, recursing into [`solve_2`]. Returns the score from
-    /// `player`'s perspective. Leaf node accounting happens in `solve_2`.
+    /// `player`'s perspective. Counts one node for itself; children are counted by
+    /// the solvers they recurse into.
     fn solve_3(
         &mut self,
         player: u64,
@@ -678,6 +681,7 @@ impl Search {
         x2: u32,
         x3: u32,
     ) -> i32 {
+        self.nodes += 1;
         const NONE: i32 = SCORE_MIN - 1;
         let mut best = NONE;
 
@@ -727,6 +731,7 @@ impl Search {
         x3: u32,
         x4: u32,
     ) -> i32 {
+        self.nodes += 1;
         const NONE: i32 = SCORE_MIN - 1;
         let mut best = NONE;
 
@@ -803,10 +808,16 @@ impl Search {
     /// Leaf dispatcher for positions with at most four empties, routing to the
     /// dedicated `solve_1`..`solve_4` solvers (or `final_score` at game end).
     fn solve_leaf(&mut self, pos: &Position, alpha: i32, beta: i32, empties: u32) -> i32 {
-        self.nodes += 1;
+        // Each solver counts its own entry (one node per visited position). The
+        // 0- and 1-empty arms count here: the terminal score and the pure
+        // `solve_1` leaf have no self-counting body of their own.
         match empties {
-            0 => pos.final_score(),
+            0 => {
+                self.nodes += 1;
+                pos.final_score()
+            }
             1 => {
+                self.nodes += 1;
                 let sq = (!pos.occupied()).trailing_zeros();
                 solve_1(pos.player, sq)
             }
