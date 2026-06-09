@@ -105,18 +105,25 @@ built in a *presorted* square order (corners → edge classes → center), so wa
 it yields a static quality move order with no per-node sort, and parity is updated
 incrementally (`parity ^= QUADRANT_ID[x]`) alongside.
 
-For us this would replace the repeated `get_moves()` + `trailing_zeros()`/
-`x &= x-1` empty-enumeration in the leaf solvers (`solve_leaf` extracts `x1..x4`
-this way every visit) and the hot search loops, threading the list through the
-already-mutable `Search`. Wins: no popcount/tzcnt to enumerate empties per node;
-a cheap *static* ordering that could replace (or feed) the mobility sort; and it
-makes Edax-style parity ordering (Step 9, reverted for its sort cost) essentially
-free, reviving that ~2% node ceiling. Caveats: it changes move generation to
-"walk all empties, test legality via flip" rather than computing the legal-move
-bitboard up front (flips are still needed to build children); and it adds
-make/undo bookkeeping to a search that is currently stateless per node (passes
-`Position` by value). Needs benchmarking against our current bitboard enumeration
-— the win is real for Edax but our `flip_mask`/`get_moves` are already fast.
+**Investigated — currently judged low-value; not pursued.** The "eliminate
+`trailing_zeros`" motivation doesn't hold up here:
+- `trailing_zeros` is a single instruction (~3 cycles); a list walk replaces it
+  with serialized pointer-chases. For `solve_leaf`'s ≤4-empty extraction (the most
+  frequent case) `tzcnt` + `x &= x-1` is likely *faster* than following 4 links.
+- It doesn't remove `get_moves`/`do_move` (the expensive calls). Avoiding
+  `get_moves` requires *also* switching move-gen to "walk every empty, flip-test
+  it" — trading one branchless 8-direction pass for N per-square flips (worse at
+  high empties; our `get_moves` is already branchless).
+- We already capture the leaf-solver benefit: `solve_2/3/4` take explicit
+  `x1..x4` and flip-test each, exactly like Edax's list-driven leaf solvers.
+- Our search is immutable per node (`Position` by value, fresh children); a
+  `SquareList` adds make/undo bookkeeping through every child, pass, and PVS
+  re-search.
+
+What it *would* unlock is a static presorted move order (replacing the mobility
+sort + per-child `get_moves().count_ones()`) and cheap incremental parity — both
+**ordering** levers, so their payoff belongs with Step 6b / Step 9, measured in
+node count, not enumeration speed. Revisit only as part of an ordering rework.
 
 ### Step 11 — Alternative flip-computation variants
 Edax ships many implementations of the flip primitive (kindergarten/carry, BMI2
