@@ -120,6 +120,23 @@ One line each; see the code and `git log` for detail.
 
 ## Remaining steps
 
+### Step 21 — Parallel search (YBWC)
+Young Brothers Wait Concept: the standard way to parallelize alpha-beta, and how
+Edax uses multiple cores. At a node, search the eldest child sequentially first
+— that establishes alpha (and at a cut node usually causes the cutoff, so no
+siblings are searched at all). Only once it returns are the younger siblings
+searched in parallel across threads, with the narrowed window making each
+cheaper; a sibling that fails high aborts the rest. Edax carries the machinery:
+a thread pool, per-thread `Search` state, split points (`search->child[]`, task
+stacks, spinlocks), and abort signalling.
+
+Cost on our side: a thread pool, per-thread search state, and a **thread-safe
+transposition table** (today's `&mut Vec<TtEntry>` would become a shared
+concurrent table, or per-thread tables merged periodically — exact scores stay
+path-independent, so lossy sharing is still correct). It is the main lever left
+for wall-clock on multi-core, but the only one that adds real concurrency
+complexity; everything else so far is single-threaded. Not started.
+
 ### Step 6b — Move ordering: Edax tricks
 PVS pays off in proportion to ordering quality. Add Edax's other ordering signals
 (square-weighted mobility, corner stability) and selectivity tricks to reduce
@@ -127,31 +144,42 @@ re-searches. Mobility (the dominant term) is already in place, so expect modest
 gains. Re-tune `SORT_MIN_EMPTIES` afterward — richer/costlier ordering shifts its
 crossover.
 
-### Step 19 — Incremental empties list (Edax `SquareList`)
-Edax never recomputes the set of empty squares: `search_setup` builds a doubly-
-linked list (`SquareList empties[66]`, `u8` previous/next per square + `NOMOVE`/
-`PASS` sentinels) once, then `empty_remove`/`empty_restore` unlink/relink the
-played square in O(1) on make/undo, and `foreach_empty` walks it. The list is
-built in a *presorted* square order (corners → edge classes → center), so walking
-it yields a static quality move order with no per-node sort, and parity is updated
-incrementally (`parity ^= QUADRANT_ID[x]`) alongside.
+### Step 19 — Incremental board state (Edax `SquareList` + parity)
+Edax recomputes none of its endgame bookkeeping. `search_setup` builds three
+things once and maintains them by make/undo:
+- **empties `SquareList`** — a doubly-linked list (`u8` previous/next per square +
+  `NOMOVE`/`PASS` sentinels). `empty_remove`/`empty_restore` unlink/relink the
+  played square in O(1); `foreach_empty` walks it. It is built in a *presorted*
+  square order (`presorted_x`: corners → E/D/A/B/G/F edge classes → X-squares →
+  center), so the walk yields a static quality move order with **no per-node
+  mobility sort**.
+- **`n_empties`** — decremented per move. We already have this (passed as a
+  recursion parameter since Step 4).
+- **region `parity`** — a 4-bit value, one bit per board quadrant
+  (`QUADRANT_ID`), set iff that quadrant holds an odd number of empties. Updated
+  `parity ^= QUADRANT_ID[x]` per move; `quadrant_mask[parity]` is the union of
+  odd-parity quadrants. Endgame move ordering plays odd-parity regions first
+  (you tend to get the last move there).
 
-**Investigated — currently judged low-value; not pursued.** The "eliminate
-`trailing_zeros`" motivation doesn't hold up here:
-- `trailing_zeros` is a single instruction (~3 cycles); a list walk replaces it
-  with serialized pointer-chases. For `solve_leaf`'s ≤4-empty extraction (the most
-  frequent case) `tzcnt` + `x &= x-1` is likely *faster* than following 4 links.
-- It doesn't remove `get_moves`/`do_move` (the expensive calls). Avoiding
-  `get_moves` requires *also* switching move-gen to "walk every empty, flip-test
-  it" — trading one branchless 8-direction pass for N per-square flips (worse at
-  high empties; our `get_moves` is already branchless).
-- We already capture the leaf-solver benefit: `solve_2/3/4` take explicit
-  `x1..x4` and flip-test each, exactly like Edax's list-driven leaf solvers.
-- Our search is immutable per node (`Position` by value, fresh children); a
-  `SquareList` adds make/undo bookkeeping through every child, pass, and PVS
-  re-search.
+The earlier "eliminate `trailing_zeros`" framing for the list alone still doesn't
+hold — `tzcnt`/`x &= x-1` is a single instruction, the leaf solvers already take
+explicit `x1..x4`, and the list doesn't remove `get_moves`/`do_move`. The real
+prize is **parity-based ordering**: the reverted Step 9 lost (~2% fewer nodes,
+~2% slower) *only* because it recomputed parity with a runtime `quadrant_bit`
+sort. Maintained incrementally (one XOR per ply) it is ~free, so the node win
+should turn into a wall-clock win. The static presorted order is a second
+ordering lever (replaces the mobility sort + per-child `get_moves().count_ones()`).
 
-What it *would* unlock is a static presorted move order (replacing the mobility
-sort + per-child `get_moves().count_ones()`) and cheap incremental parity — both
-**ordering** levers, so their payoff belongs with Step 6b / Step 9, measured in
-node count, not enumeration speed. Revisit only as part of an ordering rework.
+**Architecture.** Edax keeps this state on a *mutable* board (make/undo); our
+search is immutable (`Position` by value, fresh children). Two routes:
+1. Thread the state as immutable recursion parameters — `parity` is just
+   `child_parity = parity ^ QUADRANT_ID[cell]`, no list and no make/undo needed
+   (same shape as the existing `empties`/`alpha` params). Cheapest to try.
+2. Make/undo state in the `Search` struct (the empties `SquareList` lives here),
+   matching Edax. Needed if we also want the list-driven static order / O(1)
+   enumeration.
+
+Plan: put the state in `Search` (route 2) as the user asked, but measure against
+the carry64 baseline — if make/undo harms the hot path, fall back to route 1 for
+parity (the valuable part) and drop the list. Keep only what beats baseline
+(cf. the reverted Steps 9/20).
