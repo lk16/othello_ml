@@ -1,4 +1,5 @@
 pub mod board;
+pub(crate) mod flip;
 pub mod game;
 pub mod position;
 

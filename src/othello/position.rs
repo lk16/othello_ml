@@ -11,69 +11,6 @@ pub struct Position {
     pub opponent: u64, // Opponent's discs
 }
 
-/// Discs flipped by `player` playing at the compile-time square `SQ`, with
-/// `opponent` the other discs. The same 8-direction scan as the general flip,
-/// but with `SQ` constant the compiler folds the move bit and prunes the
-/// directions that run off the board for that square — so each instantiation
-/// does only the work that square needs. Reached via the [`FLIP`] table.
-fn flip_at<const SQ: usize>(player: u64, opponent: u64) -> u64 {
-    // Horizontal and diagonal shifts need the col B-G mask to prevent wrap.
-    const MIDDLE_COLUMNS: u64 = 0x7E7E7E7E7E7E7E7E;
-    let move_bit = 1u64 << SQ;
-    let opp_h = opponent & MIDDLE_COLUMNS;
-    let opp_v = opponent;
-    let opp_d = opponent & MIDDLE_COLUMNS;
-    let mut flipped: u64 = 0;
-
-    // Each block walks one direction: gather the run of opponent discs, then
-    // keep it only if a player disc closes the run.
-    macro_rules! ray {
-        ($opp:expr, $shift:tt, $n:literal) => {{
-            let mut f = $opp & (move_bit $shift $n);
-            f |= $opp & (f $shift $n);
-            f |= $opp & (f $shift $n);
-            f |= $opp & (f $shift $n);
-            f |= $opp & (f $shift $n);
-            f |= $opp & (f $shift $n);
-            if player & (f $shift $n) != 0 {
-                flipped |= f;
-            }
-        }};
-    }
-
-    ray!(opp_h, <<, 1); // horizontal
-    ray!(opp_h, >>, 1);
-    ray!(opp_v, <<, 8); // vertical
-    ray!(opp_v, >>, 8);
-    ray!(opp_d, <<, 7); // diagonal /
-    ray!(opp_d, >>, 7);
-    ray!(opp_d, <<, 9); // diagonal \
-    ray!(opp_d, >>, 9);
-
-    flipped
-}
-
-/// Build a 64-entry array of `flip_at::<SQ>` function pointers.
-macro_rules! flip_table {
-    ($($sq:literal),+ $(,)?) => {
-        [$(flip_at::<$sq> as fn(u64, u64) -> u64),+]
-    };
-}
-
-/// One specialized flip function per square (Edax's `flip[]`). Indexed by the
-/// move square in [`Position::flip_mask`].
-#[rustfmt::skip]
-const FLIP: [fn(u64, u64) -> u64; 64] = flip_table!(
-     0,  1,  2,  3,  4,  5,  6,  7,
-     8,  9, 10, 11, 12, 13, 14, 15,
-    16, 17, 18, 19, 20, 21, 22, 23,
-    24, 25, 26, 27, 28, 29, 30, 31,
-    32, 33, 34, 35, 36, 37, 38, 39,
-    40, 41, 42, 43, 44, 45, 46, 47,
-    48, 49, 50, 51, 52, 53, 54, 55,
-    56, 57, 58, 59, 60, 61, 62, 63,
-);
-
 impl Position {
     /// Create an empty position.
     pub fn new() -> Self {
@@ -142,11 +79,10 @@ impl Position {
     /// the occupied-square check. Assumes `mv` is empty (no such check), which
     /// lets the endgame leaf solvers skip it on the hot path.
     ///
-    /// Dispatches to a per-square specialization (see [`FLIP`]). The `& 63`
-    /// proves the index is in range so no bounds check is emitted; `mv` is
-    /// always a 0..64 square, so it never changes the result.
+    /// Delegates to the target-selected variant in [`crate::othello::flip`].
+    #[inline]
     pub(crate) fn flip_mask(mv: u32, player: u64, opponent: u64) -> u64 {
-        FLIP[(mv & 63) as usize](player, opponent)
+        crate::othello::flip::flip(mv, player, opponent)
     }
 
     /// Apply a move, returning the resulting position (opponent to move next).
