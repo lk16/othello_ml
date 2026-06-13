@@ -46,6 +46,55 @@ pub(super) fn board_parity(pos: &Position) -> u8 {
     p
 }
 
+/// Static per-square ordering value (Edax `SQUARE_VALUE`, "JCW's score"):
+/// corners high, C/X squares low. A minor tie-break in the move-ordering score.
+#[rustfmt::skip]
+const SQUARE_VALUE: [i32; 64] = [
+    18,  4, 16, 12, 12, 16,  4, 18,
+     4,  2,  6,  8,  8,  6,  2,  4,
+    16,  6, 14, 10, 10, 14,  6, 16,
+    12,  8, 10,  0,  0, 10,  8, 12,
+    12,  8, 10,  0,  0, 10,  8, 12,
+    16,  6, 14, 10, 10, 14,  6, 16,
+     4,  2,  6,  8,  8,  6,  2,  4,
+    18,  4, 16, 12, 12, 16,  4, 18,
+];
+
+// Move-ordering weights (Edax `w_*`), in descending importance. Real (opponent)
+// mobility dominates; corner stability is the next signal; square value and
+// parity are minor tie-breaks.
+const W_MOBILITY: i32 = 1 << 15;
+const W_CORNER: i32 = 1 << 11;
+
+/// Quick corner-anchored stability count for `p`: held corners plus their edge
+/// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap
+/// lower bound used only for move ordering.
+#[inline]
+fn corner_stability(p: u64) -> u32 {
+    let stable = ((0x0100_0000_0000_0001 & p) << 1)
+        | ((0x8000_0000_0000_0080 & p) >> 1)
+        | ((0x0000_0000_0000_0081 & p) << 8)
+        | ((0x8100_0000_0000_0000 & p) >> 8)
+        | 0x8100_0000_0000_0081;
+    (stable & p).count_ones()
+}
+
+/// Move-ordering score for playing `cell` (higher first). `child` is the
+/// resulting position (opponent to move); `parity`/`parity_weight` add the
+/// odd-parity bonus. Mirrors Edax's `movelist_evaluate_fast`.
+#[inline]
+fn order_score(child: &Position, cell: u32, parity: u8, parity_weight: i32) -> i32 {
+    let opp_mobility = child.get_moves().count_ones() as i32;
+    // `child.opponent` is the mover's resulting discs (corners we just secured).
+    let mut score = (36 - opp_mobility) * W_MOBILITY;
+    score += corner_stability(child.opponent) as i32 * W_CORNER;
+    score += SQUARE_VALUE[cell as usize];
+    if parity & QUADRANT_ID[cell as usize] != 0 {
+        score += parity_weight;
+    }
+    score
+}
+
 /// Mutable state for one exact search: nodes visited, the transposition table,
 /// a borrowed handle to the shared edge-stability table, and the running region
 /// parity (maintained incrementally in the ordered search for move ordering).
@@ -162,14 +211,17 @@ impl Search {
             return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
         }
 
-        let mut move_list: Vec<(u32, u32, Position)> =
+        let parity = self.parity;
+        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
+        let mut move_list: Vec<(i32, u32, Position)> =
             Vec::with_capacity(moves.count_ones() as usize);
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            move_list.push((child.get_moves().count_ones(), cell, child));
+            let score = order_score(&child, cell, parity, parity_weight);
+            move_list.push((score, cell, child));
         }
 
         // Enhanced Transposition Cutoff: if a child has a stored upper bound, our
@@ -188,13 +240,8 @@ impl Search {
             }
         }
 
-        // Order odd-parity quadrants first (you tend to get the last move in a
-        // region with an odd empty count), then by opponent mobility.
-        let parity = self.parity;
-        move_list.sort_unstable_by_key(|&(mobility, cell, _)| {
-            let even = (parity & QUADRANT_ID[cell as usize] == 0) as u32;
-            (mobility, even)
-        });
+        // Best ordering score first (mobility-dominant; see `order_score`).
+        move_list.sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
 
         // A hash best move is the strongest ordering signal: pull it to the front.
         if hash_move != NO_MOVE {
@@ -335,14 +382,17 @@ impl Search {
             return -self.alphabeta_exact_nws(&passed, -beta, empties);
         }
 
-        let mut move_list: Vec<(u32, u32, Position)> =
+        let parity = self.parity;
+        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
+        let mut move_list: Vec<(i32, u32, Position)> =
             Vec::with_capacity(moves.count_ones() as usize);
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            move_list.push((child.get_moves().count_ones(), cell, child));
+            let score = order_score(&child, cell, parity, parity_weight);
+            move_list.push((score, cell, child));
         }
 
         if empties >= ETC_MIN_EMPTIES {
@@ -357,11 +407,7 @@ impl Search {
             }
         }
 
-        let parity = self.parity;
-        move_list.sort_unstable_by_key(|&(mobility, cell, _)| {
-            let even = (parity & QUADRANT_ID[cell as usize] == 0) as u32;
-            (mobility, even)
-        });
+        move_list.sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
         if hash_move != NO_MOVE {
             if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
                 move_list[..=i].rotate_right(1);

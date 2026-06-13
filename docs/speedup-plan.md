@@ -29,19 +29,20 @@ necessarily small samples, so treat their `ms/pos` as approximate. When probing
 heavier counts, wrap a run in `timeout 125` (see best-practices.md) — `bench`
 only prints at the end, so an over-long run is killed with no output.
 
-## Current baseline (after Step 19)
+## Current baseline (after Step 6b)
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
-| 14 | 2000 | 72,007 | 2.4ms | 30.0M |
-| 16 | 1000 | 390,094 | 13.5ms | 28.9M |
-| 18 | 250 | 2,061,716 | 74.5ms | 27.7M |
-| 20 | 50 | 12,230,359 | 460.3ms | 26.6M |
-| 22 | 8 | 75,332,499 | 3003.9ms | 25.1M |
+| 14 | 2000 | 56,583 | 2.0ms | 28.3M |
+| 16 | 1000 | 281,927 | 10.4ms | 27.1M |
+| 18 | 250 | 1,379,799 | 54.0ms | 25.6M |
+| 20 | 50 | 7,238,915 | 290.5ms | 24.9M |
+| 22 | 8 | 35,303,820 | 1521.2ms | 23.2M |
 
-The big wins, in order of impact: the per-square flip table (Step 15, ~1.37×),
-the transposition table (Step 10), the stability cutoff (Step 17, ~1.55× at
-20e), and the carry-64 flip (Step 11, ~1.13×). Full history is in git.
+The big wins, in order of impact: the richer move ordering (Step 6b, ~1.6× at
+20e growing to ~2× at 22e), the per-square flip table (Step 15, ~1.37×), the
+stability cutoff (Step 17, ~1.55× at 20e), the transposition table (Step 10),
+and the carry-64 flip (Step 11, ~1.13×). Full history is in git.
 
 ## Committed steps (branch `speed-up`)
 
@@ -90,19 +91,25 @@ One line each; see the code and `git log` for detail.
   The cheaper flip then shifted two coupled floors (re-swept; see the constant
   doc comments): `TT_MIN_EMPTIES` 7 → 6 and `ETC_MIN_EMPTIES` 8 → 7, for ~7%
   fewer nodes at flat wall-clock. `SORT_MIN_EMPTIES` re-swept but stays 6.
+- **6b** richer move ordering (`order_score`). The ordered search now scores each
+  move with Edax's `movelist_evaluate_fast` weights instead of bare opponent
+  mobility: `(36 − opp_mobility)·2¹⁵` (dominant) + `corner_stability·2¹¹` +
+  `SQUARE_VALUE[cell]` + parity bonus, sorted descending. Corner stability is the
+  decisive new signal (Edax `get_corner_stability`: held corners + corner-anchored
+  edge discs). The biggest single win: ~1.4× at 16e growing to ~2× at 22e (e.g.
+  20e 12.23M → 7.24M nodes, 460 → 291 ms). `SORT_MIN_EMPTIES` re-swept afterward —
+  the costlier ordering still crosses over at 6 (5 cuts more nodes but the per-move
+  score doesn't pay that shallow; 7+ explode).
 - **19** incremental region parity for move ordering. `Search.parity` (Edax
   `QUADRANT_ID` XOR over empties) is seeded at the root and toggled
-  `^= QUADRANT_ID[move]` per ordered ply (make/undo), so it is ~free. Used as a
-  *secondary* sort key (after opponent mobility): among equal-mobility moves,
-  play odd-parity quadrants first. ~4–5% fewer nodes at 14–20e; wall-clock
-  neutral at bench depths (the node win ≈ the per-node ordering overhead),
-  tilting positive at higher empties where more plies are ordered. Kept for the
-  node reduction (helps deeper-than-bench solves) and as the parity
-  infrastructure for further ordering work (Step 6b). `n_empties` is already a
-  search parameter (Step 4); the empties `SquareList` itself was not added — with
-  `get_moves`-based move generation it has no use, and enumeration was never the
-  bottleneck. Parity as a *primary* key was tried and is a disaster (it overrides
-  mobility — nodes ~doubled).
+  `^= QUADRANT_ID[move]` per ordered ply (make/undo), so it is ~free. Feeds a
+  small odd-parity bonus into the move-ordering score (a minor term under mobility
+  and corner stability — see Step 6b). On its own, before 6b, it cut ~4–5% of
+  nodes at wall-clock-neutral. `n_empties` is already a search parameter (Step 4);
+  the empties `SquareList` itself was not added — with `get_moves`-based move
+  generation it has no use, and enumeration was never the bottleneck. Parity as a
+  *primary* ordering key was tried and is a disaster (it overrides mobility —
+  nodes ~doubled).
 
 ## Dead ends & decisions (not in code)
 
@@ -151,13 +158,6 @@ concurrent table, or per-thread tables merged periodically — exact scores stay
 path-independent, so lossy sharing is still correct). It is the main lever left
 for wall-clock on multi-core, but the only one that adds real concurrency
 complexity; everything else so far is single-threaded. Not started.
-
-### Step 6b — Move ordering: Edax tricks
-PVS pays off in proportion to ordering quality. Add Edax's other ordering signals
-(square-weighted mobility, corner stability) and selectivity tricks to reduce
-re-searches. Mobility (the dominant term) is already in place, so expect modest
-gains. Re-tune `SORT_MIN_EMPTIES` afterward — richer/costlier ordering shifts its
-crossover. The incremental `parity` from Step 19 is available as one such signal.
 
 ### Empties `SquareList` / static presorted order — not pursued
 The other half of Edax's `search_setup` state (Step 19 added the parity) is a
