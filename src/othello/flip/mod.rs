@@ -13,6 +13,11 @@
 mod generic;
 mod specialized;
 
+#[cfg(target_arch = "x86_64")]
+mod bmi2;
+#[cfg(target_arch = "x86_64")]
+mod line;
+
 // Production entry point. Baseline x86-64 (and non-x86) uses the per-square
 // specialization; richer targets are wired up in a later step.
 pub(crate) use specialized::flip;
@@ -93,5 +98,16 @@ mod tests {
     #[test]
     fn generic_matches_specialized() {
         check_against_reference("generic", generic::flip);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    fn bmi2_matches_specialized() {
+        if !is_x86_feature_detected!("bmi2") {
+            eprintln!("skipping bmi2 flip test: CPU lacks BMI2");
+            return;
+        }
+        check_against_reference("bmi2", |mv, p, o| unsafe { bmi2::flip(mv, p, o) });
     }
 }
