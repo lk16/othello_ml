@@ -16,6 +16,8 @@ mod line;
 mod specialized;
 
 #[cfg(target_arch = "x86_64")]
+mod avx2;
+#[cfg(target_arch = "x86_64")]
 mod bmi2;
 
 // Production entry point. Baseline x86-64 (and non-x86) uses the per-square
@@ -114,5 +116,16 @@ mod tests {
             return;
         }
         check_against_reference("bmi2", |mv, p, o| unsafe { bmi2::flip(mv, p, o) });
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    fn avx2_matches_specialized() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping avx2 flip test: CPU lacks AVX2");
+            return;
+        }
+        check_against_reference("avx2", |mv, p, o| unsafe { avx2::flip(mv, p, o) });
     }
 }
