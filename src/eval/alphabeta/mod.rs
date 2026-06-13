@@ -17,7 +17,7 @@ mod testutil;
 pub use depth::{best_move, depth_limited_score};
 
 use crate::othello::position::Position;
-use search::Search;
+use search::{board_parity, Search};
 
 /// Score bounds.
 pub(crate) const SCORE_MIN: i32 = -64;
@@ -61,6 +61,7 @@ impl Solver {
     /// Exact score for `pos`, reusing this solver's transposition table.
     pub fn exact_score(&mut self, pos: &Position) -> i32 {
         self.search.nodes = 0;
+        self.search.parity = board_parity(pos);
         self.search
             .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
     }
@@ -68,6 +69,7 @@ impl Solver {
     /// Exact score plus the number of search nodes visited for this position.
     pub fn exact_score_with_nodes(&mut self, pos: &Position) -> (i32, u64) {
         self.search.nodes = 0;
+        self.search.parity = board_parity(pos);
         let score = self
             .search
             .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());

@@ -18,12 +18,44 @@ use crate::othello::position::Position;
 /// visits fewer nodes, so 6 stays. Re-tune when the ordering cost/benefit shifts.
 const SORT_MIN_EMPTIES: u32 = 6;
 
+/// Region id per square: one of the four board quadrants, as a single bit
+/// (top-left = 1, top-right = 2, bottom-left = 4, bottom-right = 8). Edax's
+/// `QUADRANT_ID`. The board's parity is the XOR of these over its empty squares
+/// — bit `q` set iff quadrant `q` holds an odd number of empties.
+const QUADRANT_ID: [u8; 64] = {
+    let mut q = [0u8; 64];
+    let mut sq = 0;
+    while sq < 64 {
+        let hb = if sq % 8 >= 4 { 1 } else { 0 };
+        let vb = if sq / 8 >= 4 { 2 } else { 0 };
+        q[sq] = 1u8 << (hb + vb);
+        sq += 1;
+    }
+    q
+};
+
+/// Region parity of `pos`: XOR of [`QUADRANT_ID`] over its empty squares. Used to
+/// seed [`Search::parity`] at the root; maintained incrementally during search.
+pub(super) fn board_parity(pos: &Position) -> u8 {
+    let mut p = 0u8;
+    let mut e = !pos.occupied();
+    while e != 0 {
+        p ^= QUADRANT_ID[e.trailing_zeros() as usize];
+        e &= e - 1;
+    }
+    p
+}
+
 /// Mutable state for one exact search: nodes visited, the transposition table,
-/// and a borrowed handle to the shared edge-stability table.
+/// a borrowed handle to the shared edge-stability table, and the running region
+/// parity (maintained incrementally in the ordered search for move ordering).
 pub(super) struct Search {
     pub(super) nodes: u64,
     pub(super) tt: Vec<TtEntry>,
     edge_stability: &'static [u8; 256 * 256],
+    /// Region parity of the current node's empties (Edax `parity`). Seeded at the
+    /// root via [`board_parity`], then toggled `^= QUADRANT_ID[move]` per ply.
+    pub(super) parity: u8,
 }
 
 impl Search {
@@ -32,6 +64,7 @@ impl Search {
             nodes: 0,
             tt: vec![TtEntry::default(); TT_SIZE],
             edge_stability: edge_stability_table(),
+            parity: 0,
         }
     }
 
@@ -79,6 +112,7 @@ impl Search {
         empties: u32,
     ) -> i32 {
         self.nodes += 1;
+        debug_assert_eq!(self.parity, board_parity(pos), "parity desync (exact)");
 
         let use_tt = empties >= TT_MIN_EMPTIES;
         let mut hash_move = NO_MOVE;
@@ -154,7 +188,13 @@ impl Search {
             }
         }
 
-        move_list.sort_unstable_by_key(|&(mobility, _, _)| mobility);
+        // Order odd-parity quadrants first (you tend to get the last move in a
+        // region with an odd empty count), then by opponent mobility.
+        let parity = self.parity;
+        move_list.sort_unstable_by_key(|&(mobility, cell, _)| {
+            let even = (parity & QUADRANT_ID[cell as usize] == 0) as u32;
+            (mobility, even)
+        });
 
         // A hash best move is the strongest ordering signal: pull it to the front.
         if hash_move != NO_MOVE {
@@ -168,6 +208,7 @@ impl Search {
         let mut best_cell = NO_MOVE;
         let mut first = true;
         for &(_, cell, ref child) in &move_list {
+            self.parity ^= QUADRANT_ID[cell as usize];
             let score = if first {
                 -self.search_exact(child, -beta, -alpha, empties - 1)
             } else {
@@ -178,6 +219,7 @@ impl Search {
                     probe
                 }
             };
+            self.parity ^= QUADRANT_ID[cell as usize];
             first = false;
             if score > alpha {
                 alpha = score;
@@ -253,6 +295,7 @@ impl Search {
     /// fail-high. Node count is identical to `alphabeta_exact` with `beta = alpha + 1`.
     fn alphabeta_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
         self.nodes += 1;
+        debug_assert_eq!(self.parity, board_parity(pos), "parity desync (nws)");
         let beta = alpha + 1;
 
         let use_tt = empties >= TT_MIN_EMPTIES;
@@ -314,7 +357,11 @@ impl Search {
             }
         }
 
-        move_list.sort_unstable_by_key(|&(mobility, _, _)| mobility);
+        let parity = self.parity;
+        move_list.sort_unstable_by_key(|&(mobility, cell, _)| {
+            let even = (parity & QUADRANT_ID[cell as usize] == 0) as u32;
+            (mobility, even)
+        });
         if hash_move != NO_MOVE {
             if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
                 move_list[..=i].rotate_right(1);
@@ -325,7 +372,9 @@ impl Search {
         let mut best = alpha;
         let mut best_cell = NO_MOVE;
         for &(_, cell, ref child) in &move_list {
+            self.parity ^= QUADRANT_ID[cell as usize];
             let score = -self.search_exact_nws(child, -beta, empties - 1);
+            self.parity ^= QUADRANT_ID[cell as usize];
             if score > best {
                 best = score;
                 best_cell = cell as u8;

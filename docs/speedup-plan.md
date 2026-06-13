@@ -29,15 +29,15 @@ necessarily small samples, so treat their `ms/pos` as approximate. When probing
 heavier counts, wrap a run in `timeout 125` (see best-practices.md) — `bench`
 only prints at the end, so an over-long run is killed with no output.
 
-## Current baseline (after Step 11)
+## Current baseline (after Step 19)
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
-| 14 | 2000 | 75,280 | 2.4ms | 31.4M |
-| 16 | 1000 | 406,796 | 13.4ms | 30.4M |
-| 18 | 250 | 2,146,052 | 77.2ms | 27.8M |
-| 20 | 50 | 12,587,133 | 442.8ms | 28.4M |
-| 22 | 8 | 73,398,896 | 2729.6ms | 26.9M |
+| 14 | 2000 | 72,007 | 2.4ms | 30.0M |
+| 16 | 1000 | 390,094 | 13.5ms | 28.9M |
+| 18 | 250 | 2,061,716 | 74.5ms | 27.7M |
+| 20 | 50 | 12,230,359 | 460.3ms | 26.6M |
+| 22 | 8 | 75,332,499 | 3003.9ms | 25.1M |
 
 The big wins, in order of impact: the per-square flip table (Step 15, ~1.37×),
 the transposition table (Step 10), the stability cutoff (Step 17, ~1.55× at
@@ -90,6 +90,19 @@ One line each; see the code and `git log` for detail.
   The cheaper flip then shifted two coupled floors (re-swept; see the constant
   doc comments): `TT_MIN_EMPTIES` 7 → 6 and `ETC_MIN_EMPTIES` 8 → 7, for ~7%
   fewer nodes at flat wall-clock. `SORT_MIN_EMPTIES` re-swept but stays 6.
+- **19** incremental region parity for move ordering. `Search.parity` (Edax
+  `QUADRANT_ID` XOR over empties) is seeded at the root and toggled
+  `^= QUADRANT_ID[move]` per ordered ply (make/undo), so it is ~free. Used as a
+  *secondary* sort key (after opponent mobility): among equal-mobility moves,
+  play odd-parity quadrants first. ~4–5% fewer nodes at 14–20e; wall-clock
+  neutral at bench depths (the node win ≈ the per-node ordering overhead),
+  tilting positive at higher empties where more plies are ordered. Kept for the
+  node reduction (helps deeper-than-bench solves) and as the parity
+  infrastructure for further ordering work (Step 6b). `n_empties` is already a
+  search parameter (Step 4); the empties `SquareList` itself was not added — with
+  `get_moves`-based move generation it has no use, and enumeration was never the
+  bottleneck. Parity as a *primary* key was tried and is a disaster (it overrides
+  mobility — nodes ~doubled).
 
 ## Dead ends & decisions (not in code)
 
@@ -98,7 +111,9 @@ One line each; see the code and `git log` for detail.
   `quadrant_bit` sort in the hot `solve_3`/`solve_4` costs more than it saves.
   Edax only makes this pay via precomputed `sort3`/`parity_case` lookups plus
   *incremental* parity (one XOR per ply); replicating that for a ~2% node ceiling
-  isn't worth it.
+  isn't worth it. (Revisited in **Step 19**: incremental parity as a *secondary*
+  key in the main ordered search does pay off on node count — the runtime sort in
+  the tiny leaf solvers was the original killer.)
 - **Step 20 — TT-free `alphabeta_exact` variant (reverted).** Below
   `TT_MIN_EMPTIES` the empties-6 ordered nodes already run `use_tt = false` at
   runtime, with the TT probe/store/ETC/hash-move code compiled in behind a
@@ -142,44 +157,14 @@ PVS pays off in proportion to ordering quality. Add Edax's other ordering signal
 (square-weighted mobility, corner stability) and selectivity tricks to reduce
 re-searches. Mobility (the dominant term) is already in place, so expect modest
 gains. Re-tune `SORT_MIN_EMPTIES` afterward — richer/costlier ordering shifts its
-crossover.
+crossover. The incremental `parity` from Step 19 is available as one such signal.
 
-### Step 19 — Incremental board state (Edax `SquareList` + parity)
-Edax recomputes none of its endgame bookkeeping. `search_setup` builds three
-things once and maintains them by make/undo:
-- **empties `SquareList`** — a doubly-linked list (`u8` previous/next per square +
-  `NOMOVE`/`PASS` sentinels). `empty_remove`/`empty_restore` unlink/relink the
-  played square in O(1); `foreach_empty` walks it. It is built in a *presorted*
-  square order (`presorted_x`: corners → E/D/A/B/G/F edge classes → X-squares →
-  center), so the walk yields a static quality move order with **no per-node
-  mobility sort**.
-- **`n_empties`** — decremented per move. We already have this (passed as a
-  recursion parameter since Step 4).
-- **region `parity`** — a 4-bit value, one bit per board quadrant
-  (`QUADRANT_ID`), set iff that quadrant holds an odd number of empties. Updated
-  `parity ^= QUADRANT_ID[x]` per move; `quadrant_mask[parity]` is the union of
-  odd-parity quadrants. Endgame move ordering plays odd-parity regions first
-  (you tend to get the last move there).
-
-The earlier "eliminate `trailing_zeros`" framing for the list alone still doesn't
-hold — `tzcnt`/`x &= x-1` is a single instruction, the leaf solvers already take
-explicit `x1..x4`, and the list doesn't remove `get_moves`/`do_move`. The real
-prize is **parity-based ordering**: the reverted Step 9 lost (~2% fewer nodes,
-~2% slower) *only* because it recomputed parity with a runtime `quadrant_bit`
-sort. Maintained incrementally (one XOR per ply) it is ~free, so the node win
-should turn into a wall-clock win. The static presorted order is a second
-ordering lever (replaces the mobility sort + per-child `get_moves().count_ones()`).
-
-**Architecture.** Edax keeps this state on a *mutable* board (make/undo); our
-search is immutable (`Position` by value, fresh children). Two routes:
-1. Thread the state as immutable recursion parameters — `parity` is just
-   `child_parity = parity ^ QUADRANT_ID[cell]`, no list and no make/undo needed
-   (same shape as the existing `empties`/`alpha` params). Cheapest to try.
-2. Make/undo state in the `Search` struct (the empties `SquareList` lives here),
-   matching Edax. Needed if we also want the list-driven static order / O(1)
-   enumeration.
-
-Plan: put the state in `Search` (route 2) as the user asked, but measure against
-the carry64 baseline — if make/undo harms the hot path, fall back to route 1 for
-parity (the valuable part) and drop the list. Keep only what beats baseline
-(cf. the reverted Steps 9/20).
+### Empties `SquareList` / static presorted order — not pursued
+The other half of Edax's `search_setup` state (Step 19 added the parity) is a
+doubly-linked empties list built in a presorted square order, giving a static
+move order with no per-node mobility sort. We did not add it: our move generation
+is `get_moves`-based (we don't walk empties), so an O(1) empties list has no use
+here, and enumeration was never the bottleneck (`tzcnt` is one instruction; the
+leaf solvers already take explicit `x1..x4`). It would only matter as part of an
+ordering rework that replaced the mobility sort with the static order — revisit
+under Step 6b, measured in node count.
