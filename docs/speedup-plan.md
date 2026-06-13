@@ -4,7 +4,7 @@ Roadmap and design log for the exact endgame solver (`src/eval/alphabeta/`).
 Mechanism details live in the code and its doc comments — this file keeps the
 *why*: the benchmark recipe, the current baseline, what each step changed, dead
 ends, and what's left. Per-constant tuning sweeps live in the constant doc
-comments in `alphabeta.rs`, not here.
+comments in `alphabeta/`, not here.
 
 ## Benchmark
 
@@ -159,12 +159,48 @@ path-independent, so lossy sharing is still correct). It is the main lever left
 for wall-clock on multi-core, but the only one that adds real concurrency
 complexity; everything else so far is single-threaded. Not started.
 
-### Empties `SquareList` / static presorted order — not pursued
+### Step 22 — Empties `SquareList` / static presorted move order
 The other half of Edax's `search_setup` state (Step 19 added the parity) is a
 doubly-linked empties list built in a presorted square order, giving a static
-move order with no per-node mobility sort. We did not add it: our move generation
-is `get_moves`-based (we don't walk empties), so an O(1) empties list has no use
-here, and enumeration was never the bottleneck (`tzcnt` is one instruction; the
-leaf solvers already take explicit `x1..x4`). It would only matter as part of an
-ordering rework that replaced the mobility sort with the static order — revisit
-under Step 6b, measured in node count.
+move order with no per-node sort.
+
+A list would only pay if it let us skip `get_moves`, so checked how Edax
+enumerates endgame moves: it does **not** skip it. `search_shallow` calls
+`get_moves` (`vboard_get_moves`) at every endgame interior node down to ~5
+empties — below which the explicit `search_solve_4/3/2/1` take over with direct
+flip-tests on `x1..x4` (exactly like our `solve_*`). The empties list there is
+used only to *order* the iteration (walk empties in presorted order, filtered to
+legal by the `get_moves` bitboard); it never replaces `get_moves`. So the list
+is purely an **ordering** lever, not a move-gen one — and our dynamic
+`order_score` (Step 6b: mobility + corner stability + square value + parity)
+already orders far better than a static presorted walk would. Nothing to add;
+revisit only if an ordering rework wants to A/B a cheap static order against the
+per-node score, measured in node count.
+
+Note `get_moves` *is* a real cost (not free), and Edax SIMD-accelerates it
+(`get_moves_avx`/`get_moves_sse`) like it does flip. That is a separate primitive
+optimization, independent of the list (cf. Step 11's flip harness); our
+`get_moves` is a scalar branchless pass.
+
+### Step 23 — CPU-specific `count_last_flip`
+`count_last_flip` (the doubled flip count for the 1-empty leaf `solve_1`, Step 8)
+is a hot primitive — `solve_1` runs at every 1-empty leaf. We use one portable
+`COUNT_FLIP` table lookup summed over the move's four lines. Edax ships many
+target-specific implementations (`count_last_flip_{bmi2,sse,avx512cd,
+kindergarten,lzcnt,bitscan,…}.c`) selected at compile time. Port a few behind one
+signature + a fuzz battery and bench them, mirroring the Step 11 flip harness,
+picking per target. Same caveat as Step 11: production is baseline x86-64 and
+BMI2 is slow on AMD, so any SIMD pick must be `cfg`-gated and measured — a
+portable variant (carry/kindergarten) is likely the safe default.
+
+### Step 24 — CPU-specific `get_moves`
+`get_moves` is called at (almost) every interior node to build the move list —
+one of the hottest primitives, and a real cost (not free), as the Step 22
+investigation noted. We use one scalar branchless 8-direction pass
+(`Position::get_moves`). Edax SIMD-accelerates it (`get_moves_avx` on AVX2,
+`get_moves_sse`, with a runtime/compile-time dispatch) computing the four line
+directions in parallel — the same idea as the Step 11 `avx2` flip. Port a couple
+of variants behind one signature + a correctness battery (check against the
+scalar reference over random boards) and bench them via the search, mirroring
+Step 11. Caveats as Step 11/23: production is baseline x86-64, so any SIMD pick
+must be `cfg`-gated and measured before wiring.
