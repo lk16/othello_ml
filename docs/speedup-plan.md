@@ -181,6 +181,24 @@ One line each; see the code and `git log` for detail.
   AVX2 pays off partly via its *vboard* incremental representation (the move list
   is built once per node from a vector board); a fair re-test there would need
   that, not just a drop-in primitive swap.
+- **Step 22 static presorted order — built, measured, reverted.** Edax never
+  skips `get_moves` (the empties list only *orders* the walk, legality still comes
+  from the bitboard), so the list is purely an ordering lever. Built it anyway to
+  measure: an incremental empties `SquareList` as a *safe index arena* (a circular
+  doubly-linked ring whose `prev`/`next` are `u8` indices into a fixed inline
+  `[EmptyNode; 65]`, giving Edax's O(1) `empty_remove`/`empty_restore` with no
+  `unsafe`), built at the root in static `SQUARE_VALUE` priority and
+  removed/restored around each child. Behind a `const STATIC_ORDER` switch, A/B'd
+  the static walk against the per-node `order_score` + sort: static visits **4.6×
+  the nodes at 16e and 7.0× at 18e** (1.30M vs 0.28M; 9.71M vs 1.38M), for 3–4.6×
+  slower wall-clock — even though the static walk is *cheaper per node* (≈39M vs
+  27M nodes/s; it skips `order_score`'s mobility probe). Ordering quality dominates
+  ordering cost by a wide margin. The whole thing (`empties.rs`, the field, the
+  gated branches) was **reverted** — dead code with the flag off, and the dynamic
+  path is strictly better with it on. Conclusion stands: the `SquareList` is not
+  worth it as a move-gen lever (enumeration was never the bottleneck; cf. Step 19)
+  nor as an ordering one. If the parallel split (Step 21) later wants an O(1)
+  incremental empties structure, the safe-arena design here is the template.
 
 ## Remaining steps
 
@@ -200,26 +218,3 @@ concurrent table, or per-thread tables merged periodically — exact scores stay
 path-independent, so lossy sharing is still correct). It is the main lever left
 for wall-clock on multi-core, but the only one that adds real concurrency
 complexity; everything else so far is single-threaded. Not started.
-
-### Step 22 — Empties `SquareList` / static presorted move order
-The other half of Edax's `search_setup` state (Step 19 added the parity) is a
-doubly-linked empties list built in a presorted square order, giving a static
-move order with no per-node sort.
-
-A list would only pay if it let us skip `get_moves`, so checked how Edax
-enumerates endgame moves: it does **not** skip it. `search_shallow` calls
-`get_moves` (`vboard_get_moves`) at every endgame interior node down to ~5
-empties — below which the explicit `search_solve_4/3/2/1` take over with direct
-flip-tests on `x1..x4` (exactly like our `solve_*`). The empties list there is
-used only to *order* the iteration (walk empties in presorted order, filtered to
-legal by the `get_moves` bitboard); it never replaces `get_moves`. So the list
-is purely an **ordering** lever, not a move-gen one — and our dynamic
-`order_score` (Step 6b: mobility + corner stability + square value + parity)
-already orders far better than a static presorted walk would. Nothing to add;
-revisit only if an ordering rework wants to A/B a cheap static order against the
-per-node score, measured in node count.
-
-Note `get_moves` *is* a real cost (not free), and Edax SIMD-accelerates it
-(`get_moves_avx`/`get_moves_sse`) like it does flip — now done as **Step 24**
-(committed; `scalar` kept as the default, see above). That is a separate
-primitive optimization, independent of the list (cf. Step 11's flip harness).
