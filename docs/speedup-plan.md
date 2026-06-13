@@ -33,11 +33,11 @@ only prints at the end, so an over-long run is killed with no output.
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
-| 14 | 2000 | 81,727 | 2.5ms | 32.7M |
-| 16 | 1000 | 440,253 | 13.8ms | 31.9M |
-| 18 | 250 | 2,315,881 | 77.0ms | 30.1M |
-| 20 | 50 | 13,458,017 | 450.1ms | 29.9M |
-| 22 | 8 | 76,628,791 | 2663.4ms | 28.8M |
+| 14 | 2000 | 75,280 | 2.4ms | 31.4M |
+| 16 | 1000 | 406,796 | 13.4ms | 30.4M |
+| 18 | 250 | 2,146,052 | 77.2ms | 27.8M |
+| 20 | 50 | 12,587,133 | 442.8ms | 28.4M |
+| 22 | 8 | 73,398,896 | 2729.6ms | 26.9M |
 
 The big wins, in order of impact: the per-square flip table (Step 15, ~1.37×),
 the transposition table (Step 10), the stability cutoff (Step 17, ~1.55× at
@@ -87,6 +87,9 @@ One line each; see the code and `git log` for detail.
   production default** — fastest on the AMD dev box (~6 ns/flip micro, ~1.13×
   whole-search) and it inlines, unlike the indirect call through the `specialized`
   table. See the decision note below for why the SIMD variants aren't selected.
+  The cheaper flip then shifted two coupled floors (re-swept; see the constant
+  doc comments): `TT_MIN_EMPTIES` 7 → 6 and `ETC_MIN_EMPTIES` 8 → 7, for ~7%
+  fewer nodes at flat wall-clock. `SORT_MIN_EMPTIES` re-swept but stays 6.
 
 ## Dead ends & decisions (not in code)
 
@@ -116,11 +119,6 @@ One line each; see the code and `git log` for detail.
   on an Intel (Haswell+) box before wiring any per-target override.
 
 ## Remaining steps
-
-### Re-tune `SORT_MIN_EMPTIES` after the cheaper flip
-Step 11 made `do_move`/flip ~2.5× cheaper, which lowers the per-child ordering
-cost and may push the ordering crossover down. Sweep `SORT_MIN_EMPTIES` (and the
-TT/ETC floors that interact with it) now that flips are cheaper.
 
 ### Step 6b — Move ordering: Edax tricks
 PVS pays off in proportion to ordering quality. Add Edax's other ordering signals

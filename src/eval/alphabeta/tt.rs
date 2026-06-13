@@ -19,18 +19,19 @@ const TT_MASK: u64 = TT_SIZE as u64 - 1;
 
 /// Minimum empties at which the table is consulted. The TT is only wired into
 /// the ordered search, so the effective floor is `max(SORT_MIN_EMPTIES, this)`.
-/// Swept 6..10: 6 and 7 are within noise of each other and both beat 8/10; 7
-/// edges ahead at the less-noisy 16/18-empty levels (skipping the very numerous
-/// empties-6 probes, where overhead roughly cancels node savings). Re-swept
-/// after the stability + null-window steps: unchanged.
-pub(super) const TT_MIN_EMPTIES: u32 = 7;
+/// Swept 6..10 (8/10 clearly lose). Originally 6 and 7 tied so 7 was kept;
+/// re-swept after the carry-64 flip (Step 11) made nodes cheaper, 6 now wins
+/// reproducibly (16e 13.7 vs 14.1ms, 18e 76.5 vs 78.6) and visits ~6% fewer
+/// nodes (it probes/stores the numerous empties-6 nodes, enabling more cuts).
+pub(super) const TT_MIN_EMPTIES: u32 = 6;
 
 /// Minimum empties at which the ordered search runs Enhanced Transposition
 /// Cutoff. ETC reads *children's* entries, so the structural floor is
-/// `TT_MIN_EMPTIES + 1` (= 8): below it the probes hit unstored children and
-/// never cut. Swept 7..=12 — 8 ties 9 on wall-clock and prunes strictly more
-/// nodes, so it is preferred for robustness on deeper solves.
-pub(super) const ETC_MIN_EMPTIES: u32 = 8;
+/// `TT_MIN_EMPTIES + 1` (= 7): below it the probes hit unstored children and
+/// never cut. Swept 7..=9 at `TT_MIN_EMPTIES = 6`: 7 ties 8 on wall-clock and
+/// prunes strictly more nodes (its empties-7 probes now cut, since children at
+/// empties 6 are stored), so it is preferred. 9 is slightly slower.
+pub(super) const ETC_MIN_EMPTIES: u32 = 7;
 
 /// Sentinel "no move" square (a real square is 0..64).
 pub(super) const NO_MOVE: u8 = 64;

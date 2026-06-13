@@ -11,8 +11,11 @@ use crate::othello::position::Position;
 
 /// Minimum empties at which the deep search orders moves (by opponent mobility).
 /// Below this, moves are searched in natural order — near the leaves the ordering
-/// work costs more than the pruning it buys. Empirically tuned; re-tune when the
-/// ordering cost vs. pruning balance shifts (cheaper flips, richer ordering).
+/// work costs more than the pruning it buys. Swept 4..10: lower values cut nodes
+/// but run slower (ordering low-empty nodes costs more than it saves), higher
+/// values explode nodes. Re-swept after the carry-64 flip (Step 11): the cheaper
+/// flip nudged the crossover toward 7, but 6 and 7 are within noise while 6
+/// visits fewer nodes, so 6 stays. Re-tune when the ordering cost/benefit shifts.
 const SORT_MIN_EMPTIES: u32 = 6;
 
 /// Mutable state for one exact search: nodes visited, the transposition table,
