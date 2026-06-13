@@ -10,13 +10,13 @@
 //! - `carry64` — portable line-table (gather/lookup/scatter).
 //! - `bmi2` / `avx2` — x86-64 SIMD variants (compiled only on x86-64).
 
+mod carry64;
 mod generic;
+mod line;
 mod specialized;
 
 #[cfg(target_arch = "x86_64")]
 mod bmi2;
-#[cfg(target_arch = "x86_64")]
-mod line;
 
 // Production entry point. Baseline x86-64 (and non-x86) uses the per-square
 // specialization; richer targets are wired up in a later step.
@@ -98,6 +98,11 @@ mod tests {
     #[test]
     fn generic_matches_specialized() {
         check_against_reference("generic", generic::flip);
+    }
+
+    #[test]
+    fn carry64_matches_specialized() {
+        check_against_reference("carry64", carry64::flip);
     }
 
     #[test]
