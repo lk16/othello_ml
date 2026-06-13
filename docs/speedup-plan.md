@@ -121,6 +121,17 @@ One line each; see the code and `git log` for detail.
   fastest on the AMD dev box (2.4 vs `via_flip` 8.7 vs `bmi2` 51 ns/flip micro);
   BMI2 PEXT is microcoded and slow on AMD, same as the Step 11 flip story, so it
   is `cfg`-gated and not auto-selected. See the decision note below.
+- **24** CPU-specific `get_moves` harness (`src/othello/get_moves/`). Two
+  variants share one signature (`fn(player, opponent) -> u64`) behind a
+  correctness battery (structured pattern pairs + 1M random boards, all checked
+  against the `scalar` reference) with a `bench-get-moves` micro-benchmark,
+  mirroring Step 11: `scalar` (the prior branchless 8-direction Kogge-Stone fill)
+  and `avx2` (the four ray axes in parallel across 256-bit lanes, lane shifts
+  {1,8,7,9}; Edax `get_moves_avx`, compiled only on x86-64). **`scalar` stays the
+  production default** — slightly faster on the AMD dev box (7.24 vs `avx2`
+  7.81 ns/call micro) and portable. `Position::get_moves` now delegates to the
+  selected variant; search wall-clock unchanged (18e 54.2 vs 54.0 ms baseline).
+  See the decision note below.
 
 ## Dead ends & decisions (not in code)
 
@@ -159,6 +170,17 @@ One line each; see the code and `git log` for detail.
   `bench-count-flip` and future Intel tuning behind the same `cfg` caveat. No
   whole-search change — same node counts, same primitive, just confirmed the
   existing lookup is already the fastest portable option here.
+- **Step 24 `get_moves` variants — same outcome as Step 11.** The `avx2`
+  four-axes-in-parallel mobility was marginally *slower* than the portable
+  `scalar` 8-direction fill on the AMD dev box (7.81 vs 7.24 ns/call): the eight
+  scalar shifts already pipeline well, and the `target_feature` boundary blocks
+  inlining the SIMD call into the hot loop. `scalar` stays the production default
+  (`Position::get_moves` now delegates through the harness; search wall-clock
+  unchanged — 18e 54.2 vs 54.0 ms). `avx2` is kept compiled for `bench-get-moves`
+  and future tuning on a box where it wins, behind the same `cfg` caveat. Edax's
+  AVX2 pays off partly via its *vboard* incremental representation (the move list
+  is built once per node from a vector board); a fair re-test there would need
+  that, not just a drop-in primitive swap.
 
 ## Remaining steps
 
@@ -198,18 +220,6 @@ revisit only if an ordering rework wants to A/B a cheap static order against the
 per-node score, measured in node count.
 
 Note `get_moves` *is* a real cost (not free), and Edax SIMD-accelerates it
-(`get_moves_avx`/`get_moves_sse`) like it does flip. That is a separate primitive
-optimization, independent of the list (cf. Step 11's flip harness); our
-`get_moves` is a scalar branchless pass.
-
-### Step 24 — CPU-specific `get_moves`
-`get_moves` is called at (almost) every interior node to build the move list —
-one of the hottest primitives, and a real cost (not free), as the Step 22
-investigation noted. We use one scalar branchless 8-direction pass
-(`Position::get_moves`). Edax SIMD-accelerates it (`get_moves_avx` on AVX2,
-`get_moves_sse`, with a runtime/compile-time dispatch) computing the four line
-directions in parallel — the same idea as the Step 11 `avx2` flip. Port a couple
-of variants behind one signature + a correctness battery (check against the
-scalar reference over random boards) and bench them via the search, mirroring
-Step 11. Caveats as Step 11/23: production is baseline x86-64, so any SIMD pick
-must be `cfg`-gated and measured before wiring.
+(`get_moves_avx`/`get_moves_sse`) like it does flip — now done as **Step 24**
+(committed; `scalar` kept as the default, see above). That is a separate
+primitive optimization, independent of the list (cf. Step 11's flip harness).

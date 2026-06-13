@@ -125,67 +125,10 @@ impl Position {
     /// A move is legal at an empty cell if placing a disc there would flip
     /// at least one opponent disc in any of the 8 directions.
     ///
-    /// Adapted from Edax / flippy.
+    /// Delegates to the target-selected variant in [`crate::othello::get_moves`].
+    #[inline]
     pub fn get_moves(&self) -> u64 {
-        // Middle columns mask (excludes A and H) prevents horizontal and
-        // diagonal bitboard wrapping.  Vertical shifts need no mask.
-        const MIDDLE_COLUMNS: u64 = 0x7E7E7E7E7E7E7E7E;
-        let mask = self.opponent & MIDDLE_COLUMNS;
-        let mut moves: u64 = 0;
-
-        // Horizontal (shift 1)
-        let mut flip_l = mask & (self.player << 1);
-        flip_l |= mask & (flip_l << 1);
-        let mask_l = mask & (mask << 1);
-        flip_l |= mask_l & (flip_l << 2);
-        flip_l |= mask_l & (flip_l << 2);
-        let mut flip_r = mask & (self.player >> 1);
-        flip_r |= mask & (flip_r >> 1);
-        let mask_r = mask & (mask >> 1);
-        flip_r |= mask_r & (flip_r >> 2);
-        flip_r |= mask_r & (flip_r >> 2);
-        moves |= (flip_l << 1) | (flip_r >> 1);
-
-        // Diagonal / (shift 7)
-        let mut flip_l = mask & (self.player << 7);
-        flip_l |= mask & (flip_l << 7);
-        let mask_l = mask & (mask << 7);
-        flip_l |= mask_l & (flip_l << 14);
-        flip_l |= mask_l & (flip_l << 14);
-        let mut flip_r = mask & (self.player >> 7);
-        flip_r |= mask & (flip_r >> 7);
-        let mask_r = mask & (mask >> 7);
-        flip_r |= mask_r & (flip_r >> 14);
-        flip_r |= mask_r & (flip_r >> 14);
-        moves |= (flip_l << 7) | (flip_r >> 7);
-
-        // Diagonal \ (shift 9)
-        let mut flip_l = mask & (self.player << 9);
-        flip_l |= mask & (flip_l << 9);
-        let mask_l = mask & (mask << 9);
-        flip_l |= mask_l & (flip_l << 18);
-        flip_l |= mask_l & (flip_l << 18);
-        let mut flip_r = mask & (self.player >> 9);
-        flip_r |= mask & (flip_r >> 9);
-        let mask_r = mask & (mask >> 9);
-        flip_r |= mask_r & (flip_r >> 18);
-        flip_r |= mask_r & (flip_r >> 18);
-        moves |= (flip_l << 9) | (flip_r >> 9);
-
-        // Vertical (shift 8) — no column masking needed
-        let mut flip_l = self.opponent & (self.player << 8);
-        flip_l |= self.opponent & (flip_l << 8);
-        let mask_l = self.opponent & (self.opponent << 8);
-        flip_l |= mask_l & (flip_l << 16);
-        flip_l |= mask_l & (flip_l << 16);
-        let mut flip_r = self.opponent & (self.player >> 8);
-        flip_r |= self.opponent & (flip_r >> 8);
-        let mask_r = self.opponent & (self.opponent >> 8);
-        flip_r |= mask_r & (flip_r >> 16);
-        flip_r |= mask_r & (flip_r >> 16);
-        moves |= (flip_l << 8) | (flip_r >> 8);
-
-        moves & !(self.player | self.opponent)
+        crate::othello::get_moves::get_moves(self.player, self.opponent)
     }
 
     /// Check whether the current player has any legal moves.

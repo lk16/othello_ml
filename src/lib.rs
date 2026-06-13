@@ -18,6 +18,12 @@ pub fn bench_flip_variants() {
 pub fn bench_count_flip_variants() {
     eval::alphabeta::bench_count_flip_variants();
 }
+
+/// Micro-benchmark the mobility (`get_moves`) variants (Step 24). See
+/// [`othello::get_moves`].
+pub fn bench_get_moves_variants() {
+    othello::get_moves::bench_get_moves_variants();
+}
 pub use othello::board::Board;
 pub use othello::game::{load_games, Game, GameResult};
 pub use othello::position::Position;
