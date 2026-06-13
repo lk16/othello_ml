@@ -23,6 +23,9 @@ const TT_MASK: u64 = TT_SIZE as u64 - 1;
 /// re-swept after the carry-64 flip (Step 11) made nodes cheaper, 6 now wins
 /// reproducibly (16e 13.7 vs 14.1ms, 18e 76.5 vs 78.6) and visits ~6% fewer
 /// nodes (it probes/stores the numerous empties-6 nodes, enabling more cuts).
+/// Re-swept jointly with `ETC_MIN_EMPTIES` after the Step 6b ordering change:
+/// (6,7) keeps the fewest nodes at neutral wall-clock (raising either floor cuts
+/// no time but adds nodes), so unchanged.
 pub(super) const TT_MIN_EMPTIES: u32 = 6;
 
 /// Minimum empties at which the ordered search runs Enhanced Transposition
