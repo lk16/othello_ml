@@ -1,6 +1,6 @@
 # Alphabeta Exact-Search Speed-Up Plan
 
-Roadmap and design log for the exact endgame solver (`src/eval/alphabeta.rs`).
+Roadmap and design log for the exact endgame solver (`src/eval/alphabeta/`).
 Mechanism details live in the code and its doc comments — this file keeps the
 *why*: the benchmark recipe, the current baseline, what each step changed, dead
 ends, and what's left. Per-constant tuning sweeps live in the constant doc
@@ -29,19 +29,19 @@ necessarily small samples, so treat their `ms/pos` as approximate. When probing
 heavier counts, wrap a run in `timeout 125` (see best-practices.md) — `bench`
 only prints at the end, so an over-long run is killed with no output.
 
-## Current baseline (after Step 18)
+## Current baseline (after Step 11)
 
 | empties | boards | nodes/pos | ms/pos | nodes/s |
 |---------|--------|-----------|--------|---------|
-| 14 | 2000 | 81,727 | 2.8ms | 29.2M |
-| 16 | 1000 | 440,253 | 15.2ms | 29.0M |
-| 18 | 250 | 2,315,881 | 83.8ms | 27.6M |
-| 20 | 50 | 13,458,017 | 487.0ms | 27.6M |
-| 22 | 8 | 76,628,791 | 2943.4ms | 26.0M |
+| 14 | 2000 | 81,727 | 2.5ms | 32.7M |
+| 16 | 1000 | 440,253 | 13.8ms | 31.9M |
+| 18 | 250 | 2,315,881 | 77.0ms | 30.1M |
+| 20 | 50 | 13,458,017 | 450.1ms | 29.9M |
+| 22 | 8 | 76,628,791 | 2663.4ms | 28.8M |
 
 The big wins, in order of impact: the per-square flip table (Step 15, ~1.37×),
-the transposition table (Step 10), and the stability cutoff (Step 17, ~1.55× at
-20e). Full history is in git.
+the transposition table (Step 10), the stability cutoff (Step 17, ~1.55× at
+20e), and the carry-64 flip (Step 11, ~1.13×). Full history is in git.
 
 ## Committed steps (branch `speed-up`)
 
@@ -77,6 +77,16 @@ One line each; see the code and `git log` for detail.
   passing `beta` lets the compiler fold it to `alpha + 1`, dropping the dead
   TT-narrowing branches and the PVS re-search. Node counts identical to 17;
   ~1.02× at 20e, growing with depth.
+- **11** flip-computation variants (`src/othello/flip/`). Five share one
+  signature behind a fuzz battery (every square × patterns + 500k random boards,
+  all checked against the proven reference): `specialized` (the Step-15 per-square
+  function table), `generic` (inlinable runtime ray-scan), `carry64` (portable
+  line gather → `OUTFLANK`/`FLIPPED` lookup → scatter), `bmi2` (PEXT/PDEP) and
+  `avx2` (4-lane Kogge-Stone fill), both x86-64-only with localized
+  `allow(unsafe_code)`. `bench-flip` micro-benchmarks each. **`carry64` is the
+  production default** — fastest on the AMD dev box (~6 ns/flip micro, ~1.13×
+  whole-search) and it inlines, unlike the indirect call through the `specialized`
+  table. See the decision note below for why the SIMD variants aren't selected.
 
 ## Dead ends & decisions (not in code)
 
@@ -96,8 +106,21 @@ One line each; see the code and `git log` for detail.
   saves nothing while the second monomorphization of two large functions adds
   bloat. Same lesson as the reverted Step 18 const-generic attempt: a `const
   bool` split only pays when it removes *executed* work, not a predicted branch.
+- **Step 11 SIMD variants — kept in-tree, not selected.** On the AMD dev box the
+  `bmi2` flip was ~20× *slower* than `carry64` (~125 vs ~6 ns/flip): AMD's
+  PEXT/PDEP are microcoded. The trap is that `cfg(target_feature = "bmi2")` is
+  *true* on AMD too, so a cfg-based auto-select would pick the slow path — there
+  is no compile-time signal for "fast PEXT". `avx2` (~10 ns/flip) also lost to
+  `carry64` here. Both stay compiled for `bench-flip` and future Intel tuning,
+  but production uses the portable `carry64` unconditionally. Re-run `bench-flip`
+  on an Intel (Haswell+) box before wiring any per-target override.
 
 ## Remaining steps
+
+### Re-tune `SORT_MIN_EMPTIES` after the cheaper flip
+Step 11 made `do_move`/flip ~2.5× cheaper, which lowers the per-child ordering
+cost and may push the ordering crossover down. Sweep `SORT_MIN_EMPTIES` (and the
+TT/ETC floors that interact with it) now that flips are cheaper.
 
 ### Step 6b — Move ordering: Edax tricks
 PVS pays off in proportion to ordering quality. Add Edax's other ordering signals
@@ -134,21 +157,3 @@ What it *would* unlock is a static presorted move order (replacing the mobility
 sort + per-child `get_moves().count_ones()`) and cheap incremental parity — both
 **ordering** levers, so their payoff belongs with Step 6b / Step 9, measured in
 node count, not enumeration speed. Revisit only as part of an ordering rework.
-
-### Step 11 — Alternative flip-computation variants
-Edax ships many implementations of the flip primitive (kindergarten/carry, BMI2
-PEXT/PDEP, SSE/AVX2, NEON/SVE), selected at compile time per target. We use one
-portable bitboard `flip_mask`. Goal: implement a few alternatives, benchmark, and
-pick the best per target. Faster flips lower the per-child ordering cost, which
-pushes `SORT_MIN_EMPTIES` down — re-tune it afterward.
-
-**Test/config strategy** (no new deps; `std::arch` only):
-- All variants share one signature, checked against the portable reference over
-  the existing square × pattern battery (`check_flip_impl`).
-- Portable variants always compiled and tested. SIMD variants are
-  `#[cfg(target_arch)]` + `#[target_feature(...)]`, with tests guarded by
-  `is_x86_feature_detected!` (no-op + note when unsupported), so `cargo test` is
-  correct on any machine.
-- Production: prefer compile-time `cfg(target_feature)` (one impl per binary) over
-  a runtime dispatcher — indirection in this hot leaf op would cost more than it
-  saves. `bench` can still exercise each compiled variant.

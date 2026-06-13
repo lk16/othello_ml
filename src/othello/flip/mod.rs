@@ -20,9 +20,107 @@ mod avx2;
 #[cfg(target_arch = "x86_64")]
 mod bmi2;
 
-// Production entry point. Baseline x86-64 (and non-x86) uses the per-square
-// specialization; richer targets are wired up in a later step.
-pub(crate) use specialized::flip;
+// Production entry point: the portable carry-64 line-table variant. It was the
+// fastest in the Step 11 benchmark (see docs/speedup-plan.md) — about 2.5x the
+// per-square specialization on the AMD dev box, and faster there than the SIMD
+// variants. BMI2 PEXT/PDEP is microcoded and ~20x slower on AMD, and
+// `cfg(target_feature = "bmi2")` cannot tell fast Intel PEXT from slow AMD PEXT,
+// so we do not auto-select it; carry64 is the robust portable default.
+pub(crate) use carry64::flip;
+
+/// Micro-benchmark every compiled flip variant over realistic flip sites
+/// (every legal move of positions sampled from random self-play), printing
+/// ns/flip. Invoked by the `bench-flip` subcommand. SIMD variants are timed
+/// only when the running CPU supports them.
+#[allow(unsafe_code)]
+pub(crate) fn bench_variants() {
+    use crate::othello::position::Position;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // Collect (move, player, opponent) flip sites from random self-play.
+    let mut samples: Vec<(u32, u64, u64)> = Vec::with_capacity(200_000);
+    let mut rng: u64 = 0x1234_5678_9ABC_DEF1;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    while samples.len() < 200_000 {
+        let mut pos = Position::initial();
+        loop {
+            let moves = pos.get_moves();
+            if moves == 0 {
+                let passed = pos.pass_move();
+                if passed.get_moves() == 0 {
+                    break;
+                }
+                pos = passed;
+                continue;
+            }
+            let mut m = moves;
+            while m != 0 {
+                let cell = m.trailing_zeros();
+                m &= m - 1;
+                samples.push((cell, pos.player, pos.opponent));
+            }
+            let pick = next() % moves.count_ones() as u64;
+            let mut m = moves;
+            for _ in 0..pick {
+                m &= m - 1;
+            }
+            pos = pos.do_move(m.trailing_zeros());
+            if samples.len() >= 200_000 {
+                break;
+            }
+        }
+    }
+
+    const REPEATS: usize = 300;
+    let total = (samples.len() * REPEATS) as f64;
+
+    macro_rules! time_variant {
+        ($name:expr, $f:expr) => {{
+            let mut acc = 0u64;
+            for &(mv, p, o) in &samples {
+                acc ^= $f(mv, p, o);
+            }
+            black_box(acc);
+            let start = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..REPEATS {
+                for &(mv, p, o) in &samples {
+                    acc ^= $f(mv, p, o);
+                }
+            }
+            black_box(acc);
+            eprintln!(
+                "  {:<12} {:.3} ns/flip",
+                $name,
+                start.elapsed().as_nanos() as f64 / total
+            );
+        }};
+    }
+
+    eprintln!(
+        "flip micro-bench: {} sites x {} repeats",
+        samples.len(),
+        REPEATS
+    );
+    time_variant!("specialized", specialized::flip);
+    time_variant!("generic", generic::flip);
+    time_variant!("carry64", carry64::flip);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("bmi2") {
+            time_variant!("bmi2", |mv, p, o| unsafe { bmi2::flip(mv, p, o) });
+        }
+        if is_x86_feature_detected!("avx2") {
+            time_variant!("avx2", |mv, p, o| unsafe { avx2::flip(mv, p, o) });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

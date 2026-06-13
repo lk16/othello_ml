@@ -12,6 +12,7 @@ enum Command {
     Train(TrainArgs),
     Play(PlayArgs),
     Bench(BenchArgs),
+    BenchFlip,
 }
 
 struct TrainArgs {
@@ -55,6 +56,7 @@ fn parse_args() -> Option<Command> {
         "train" => parse_train_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
         "bench" => parse_bench_args(&args[0], &args[2..]),
+        "bench-flip" => Some(Command::BenchFlip),
         "--help" | "-h" => {
             print_usage(&args[0]);
             None
@@ -242,6 +244,7 @@ fn main() {
         Command::Train(args) => run_train(args),
         Command::Play(args) => run_play(args),
         Command::Bench(args) => run_bench(args),
+        Command::BenchFlip => othello_eval::bench_flip_variants(),
     }
 }
 
@@ -570,6 +573,7 @@ fn print_usage(program: &str) {
     eprintln!("  train    Train evaluation weights from game files");
     eprintln!("  play     Play a game against the CLI");
     eprintln!("  bench    Benchmark exact alpha-beta search speed");
+    eprintln!("  bench-flip  Micro-benchmark the flip-computation variants");
     eprintln!();
     eprintln!("Use \"{program} <command> --help\" for more information about a command.");
 }
