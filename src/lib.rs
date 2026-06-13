@@ -12,6 +12,12 @@ pub use eval::cache::{build_examples, EvalCache};
 pub fn bench_flip_variants() {
     othello::flip::bench_variants();
 }
+
+/// Micro-benchmark the count-last-flip variants (Step 23). See
+/// [`eval::alphabeta::bench_count_flip_variants`].
+pub fn bench_count_flip_variants() {
+    eval::alphabeta::bench_count_flip_variants();
+}
 pub use othello::board::Board;
 pub use othello::game::{load_games, Game, GameResult};
 pub use othello::position::Position;

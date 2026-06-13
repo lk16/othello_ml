@@ -5,6 +5,7 @@
 //! estimate), [`tt`] (transposition table), and [`depth`] (the depth-limited
 //! heuristic search used for gameplay).
 
+mod count_flip;
 mod depth;
 mod leaf;
 mod search;
@@ -14,6 +15,7 @@ mod tt;
 #[cfg(test)]
 mod testutil;
 
+pub use count_flip::bench_count_flip_variants;
 pub use depth::{best_move, depth_limited_score};
 
 use crate::othello::position::Position;

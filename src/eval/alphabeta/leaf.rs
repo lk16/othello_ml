@@ -5,6 +5,7 @@
 //! function; `solve_2`..`solve_4` and the `solve_leaf` dispatcher are [`Search`]
 //! methods so they can count nodes. Every visited position counts exactly once.
 
+use super::count_flip::count_last_flip;
 use super::search::Search;
 use super::SCORE_MIN;
 use crate::othello::position::Position;
@@ -20,93 +21,6 @@ pub(super) fn solve_game_over(player: u64, n_empties: u32) -> i32 {
     } else {
         0
     }
-}
-
-/// `COUNT_FLIP[i][pattern]` = 2× discs flipped by playing at line-position `i`,
-/// where `pattern` bit j is set iff the player holds line-cell j (every other
-/// cell being an opponent disc — the [`solve_1`] full-line invariant). Doubled
-/// to ease disc-difference arithmetic, matching Edax.
-const COUNT_FLIP: [[u8; 256]; 8] = {
-    let mut table = [[0u8; 256]; 8];
-    let mut i = 0;
-    while i < 8 {
-        let mut p = 0usize;
-        while p < 256 {
-            let mut flips = 0u32;
-            let mut run = 0u32;
-            let mut j = i + 1;
-            while j < 8 {
-                if p & (1 << j) != 0 {
-                    flips += run;
-                    break;
-                }
-                run += 1;
-                j += 1;
-            }
-            run = 0;
-            let mut j = i;
-            while j > 0 {
-                j -= 1;
-                if p & (1 << j) != 0 {
-                    flips += run;
-                    break;
-                }
-                run += 1;
-            }
-            table[i][p] = (2 * flips) as u8;
-            p += 1;
-        }
-        i += 1;
-    }
-    table
-};
-
-/// Diagonal masks per square: `[0]` = the ╲ diagonal, `[1]` = the ╱ diagonal.
-const MASK_DIAG: [[u64; 64]; 2] = {
-    let mut m = [[0u64; 64]; 2];
-    let mut pos = 0;
-    while pos < 64 {
-        let x = (pos % 8) as i32;
-        let y = (pos / 8) as i32;
-        let mut sq = 0;
-        while sq < 64 {
-            let sx = sq % 8;
-            let sy = sq / 8;
-            if sx - sy == x - y {
-                m[0][pos] |= 1u64 << sq;
-            }
-            if sx + sy == x + y {
-                m[1][pos] |= 1u64 << sq;
-            }
-            sq += 1;
-        }
-        pos += 1;
-    }
-    m
-};
-
-/// Gather column `x` (bits x, x+8, …, x+56) into 8 contiguous bits, bit r = row r.
-#[inline]
-fn pack_v(p: u64, x: u32) -> usize {
-    (((p >> x) & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize
-}
-
-/// Gather a diagonal-masked bitboard into 8 bits, bit c = column c.
-#[inline]
-fn pack_d(pm: u64) -> usize {
-    (pm.wrapping_mul(0x0101_0101_0101_0101) >> 56) as usize
-}
-
-/// 2× the discs `player` flips by playing at `pos`, valid only when `pos` is the
-/// board's only empty square (the [`solve_1`] invariant).
-pub(super) fn count_last_flip(pos: u32, player: u64) -> i32 {
-    let x = (pos & 7) as usize;
-    let y = (pos >> 3) as usize;
-    let mut n = COUNT_FLIP[x][((player >> (y * 8)) & 0xFF) as usize]; // row
-    n += COUNT_FLIP[y][pack_v(player, x as u32)]; // column
-    n += COUNT_FLIP[x][pack_d(player & MASK_DIAG[0][pos as usize])]; // ╲
-    n += COUNT_FLIP[x][pack_d(player & MASK_DIAG[1][pos as usize])]; // ╱
-    n as i32
 }
 
 /// 1-empty leaf solver: exact score from `player`'s perspective for a full board

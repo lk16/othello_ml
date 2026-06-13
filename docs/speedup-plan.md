@@ -110,6 +110,17 @@ One line each; see the code and `git log` for detail.
   generation it has no use, and enumeration was never the bottleneck. Parity as a
   *primary* ordering key was tried and is a disaster (it overrides mobility —
   nodes ~doubled).
+- **23** CPU-specific `count_last_flip` harness (`src/eval/alphabeta/count_flip/`).
+  Three variants share one signature (`fn(pos, player) -> i32`) behind a fuzz
+  battery (every square × patterns + 500k random near-full boards, all checked
+  against the `table` reference) with a `bench-count-flip` micro-benchmark,
+  mirroring the Step 11 flip harness: `table` (the prior per-line `COUNT_FLIP`
+  lookup, gathered by shift/multiply — kindergarten), `via_flip` (full flip mask
+  via the production flip, then `2×popcount`) and `bmi2` (x86-64 `PEXT` line
+  gather, compiled only on x86-64). **`table` stays the production default** —
+  fastest on the AMD dev box (2.4 vs `via_flip` 8.7 vs `bmi2` 51 ns/flip micro);
+  BMI2 PEXT is microcoded and slow on AMD, same as the Step 11 flip story, so it
+  is `cfg`-gated and not auto-selected. See the decision note below.
 
 ## Dead ends & decisions (not in code)
 
@@ -139,6 +150,15 @@ One line each; see the code and `git log` for detail.
   `carry64` here. Both stay compiled for `bench-flip` and future Intel tuning,
   but production uses the portable `carry64` unconditionally. Re-run `bench-flip`
   on an Intel (Haswell+) box before wiring any per-target override.
+- **Step 23 `count_last_flip` variants — same outcome as Step 11.** The `bmi2`
+  PEXT gather was ~21× *slower* than the portable `table` lookup on the AMD dev
+  box (51 vs 2.4 ns/flip), and `via_flip` (recompute the full flip mask, then
+  `2×popcount`) was ~3.6× slower (8.7 ns) — paying for a whole flip mask where a
+  per-line count needs only four table reads. The `table` variant (the original
+  kindergarten lookup) stays the production default; `bmi2` is kept compiled for
+  `bench-count-flip` and future Intel tuning behind the same `cfg` caveat. No
+  whole-search change — same node counts, same primitive, just confirmed the
+  existing lookup is already the fastest portable option here.
 
 ## Remaining steps
 
@@ -181,17 +201,6 @@ Note `get_moves` *is* a real cost (not free), and Edax SIMD-accelerates it
 (`get_moves_avx`/`get_moves_sse`) like it does flip. That is a separate primitive
 optimization, independent of the list (cf. Step 11's flip harness); our
 `get_moves` is a scalar branchless pass.
-
-### Step 23 — CPU-specific `count_last_flip`
-`count_last_flip` (the doubled flip count for the 1-empty leaf `solve_1`, Step 8)
-is a hot primitive — `solve_1` runs at every 1-empty leaf. We use one portable
-`COUNT_FLIP` table lookup summed over the move's four lines. Edax ships many
-target-specific implementations (`count_last_flip_{bmi2,sse,avx512cd,
-kindergarten,lzcnt,bitscan,…}.c`) selected at compile time. Port a few behind one
-signature + a fuzz battery and bench them, mirroring the Step 11 flip harness,
-picking per target. Same caveat as Step 11: production is baseline x86-64 and
-BMI2 is slow on AMD, so any SIMD pick must be `cfg`-gated and measured — a
-portable variant (carry/kindergarten) is likely the safe default.
 
 ### Step 24 — CPU-specific `get_moves`
 `get_moves` is called at (almost) every interior node to build the move list —
