@@ -13,15 +13,6 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Minimum empties at which the deep search orders moves (by opponent mobility).
-/// Below this, moves are searched in natural order — near the leaves the ordering
-/// work costs more than the pruning it buys. Swept 4..10: lower values cut nodes
-/// but run slower (ordering low-empty nodes costs more than it saves), higher
-/// values explode nodes. Re-swept after the carry-64 flip (Step 11): the cheaper
-/// flip nudged the crossover toward 7, but 6 and 7 are within noise while 6
-/// visits fewer nodes, so 6 stays. Re-tune when the ordering cost/benefit shifts.
-const SORT_MIN_EMPTIES: u32 = 6;
-
 /// Minimum empties at which a null-window node may split its younger siblings
 /// across worker threads (full recursive YBWC, Step 21). Below this a subtree is
 /// too small to amortize the spawn and shared-table lock traffic, so it runs
@@ -37,6 +28,16 @@ const SORT_MIN_EMPTIES: u32 = 6;
 /// dominate); the earlier pre-Step-29 16-thread-only sweep is in git history.
 const SPLIT_MIN_EMPTIES: u32 = 15;
 
+/// Top of the shallow-tier band (Edax `DEPTH_TO_SHALLOW_SEARCH`): empties
+/// `5 ..= SHALLOW_MAX_EMPTIES` use the cheap [`Search::shallow`] path (parity-only
+/// ordering, no move list, no mobility sort, no transposition table) in place of
+/// the mobility-sorted ordered search. A/B'd against the prior unordered-5 +
+/// ordered-6/7 split (Step 30): +30–40% nodes but neutral-to-faster wall-clock,
+/// the win growing with depth and larger in parallel (22e: ~4.5% sequential,
+/// ~11% at 16 threads). NB the empties-list enumeration Edax also ships is not yet
+/// implemented — this uses `get_moves` + a parity mask — so Step 30 is partial.
+const SHALLOW_MAX_EMPTIES: u32 = 7;
+
 /// Region id per square: one of the four board quadrants, as a single bit
 /// (top-left = 1, top-right = 2, bottom-left = 4, bottom-right = 8). Edax's
 /// `QUADRANT_ID`. The board's parity is the XOR of these over its empty squares
@@ -51,6 +52,28 @@ const QUADRANT_ID: [u8; 64] = {
         sq += 1;
     }
     q
+};
+
+/// For each 4-bit region-parity value, the board mask of squares lying in an
+/// odd-parity quadrant (the quadrants whose [`QUADRANT_ID`] bit is set in the
+/// parity). The shallow tier ([`Search::shallow`]) ANDs this with the legal moves
+/// to visit odd-region moves first — parity ordering with no list, no sort.
+const PARITY_MASK: [u64; 16] = {
+    let mut table = [0u64; 16];
+    let mut p = 0usize;
+    while p < 16 {
+        let mut m = 0u64;
+        let mut sq = 0usize;
+        while sq < 64 {
+            if (QUADRANT_ID[sq] as usize) & p != 0 {
+                m |= 1u64 << sq;
+            }
+            sq += 1;
+        }
+        table[p] = m;
+        p += 1;
+    }
+    table
 };
 
 /// Region parity of `pos`: XOR of [`QUADRANT_ID`] over its empty squares. Used to
@@ -288,8 +311,8 @@ impl Search {
         }
     }
 
-    /// Full-window dispatch by `empties`: leaf solver (≤4), unordered search
-    /// (below `SORT_MIN_EMPTIES`), else the ordered PVS search.
+    /// Full-window dispatch by `empties`: leaf solver (≤4), shallow tier
+    /// (`5 ..= SHALLOW_MAX_EMPTIES`), else the ordered PVS search.
     #[inline]
     pub(super) fn search_exact(
         &mut self,
@@ -300,8 +323,8 @@ impl Search {
     ) -> i32 {
         if empties <= 4 {
             self.solve_leaf(pos, alpha, beta, empties)
-        } else if empties < SORT_MIN_EMPTIES {
-            self.alphabeta_nosort(pos, alpha, beta, empties)
+        } else if empties <= SHALLOW_MAX_EMPTIES {
+            self.shallow(pos, alpha, beta, empties)
         } else {
             self.alphabeta_exact(pos, alpha, beta, empties)
         }
@@ -314,8 +337,8 @@ impl Search {
     fn search_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
         if empties <= 4 {
             self.solve_leaf(pos, alpha, alpha + 1, empties)
-        } else if empties < SORT_MIN_EMPTIES {
-            self.alphabeta_nosort_nws(pos, alpha, empties)
+        } else if empties <= SHALLOW_MAX_EMPTIES {
+            self.shallow_nws(pos, alpha, empties)
         } else {
             self.alphabeta_exact_nws(pos, alpha, empties)
         }
@@ -342,7 +365,7 @@ impl Search {
         buf
     }
 
-    /// Ordered negamax with PVS for `empties >= SORT_MIN_EMPTIES`. Consults the
+    /// Ordered negamax with PVS for `empties > SHALLOW_MAX_EMPTIES`. Consults the
     /// transposition table (at `empties >= TT_MIN_EMPTIES`) for a cutoff bound,
     /// hash move, and bound write-back.
     fn alphabeta_exact(
@@ -475,48 +498,6 @@ impl Search {
                 (alpha as i8, alpha as i8)
             };
             self.tt_store(pos, lower, upper, best_cell);
-        }
-
-        alpha
-    }
-
-    /// Negamax with PVS but no move ordering, for the `5 ..< SORT_MIN_EMPTIES`
-    /// range. Moves are tried in natural board order with no move-list allocation.
-    fn alphabeta_nosort(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
-        self.nodes += 1;
-
-        let moves = pos.get_moves();
-        if moves == 0 {
-            let passed = pos.pass_move();
-            if passed.get_moves() == 0 {
-                return pos.final_score();
-            }
-            return -self.alphabeta_nosort(&passed, -beta, -alpha, empties);
-        }
-
-        let mut first = true;
-        let mut remaining = moves;
-        while remaining != 0 {
-            let cell = remaining.trailing_zeros();
-            remaining &= remaining - 1;
-            let child = pos.do_move(cell);
-            let score = if first {
-                -self.search_exact(&child, -beta, -alpha, empties - 1)
-            } else {
-                let probe = -self.search_exact_nws(&child, -alpha - 1, empties - 1);
-                if probe > alpha && probe < beta {
-                    -self.search_exact(&child, -beta, -alpha, empties - 1)
-                } else {
-                    probe
-                }
-            };
-            first = false;
-            if score > alpha {
-                alpha = score;
-                if alpha >= beta {
-                    break;
-                }
-            }
         }
 
         alpha
@@ -730,11 +711,22 @@ impl Search {
         outcome
     }
 
-    /// Null-window counterpart of [`Search::alphabeta_nosort`]: natural order, no
-    /// re-search, first fail-high cuts.
-    fn alphabeta_nosort_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+    /// Shallow tier (Step 30) for `5 ..= SHALLOW_MAX_EMPTIES`: PVS with
+    /// parity-only move ordering (odd-parity quadrants first) — no move list, no
+    /// mobility sort, no transposition table — keeping only the cheap stability
+    /// cutoff. Recurses through [`Search::search_exact`], which dispatches the leaf
+    /// solvers at `<= 4` empties.
+    fn shallow(&mut self, pos: &Position, mut alpha: i32, beta: i32, empties: u32) -> i32 {
         self.nodes += 1;
-        let beta = alpha + 1;
+        debug_assert_eq!(self.parity, board_parity(pos), "parity desync (shallow)");
+
+        if alpha >= STABILITY_THRESHOLD[empties as usize] {
+            let stable = get_stability(self.edge_stability, pos.opponent, pos.player) as i32;
+            let bound = SCORE_MAX - 2 * stable;
+            if bound <= alpha {
+                return bound;
+            }
+        }
 
         let moves = pos.get_moves();
         if moves == 0 {
@@ -742,19 +734,85 @@ impl Search {
             if passed.get_moves() == 0 {
                 return pos.final_score();
             }
-            return -self.alphabeta_nosort_nws(&passed, -beta, empties);
+            return -self.shallow(&passed, -beta, -alpha, empties);
         }
 
+        // Parity ordering: odd-region moves first, then the rest. No list, no sort.
+        let odd = moves & PARITY_MASK[self.parity as usize];
+        let mut first = true;
+        for group in [odd, moves & !odd] {
+            let mut remaining = group;
+            while remaining != 0 {
+                let cell = remaining.trailing_zeros();
+                remaining &= remaining - 1;
+                let child = pos.do_move(cell);
+                self.parity ^= QUADRANT_ID[cell as usize];
+                let score = if first {
+                    -self.search_exact(&child, -beta, -alpha, empties - 1)
+                } else {
+                    let probe = -self.search_exact_nws(&child, -alpha - 1, empties - 1);
+                    if probe > alpha && probe < beta {
+                        -self.search_exact(&child, -beta, -alpha, empties - 1)
+                    } else {
+                        probe
+                    }
+                };
+                self.parity ^= QUADRANT_ID[cell as usize];
+                first = false;
+                if score > alpha {
+                    alpha = score;
+                    if alpha >= beta {
+                        return alpha;
+                    }
+                }
+            }
+        }
+        alpha
+    }
+
+    /// Null-window counterpart of [`Search::shallow`] (window `[alpha, alpha + 1]`):
+    /// parity-ordered, no re-search, first fail-high cuts the node.
+    fn shallow_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+        self.nodes += 1;
+        debug_assert_eq!(
+            self.parity,
+            board_parity(pos),
+            "parity desync (shallow nws)"
+        );
+        let beta = alpha + 1;
+
+        if alpha >= STABILITY_THRESHOLD[empties as usize] {
+            let stable = get_stability(self.edge_stability, pos.opponent, pos.player) as i32;
+            let bound = SCORE_MAX - 2 * stable;
+            if bound <= alpha {
+                return bound;
+            }
+        }
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.shallow_nws(&passed, -beta, empties);
+        }
+
+        let odd = moves & PARITY_MASK[self.parity as usize];
         let mut best = alpha;
-        let mut remaining = moves;
-        while remaining != 0 {
-            let cell = remaining.trailing_zeros();
-            remaining &= remaining - 1;
-            let child = pos.do_move(cell);
-            let score = -self.search_exact_nws(&child, -beta, empties - 1);
-            if score > best {
-                best = score;
-                break;
+        'search: for group in [odd, moves & !odd] {
+            let mut remaining = group;
+            while remaining != 0 {
+                let cell = remaining.trailing_zeros();
+                remaining &= remaining - 1;
+                let child = pos.do_move(cell);
+                self.parity ^= QUADRANT_ID[cell as usize];
+                let score = -self.search_exact_nws(&child, -beta, empties - 1);
+                self.parity ^= QUADRANT_ID[cell as usize];
+                if score > best {
+                    best = score;
+                    break 'search;
+                }
             }
         }
 

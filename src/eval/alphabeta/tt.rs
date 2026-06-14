@@ -18,15 +18,15 @@ const TT_BITS: u32 = 19;
 pub(super) const TT_SIZE: usize = 1 << TT_BITS;
 const TT_MASK: u64 = TT_SIZE as u64 - 1;
 
-/// Minimum empties at which the table is consulted. The TT is only wired into
-/// the ordered search, so the effective floor is `max(SORT_MIN_EMPTIES, this)`.
-/// Swept 6..10 (8/10 clearly lose). Originally 6 and 7 tied so 7 was kept;
-/// re-swept after the carry-64 flip (Step 11) made nodes cheaper, 6 now wins
-/// reproducibly (16e 13.7 vs 14.1ms, 18e 76.5 vs 78.6) and visits ~6% fewer
-/// nodes (it probes/stores the numerous empties-6 nodes, enabling more cuts).
-/// Re-swept jointly with `ETC_MIN_EMPTIES` after the Step 6b ordering change:
-/// (6,7) keeps the fewest nodes at neutral wall-clock (raising either floor cuts
-/// no time but adds nodes), so unchanged.
+/// Minimum empties at which the table is consulted. The TT is only wired into the
+/// ordered search, which since the shallow tier (Step 30) runs at `empties >
+/// SHALLOW_MAX_EMPTIES` (≥ 8), so the *effective* floor is now 8 — values of this
+/// const below 8 no longer change behavior (empties 6–7 are searched without the
+/// TT). The historical sweep below predates Step 30, when 6/7 were TT-ordered
+/// nodes: swept 6..10 (8/10 clearly lose); 6 then beat 7 (16e 13.7 vs 14.1ms, 18e
+/// 76.5 vs 78.6, ~6% fewer nodes by probing/storing the numerous empties-6 nodes),
+/// re-swept jointly with `ETC_MIN_EMPTIES` after Step 6b. Kept at 6; re-tune
+/// alongside `SHALLOW_MAX_EMPTIES` if the shallow band moves.
 pub(super) const TT_MIN_EMPTIES: u32 = 6;
 
 /// Minimum empties at which the ordered search runs Enhanced Transposition
