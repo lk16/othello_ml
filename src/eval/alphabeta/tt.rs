@@ -8,7 +8,7 @@
 
 use super::search::Search;
 use crate::othello::position::Position;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Table size as a power of two. Swept 17..23: node counts barely move above
 /// ~2^19 (collisions already rare at benchmarked depths), so the win is cache
@@ -64,71 +64,114 @@ impl Default for TtEntry {
     }
 }
 
-/// Number of mutex shards for the shared (parallel) table, as a power of two.
-/// Probes scatter across slots, so with a handful of worker threads contention
-/// on any one shard is rare; 1024 keeps lock traffic spread while the per-shard
-/// allocation overhead stays trivial.
-const TT_SHARD_BITS: u32 = 10;
-const TT_SHARDS: usize = 1 << TT_SHARD_BITS;
-/// Slots per shard. The high `TT_SHARD_BITS` of a slot index pick the shard.
-const TT_SHARD_SLOTS: usize = TT_SIZE >> TT_SHARD_BITS;
-
 /// Transposition table backing for a [`Search`]: either a private `Vec` (the
-/// single-threaded path — no synchronization) or a handle to a sharded,
-/// mutex-guarded table shared by parallel YBWC workers (Step 21). A given
-/// `Search` is always one variant, so the dispatch branch is well-predicted.
+/// single-threaded path — no synchronization) or a handle to a lock-free table
+/// shared by parallel YBWC workers (Step 21/29). A given `Search` is always one
+/// variant, so the dispatch branch is well-predicted.
 pub(super) enum TtBackend {
     Owned(Vec<TtEntry>),
     Shared(std::sync::Arc<SharedTt>),
 }
 
-/// Sharded concurrent transposition table for parallel search. The slot array is
-/// split into [`TT_SHARDS`] contiguous mutex-guarded ranges; an entry access
-/// locks only its shard. Full-position-keyed like the owned table, so it stays
-/// exactly correct (no torn reads, no partial-key collisions); a stored bound is
-/// valid for the position's intrinsic score regardless of which worker wrote it.
+/// One lock-free slot, Hyatt XOR-validated ("lockless hashing"). The 128-bit key
+/// (`player`, `opponent`) plus the packed payload exceed any single atomic, so
+/// instead of a lock the three words are tied together by XOR: `w0 = player ^
+/// data`, `w1 = opponent ^ data`, `w2 = data`. A reader recovers `data = w2`,
+/// `player = w0 ^ data`, `opponent = w1 ^ data` and accepts the entry only on a
+/// full-key match. A torn read — words observed from two different writes — yields
+/// at least one mismatched word, so the recovered key fails the compare and the
+/// slot reads as a miss (the searcher just recomputes). Correctness is purely
+/// value-based, so plain `Relaxed` atomics suffice: no fence, no per-slot lock.
+struct Slot {
+    w0: AtomicU64,
+    w1: AtomicU64,
+    w2: AtomicU64,
+}
+
+impl Slot {
+    fn empty() -> Self {
+        Slot {
+            w0: AtomicU64::new(0),
+            w1: AtomicU64::new(0),
+            w2: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Pack the payload (score bounds + best move) into one word.
+#[inline]
+fn pack_data(lower: i8, upper: i8, best_move: u8) -> u64 {
+    (lower as u8 as u64) | ((upper as u8 as u64) << 8) | ((best_move as u64) << 16)
+}
+
+/// Lock-free concurrent transposition table for parallel search: a flat array of
+/// XOR-validated [`Slot`]s, no sharding and no mutex. Full-position-keyed like the
+/// owned table, so a stored bound is valid for the position's intrinsic score
+/// regardless of which worker wrote it.
 pub(super) struct SharedTt {
-    shards: Vec<Mutex<Box<[TtEntry]>>>,
+    slots: Box<[Slot]>,
 }
 
 impl SharedTt {
     pub(super) fn new() -> Self {
-        let shards = (0..TT_SHARDS)
-            .map(|_| Mutex::new(vec![TtEntry::default(); TT_SHARD_SLOTS].into_boxed_slice()))
-            .collect();
-        SharedTt { shards }
+        let slots = (0..TT_SIZE).map(|_| Slot::empty()).collect();
+        SharedTt { slots }
     }
 
-    /// Probe `pos`; returns the entry on an exact (full-position) hit.
+    /// Probe `pos`; returns the entry on an exact (full-position) hit. A torn or
+    /// foreign slot recovers a non-matching key and returns `None`.
     #[inline]
     fn probe(&self, pos: &Position) -> Option<TtEntry> {
-        let idx = tt_index(pos.player, pos.opponent);
-        let shard = self.shards[idx >> (TT_BITS - TT_SHARD_BITS)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let e = shard[idx & (TT_SHARD_SLOTS - 1)];
-        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
-            Some(e)
+        let slot = &self.slots[tt_index(pos.player, pos.opponent)];
+        let data = slot.w2.load(Ordering::Relaxed);
+        let player = slot.w0.load(Ordering::Relaxed) ^ data;
+        let opponent = slot.w1.load(Ordering::Relaxed) ^ data;
+        if player == pos.player && opponent == pos.opponent && (player | opponent) != 0 {
+            Some(TtEntry {
+                player,
+                opponent,
+                lower: data as u8 as i8,
+                upper: (data >> 8) as u8 as i8,
+                best_move: (data >> 16) as u8,
+            })
         } else {
             None
         }
     }
 
-    /// Record a `[lower, upper]` bound (and best move) for `pos`, with the same
-    /// intersect-or-replace policy as the owned table.
+    /// Record a `[lower, upper]` bound (and best move) for `pos`. Best-effort
+    /// merge: if the slot still holds this position the bounds are intersected and
+    /// a real best move kept (same policy as the owned table), else replace. The
+    /// read-modify-write is not atomic, but a lost race only drops a refinement —
+    /// every written bound is independently valid — so the table stays exact, the
+    /// same trade-off Edax makes for its lockless table.
     #[inline]
     fn store(&self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
-        let idx = tt_index(pos.player, pos.opponent);
-        let mut shard = self.shards[idx >> (TT_BITS - TT_SHARD_BITS)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        merge_entry(
-            &mut shard[idx & (TT_SHARD_SLOTS - 1)],
-            pos,
-            lower,
-            upper,
-            best_move,
-        );
+        let slot = &self.slots[tt_index(pos.player, pos.opponent)];
+        let (mut lo, mut hi, mut bm) = (lower, upper, best_move);
+        let cur_data = slot.w2.load(Ordering::Relaxed);
+        let cur_player = slot.w0.load(Ordering::Relaxed) ^ cur_data;
+        let cur_opponent = slot.w1.load(Ordering::Relaxed) ^ cur_data;
+        if cur_player == pos.player
+            && cur_opponent == pos.opponent
+            && (cur_player | cur_opponent) != 0
+        {
+            let cur_lo = cur_data as u8 as i8;
+            let cur_hi = (cur_data >> 8) as u8 as i8;
+            if cur_lo > lo {
+                lo = cur_lo;
+            }
+            if cur_hi < hi {
+                hi = cur_hi;
+            }
+            if bm == NO_MOVE {
+                bm = (cur_data >> 16) as u8;
+            }
+        }
+        let data = pack_data(lo, hi, bm);
+        slot.w0.store(pos.player ^ data, Ordering::Relaxed);
+        slot.w1.store(pos.opponent ^ data, Ordering::Relaxed);
+        slot.w2.store(data, Ordering::Relaxed);
     }
 }
 

@@ -158,10 +158,12 @@ mod tests {
             rng
         };
 
-        let par = ParallelSolver::new(4);
+        // 16 workers stresses the lock-free table's torn-read path under real
+        // contention — the failure mode a low thread count would hide (Step 29).
+        let par = ParallelSolver::new(16);
         let mut seq = Solver::new();
         let mut checked = 0;
-        for _ in 0..6 {
+        for _ in 0..12 {
             // Play random moves down to ~16 empties from the initial position.
             let mut pos = Position::initial();
             while pos.empties() > 16 {

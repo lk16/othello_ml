@@ -165,6 +165,23 @@ One line each; see the code and `git log` for detail.
   with a *zeroed* `[T; 34]` was ~2–3% *slower* (the forced init outweighed the
   cheap malloc) — `MaybeUninit` is what removes the init, exactly as C leaves the
   stack array untouched.
+- **29** lock-free transposition table (`tt::SharedTt`). The shared table was a
+  sharded `Mutex<Box<[TtEntry]>>` (Step 21); the lock traffic and guard cache line
+  were the contention ceiling as threads grow. Replaced by a flat array of Hyatt
+  XOR-validated slots ("lockless hashing", as Crafty/Stockfish): the 128-bit key +
+  packed payload exceed any single atomic, so the three `AtomicU64` words are tied
+  by XOR — `w0 = player ^ data`, `w1 = opponent ^ data`, `w2 = data`. A reader
+  recovers the key and accepts only on a full-key match, so a torn read (words from
+  two writes) recovers a mismatched key and reads as a miss — correctness is purely
+  value-based, so plain `Relaxed` loads/stores suffice (no fence, no per-slot
+  lock). Store is a best-effort merge (intersect bounds / keep a real move, same
+  policy as the owned table); the RMW isn't atomic but a lost race only drops a
+  refinement, never correctness (every written bound is independently valid — the
+  Edax trade-off). Same 24 B/slot as the old padded entry, no sharding, no new
+  dependency. The sequential `Owned` `Vec` path is **untouched** (16e 281,927
+  nodes/pos, ms unchanged). Parallel wall-clock at 16t: **20e 179 → 141 ms
+  (~1.27×), 22e 676 → 519 ms (~1.30×)**. The 16-thread `ParallelSolver`-vs-`Solver`
+  score-equality test guards the torn-read path under real contention.
 
 ## Dead ends & decisions (not in code)
 
@@ -245,8 +262,9 @@ One line each; see the code and `git log` for detail.
 
 ## Remaining steps
 
-Steps 1–24 are implemented or resolved. The five below come from a **callgrind
-profile of the sequential hot path** (release + debug symbols, 16e, 150 boards).
+Steps 1–25 and 29 are implemented or resolved. The four below come from a
+**callgrind profile of the sequential hot path** (release + debug symbols, 16e,
+150 boards).
 These are *instruction counts*, so cache misses, branch mispredicts, and the
 parallel TT contention are not captured — `perf` is the missing wall-clock /
 cache view, blocked on this box by `perf_event_paranoid = 4` (needs root to
@@ -281,15 +299,6 @@ AMD re-bench has lost (microcoded PEXT; `target_feature` boundary blocks
 inlining). Re-run `bench-flip` / `bench-get-moves` and the search on a Haswell+
 box and wire a `cfg`/runtime override only if measured. The single largest latent
 lever, but gated on hardware we do not have here.
-
-### Step 29 — Lock-free transposition table
-The shared table is sharded `Mutex<Box<[TtEntry]>>` (Step 21); the lock traffic
-and the guard's cache line are the contention ceiling as thread counts grow (the
-sequential path also pays one predicted branch plus an uncontended lock via the
-`Shared` arm). A lock-free design — Hyatt XOR-validated atomic entries, or a
-per-slot seqlock — would cut that, but must stay *exactly* correct (full-key
-validation, no torn reads), since the solver is reference-tested. The main lever
-left for multi-core scaling beyond what recursive YBWC already gave.
 
 ### Step 30 — Edax's shallow-search tier (make/unmake + parity order, no move list)
 Edax keeps no heap in its search: the `MoveList` is a stack local (`Move
