@@ -231,11 +231,60 @@ One line each; see the code and `git log` for detail.
 
 ## Remaining steps
 
-All roadmap steps (1–24) are implemented or resolved. Possible further parallel
-work, none started: split PV nodes too (the spine is currently sequential — minor,
-the spine is O(depth) nodes); a lock-free transposition table (the sharded mutex
-is the contention ceiling as thread counts grow); NUMA-aware table sharding; and a
-re-sweep of `SPLIT_MIN_EMPTIES` / shard count on an Intel box. The primitive
-harnesses (`bench-flip`, `bench-count-flip`, `bench-get-moves`) also remain to be
-re-run on a Haswell+ CPU where the SIMD variants may finally win (see the Step 11
-/ 23 / 24 notes).
+Steps 1–24 are implemented or resolved. The five below come from a **callgrind
+profile of the sequential hot path** (release + debug symbols, 16e, 150 boards).
+These are *instruction counts*, so cache misses, branch mispredicts, and the
+parallel TT contention are not captured — `perf` is the missing wall-clock /
+cache view, blocked on this box by `perf_event_paranoid = 4` (needs root to
+lower). Self-cost ranking: **flip ~31%** (already maximal — Steps 11/15),
+**`get_moves` ~17%** (per-node move-gen *and* per-child `order_score` mobility),
+`alphabeta_exact_nws` bookkeeping ~12%, `solve_1`/`count_last_flip` ~6%,
+`tt_probe`/`store` ~3%, **`malloc`/`free` ~2.7%** (the per-node move-list `Vec`),
+per-node `get_stability` ~1%. (The `find_edge_stable` ~17% seen in a *short* run
+is the one-time `OnceLock` edge-table build, not a hot-path cost — it amortizes
+to ~0 as boards grow; likewise `memchr`/`CharSearcher` ~1% is PGN parsing at
+load.)
+
+### Step 25 — Eliminate the per-node move-list allocation
+The ordered search (`alphabeta_exact` / `_nws`) builds `move_list` with a fresh
+`Vec::with_capacity` per node — ~2.7% of instructions go to `malloc`/`free`.
+Legal moves number ≤ ~32 and `Position` is 16 B, so a fixed stack array
+(`[(i32, u32, Position); 34]` + a length, ArrayVec-style) removes the heap
+traffic entirely and deterministically, with no behaviour change — and drops
+allocator contention on the parallel path too. Lowest-risk win; do first.
+
+### Step 26 — AVX2 `get_moves` in the real search
+`get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-
+benchmark that was call-overhead-bound (7.81 vs 7.24 ns/call). At 17% of real
+work a 10%-faster primitive is ~1.7% overall, so A/B the `avx2` variant *inside
+the search* (not the micro-bench), `cfg`-gated since it is Intel-favorable. May
+still lose on this AMD box — measure in `bench`, keep only if it wins.
+
+### Step 27 — Cheaper move-ordering mobility
+Most of the `get_moves` cost is `order_score` running a full `get_moves` +
+popcount for *every* child. Edax's "potential mobility" (empties adjacent to
+opponent discs — a cheap bitboard dilation, no occluded fill) is a candidate
+proxy. Risk is the recurring lesson (Steps 6b/22): ordering *quality* dominates
+ordering *cost*, so a weaker key can cost more nodes than it saves. A/B in node
+count first; pursue only if mobility can be cheapened without loosening the order.
+
+### Step 28 — SIMD flip / `get_moves` on Intel
+flip (~31%) and `get_moves` (~17%) are the two biggest primitives, and their
+`avx2`/`bmi2` variants (Steps 11/24, already in-tree) only win on Intel — every
+AMD re-bench has lost (microcoded PEXT; `target_feature` boundary blocks
+inlining). Re-run `bench-flip` / `bench-get-moves` and the search on a Haswell+
+box and wire a `cfg`/runtime override only if measured. The single largest latent
+lever, but gated on hardware we do not have here.
+
+### Step 29 — Lock-free transposition table
+The shared table is sharded `Mutex<Box<[TtEntry]>>` (Step 21); the lock traffic
+and the guard's cache line are the contention ceiling as thread counts grow (the
+sequential path also pays one predicted branch plus an uncontended lock via the
+`Shared` arm). A lock-free design — Hyatt XOR-validated atomic entries, or a
+per-slot seqlock — would cut that, but must stay *exactly* correct (full-key
+validation, no torn reads), since the solver is reference-tested. The main lever
+left for multi-core scaling beyond what recursive YBWC already gave.
+
+Minor / opportunistic, not numbered: split PV nodes too (the spine is O(depth)
+nodes — small); NUMA-aware shard placement; re-sweep `SPLIT_MIN_EMPTIES` and the
+shard count on other hardware.
