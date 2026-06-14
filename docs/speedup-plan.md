@@ -249,6 +249,21 @@ One line each; see the code and `git log` for detail.
   worth it as a move-gen lever (enumeration was never the bottleneck; cf. Step 19)
   nor as an ordering one. If the parallel split (Step 21) later wants an O(1)
   incremental empties structure, the safe-arena design here is the template.
+- **Step 27 — cheaper move-ordering mobility (A/B'd, reverted).** `order_score`
+  runs a full `get_moves` + popcount per child (the bulk of the ~17% `get_moves`
+  hot cost), so the mobility term was swapped for Edax's *potential mobility*
+  (empties adjacent to opponent discs — one file-masked bitboard dilation, no
+  occluded fill) behind a `const USE_POTENTIAL_MOBILITY`, A/B'd on sequential
+  (deterministic) node counts. The proxy visits **1.49× the nodes at 14e, 1.63× at
+  16e, 1.78× at 18e** (56.6k→84.5k; 282k→459k; 1.38M→2.46M) — the penalty *grows*
+  with depth — for **30–55% slower** wall-clock (16e 10.4→14.5ms, 18e 52.4→81.1ms)
+  despite the cheaper per-node key. Same outcome as Step 22's static order:
+  potential mobility is a much looser ordering signal than exact mobility, and
+  ordering quality dominates ordering cost by a wide margin. **Reverted.** Cheapening
+  the mobility probe is a dead end *unless* a proxy can be found that does not
+  loosen the order — none of the cheap candidates (static `SQUARE_VALUE`, parity,
+  potential mobility) clear that bar. The `get_moves`-in-`order_score` cost is real
+  but the exact key is load-bearing.
 - **Step 21 root-only YBWC — built, regressed, superseded.** The first cut split
   only the *root's* siblings (eldest sequential to set alpha, the rest in
   parallel). It regressed and got *worse* with threads (20e ms/pos: 337 / 365 /
@@ -262,7 +277,7 @@ One line each; see the code and `git log` for detail.
 
 ## Remaining steps
 
-Steps 1–25 and 29 are implemented or resolved. The four below come from a
+Steps 1–25, 27 and 29 are implemented or resolved. The three below come from a
 **callgrind profile of the sequential hot path** (release + debug symbols, 16e,
 150 boards).
 These are *instruction counts*, so cache misses, branch mispredicts, and the
@@ -283,14 +298,6 @@ benchmark that was call-overhead-bound (7.81 vs 7.24 ns/call). At 17% of real
 work a 10%-faster primitive is ~1.7% overall, so A/B the `avx2` variant *inside
 the search* (not the micro-bench), `cfg`-gated since it is Intel-favorable. May
 still lose on this AMD box — measure in `bench`, keep only if it wins.
-
-### Step 27 — Cheaper move-ordering mobility
-Most of the `get_moves` cost is `order_score` running a full `get_moves` +
-popcount for *every* child. Edax's "potential mobility" (empties adjacent to
-opponent discs — a cheap bitboard dilation, no occluded fill) is a candidate
-proxy. Risk is the recurring lesson (Steps 6b/22): ordering *quality* dominates
-ordering *cost*, so a weaker key can cost more nodes than it saves. A/B in node
-count first; pursue only if mobility can be cheapened without loosening the order.
 
 ### Step 28 — SIMD flip / `get_moves` on Intel
 flip (~31%) and `get_moves` (~17%) are the two biggest primitives, and their
