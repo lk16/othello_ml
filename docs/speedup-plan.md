@@ -151,6 +151,20 @@ One line each; see the code and `git log` for detail.
   amortize the speculative-node overhead (+45–83% nodes). `SPLIT_MIN_EMPTIES = 14`
   (swept). Node counts are non-deterministic under threads; scores stay exact
   (a `ParallelSolver`-vs-`Solver` score-equality test guards it).
+- **25** stack move buffer (`search::MoveBuf`). The ordered search built its
+  `move_list` with a per-node heap `Vec` — ~2.7% of *instructions* in
+  `malloc`/`free` (callgrind). Replaced by a `MaybeUninit<[(i32,u32,Position);
+  34]>` + length, written/read only over `[..len]` — the model is Edax's
+  uninitialized stack `Move move[34]` (`MAX_MOVE = 33`). One localized
+  `#[allow(unsafe_code)]` for the init-prefix→`&[T]` cast (write-before-read
+  invariant; layout-compatible). Identical node counts. **Sequentially neutral**
+  (16e ~10.5ms either way — the allocator fast path is cheap in *cycles* even
+  when it is 2.7% of *instructions*; the instruction win does not convert), but
+  **~2–5% faster in parallel** (20e: t=8 171 vs 179 ms, t=16 ~160 vs ~164) by
+  relieving cross-thread allocator contention under YBWC. A first safe attempt
+  with a *zeroed* `[T; 34]` was ~2–3% *slower* (the forced init outweighed the
+  cheap malloc) — `MaybeUninit` is what removes the init, exactly as C leaves the
+  stack array untouched.
 
 ## Dead ends & decisions (not in code)
 
@@ -245,14 +259,6 @@ is the one-time `OnceLock` edge-table build, not a hot-path cost — it amortize
 to ~0 as boards grow; likewise `memchr`/`CharSearcher` ~1% is PGN parsing at
 load.)
 
-### Step 25 — Eliminate the per-node move-list allocation
-The ordered search (`alphabeta_exact` / `_nws`) builds `move_list` with a fresh
-`Vec::with_capacity` per node — ~2.7% of instructions go to `malloc`/`free`.
-Legal moves number ≤ ~32 and `Position` is 16 B, so a fixed stack array
-(`[(i32, u32, Position); 34]` + a length, ArrayVec-style) removes the heap
-traffic entirely and deterministically, with no behaviour change — and drops
-allocator contention on the parallel path too. Lowest-risk win; do first.
-
 ### Step 26 — AVX2 `get_moves` in the real search
 `get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-
 benchmark that was call-overhead-bound (7.81 vs 7.24 ns/call). At 17% of real
@@ -284,6 +290,31 @@ sequential path also pays one predicted branch plus an uncontended lock via the
 per-slot seqlock — would cut that, but must stay *exactly* correct (full-key
 validation, no torn reads), since the solver is reference-tested. The main lever
 left for multi-core scaling beyond what recursive YBWC already gave.
+
+### Step 30 — Edax's shallow-search tier (make/unmake + parity order, no move list)
+Edax keeps no heap in its search: the `MoveList` is a stack local (`Move
+move[34]`, uninitialized — the model for Step 25's stack buffer). Its make/unmake
+machinery — `board_update`/`board_restore`, the empties-list O(1)
+`remove`/`restore` (`search->empties[prev].next = …`), and copy-make (`vboard_next`
+from a saved parent board) — exists to apply moves *cheaply* (each `Move` carries
+its precomputed `flipped`), not to dodge allocation; the stack array already does
+that.
+
+What we have never tried is Edax's distinct middle tier, `search_shallow`, for
+`n_empties` 5–7 (`DEPTH_TO_SHALLOW_SEARCH = 7`), which deliberately **drops the
+mobility sort**: it orders by **parity only** (priority-quadrant moves first, no
+`order_score`, no sort), walks the **empties list** with O(1) remove/restore,
+applies moves by copy-make, and builds **no move list at all**. We have measured
+the *pieces* and each lost on its own — the empties `SquareList` (Step 22,
+reverted), parity as a primary key (Step 19, nodes ~doubled), cheap/static vs
+dynamic mobility ordering (Step 22 A/B, 4.6–7× nodes), `SORT_MIN_EMPTIES`
+(mobility-sort wins from 6). What is *untested* is the **combination** Edax
+actually ships: parity ordering + empties-list make/unmake + zero move list,
+confined to a thin 5–7 band, where the much cheaper per-node cost might offset the
+extra nodes at the shallowest (most numerous) ordered levels. Speculative and
+against our piecewise evidence, but it is the one unexplored point in that design
+space — worth an A/B in node count and wall-clock if the low-empties ordering /
+allocation cost ever looks worth re-opening.
 
 Minor / opportunistic, not numbered: split PV nodes too (the spine is O(depth)
 nodes — small); NUMA-aware shard placement; re-sweep `SPLIT_MIN_EMPTIES` and the

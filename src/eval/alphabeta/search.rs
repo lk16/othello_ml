@@ -9,6 +9,7 @@ use super::stability::{edge_stability_table, get_stability, STABILITY_THRESHOLD}
 use super::tt::{SharedTt, TtBackend, ETC_MIN_EMPTIES, NO_MOVE, TT_MIN_EMPTIES, TT_SIZE};
 use super::{SCORE_MAX, SCORE_MIN};
 use crate::othello::position::Position;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -106,6 +107,71 @@ fn order_score(child: &Position, cell: u32, parity: u8, parity_weight: i32) -> i
         score += parity_weight;
     }
     score
+}
+
+/// Capacity of the stack move buffer. An Othello position has at most 33 legal
+/// moves; 34 leaves margin. A position with more would panic on `push` (checked
+/// index) rather than corrupt memory — but that cannot happen in real play.
+const MAX_MOVES: usize = 34;
+
+/// Stack-allocated ordered-move buffer of `(order_score, cell, child)` triples,
+/// replacing the per-node heap `Vec` (Step 25). Backed by [`MaybeUninit`] so the
+/// unused tail is never written — the model is Edax's uninitialized stack
+/// `Move move[34]`, which is what makes the per-node buffer free of both heap
+/// traffic and init cost. Invariant: `push` writes indices `0..len` in order and
+/// nothing else, and only `[..len]` is ever read, so the prefix is always a fully
+/// initialized — hence valid — `&[(i32, u32, Position)]`.
+struct MoveBuf {
+    moves: [MaybeUninit<(i32, u32, Position)>; MAX_MOVES],
+    len: usize,
+}
+
+impl MoveBuf {
+    #[inline]
+    fn new() -> Self {
+        // `[MaybeUninit; N]` needs no initialization; the array is left untouched
+        // until `push` writes into it.
+        MoveBuf {
+            moves: [MaybeUninit::uninit(); MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, entry: (i32, u32, Position)) {
+        // `write` initializes slot `len`; the checked index panics rather than
+        // overflowing if a position ever exceeds `MAX_MOVES` (it cannot).
+        self.moves[self.len].write(entry);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[allow(unsafe_code)]
+    fn as_slice(&self) -> &[(i32, u32, Position)] {
+        let init = &self.moves[..self.len];
+        // SAFETY: `push` initialized every index in `0..len`, and `MaybeUninit<T>`
+        // has the same layout as `T`, so the prefix is a valid `&[T]`.
+        unsafe {
+            &*(init as *const [MaybeUninit<(i32, u32, Position)>]
+                as *const [(i32, u32, Position)])
+        }
+    }
+
+    #[inline]
+    #[allow(unsafe_code)]
+    fn as_mut_slice(&mut self) -> &mut [(i32, u32, Position)] {
+        let init = &mut self.moves[..self.len];
+        // SAFETY: as in `as_slice` — every index in `0..len` is initialized.
+        unsafe {
+            &mut *(init as *mut [MaybeUninit<(i32, u32, Position)>]
+                as *mut [(i32, u32, Position)])
+        }
+    }
 }
 
 /// Shared state of one null-window split point (full recursive YBWC, Step 21),
@@ -250,6 +316,27 @@ impl Search {
         }
     }
 
+    /// Build the move list for `pos` (legal `moves`) into a stack buffer, scoring
+    /// each with [`order_score`]. Shared by the PV and null-window ordered nodes.
+    #[inline]
+    fn ordered_moves(&self, pos: &Position, moves: u64, empties: u32) -> MoveBuf {
+        let parity = self.parity;
+        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
+        let mut buf = MoveBuf::new();
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            buf.push((
+                order_score(&child, cell, parity, parity_weight),
+                cell,
+                child,
+            ));
+        }
+        buf
+    }
+
     /// Ordered negamax with PVS for `empties >= SORT_MIN_EMPTIES`. Consults the
     /// transposition table (at `empties >= TT_MIN_EMPTIES`) for a cutoff bound,
     /// hash move, and bound write-back.
@@ -311,25 +398,14 @@ impl Search {
             return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
         }
 
-        let parity = self.parity;
-        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
-        let mut move_list: Vec<(i32, u32, Position)> =
-            Vec::with_capacity(moves.count_ones() as usize);
-        let mut remaining = moves;
-        while remaining != 0 {
-            let cell = remaining.trailing_zeros();
-            remaining &= remaining - 1;
-            let child = pos.do_move(cell);
-            let score = order_score(&child, cell, parity, parity_weight);
-            move_list.push((score, cell, child));
-        }
+        let mut move_list = self.ordered_moves(pos, moves, empties);
 
         // Enhanced Transposition Cutoff: if a child has a stored upper bound, our
         // value for that move is at least `-upper`; if that meets beta the node
         // fails high. Gated at ETC_MIN_EMPTIES so children are deep enough to be
         // stored and the per-child probe pays for itself.
         if empties >= ETC_MIN_EMPTIES {
-            for &(_, cell, ref child) in &move_list {
+            for &(_, cell, ref child) in move_list.as_slice() {
                 if let Some(e) = self.tt_probe(child) {
                     let value = -(e.upper as i32);
                     if value >= beta {
@@ -341,12 +417,18 @@ impl Search {
         }
 
         // Best ordering score first (mobility-dominant; see `order_score`).
-        move_list.sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
+        move_list
+            .as_mut_slice()
+            .sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
 
         // A hash best move is the strongest ordering signal: pull it to the front.
         if hash_move != NO_MOVE {
-            if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
-                move_list[..=i].rotate_right(1);
+            if let Some(i) = move_list
+                .as_slice()
+                .iter()
+                .position(|&(_, c, _)| c as u8 == hash_move)
+            {
+                move_list.as_mut_slice()[..=i].rotate_right(1);
             }
         }
 
@@ -354,7 +436,7 @@ impl Search {
         // each sibling and re-search only on a fail-high.
         let mut best_cell = NO_MOVE;
         let mut first = true;
-        for &(_, cell, ref child) in &move_list {
+        for &(_, cell, ref child) in move_list.as_slice() {
             self.parity ^= QUADRANT_ID[cell as usize];
             let score = if first {
                 -self.search_exact(child, -beta, -alpha, empties - 1)
@@ -488,21 +570,10 @@ impl Search {
             return -self.alphabeta_exact_nws(&passed, -beta, empties);
         }
 
-        let parity = self.parity;
-        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
-        let mut move_list: Vec<(i32, u32, Position)> =
-            Vec::with_capacity(moves.count_ones() as usize);
-        let mut remaining = moves;
-        while remaining != 0 {
-            let cell = remaining.trailing_zeros();
-            remaining &= remaining - 1;
-            let child = pos.do_move(cell);
-            let score = order_score(&child, cell, parity, parity_weight);
-            move_list.push((score, cell, child));
-        }
+        let mut move_list = self.ordered_moves(pos, moves, empties);
 
         if empties >= ETC_MIN_EMPTIES {
-            for &(_, cell, ref child) in &move_list {
+            for &(_, cell, ref child) in move_list.as_slice() {
                 if let Some(e) = self.tt_probe(child) {
                     let value = -(e.upper as i32);
                     if value >= beta {
@@ -513,10 +584,16 @@ impl Search {
             }
         }
 
-        move_list.sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
+        move_list
+            .as_mut_slice()
+            .sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
         if hash_move != NO_MOVE {
-            if let Some(i) = move_list.iter().position(|&(_, c, _)| c as u8 == hash_move) {
-                move_list[..=i].rotate_right(1);
+            if let Some(i) = move_list
+                .as_slice()
+                .iter()
+                .position(|&(_, c, _)| c as u8 == hash_move)
+            {
+                move_list.as_mut_slice()[..=i].rotate_right(1);
             }
         }
 
@@ -527,7 +604,7 @@ impl Search {
         let mut best = alpha;
         let mut best_cell = NO_MOVE;
 
-        let (_, c0, ref ch0) = move_list[0];
+        let (_, c0, ref ch0) = move_list.as_slice()[0];
         self.parity ^= QUADRANT_ID[c0 as usize];
         let s0 = -self.search_exact_nws(ch0, -beta, empties - 1);
         self.parity ^= QUADRANT_ID[c0 as usize];
@@ -541,7 +618,7 @@ impl Search {
 
         if best <= alpha && move_list.len() > 1 {
             if self.par.is_some() && empties >= SPLIT_MIN_EMPTIES {
-                let (pb, pc) = self.split_nws(&move_list, beta, empties);
+                let (pb, pc) = self.split_nws(move_list.as_slice(), beta, empties);
                 if self.is_cancelled() {
                     return best;
                 }
@@ -550,7 +627,7 @@ impl Search {
                     best_cell = pc;
                 }
             } else {
-                for &(_, cell, ref child) in &move_list[1..] {
+                for &(_, cell, ref child) in &move_list.as_slice()[1..] {
                     self.parity ^= QUADRANT_ID[cell as usize];
                     let score = -self.search_exact_nws(child, -beta, empties - 1);
                     self.parity ^= QUADRANT_ID[cell as usize];
