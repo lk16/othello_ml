@@ -26,11 +26,16 @@ const SORT_MIN_EMPTIES: u32 = 6;
 /// across worker threads (full recursive YBWC, Step 21). Below this a subtree is
 /// too small to amortize the spawn and shared-table lock traffic, so it runs
 /// sequentially. Only reached when the search carries a parallel context
-/// ([`Search::par`]); the sequential solver never splits. Swept at 20e/16-thread
-/// (ms/pos): 10→466, 11→327, 12→231, 13→187, **14→179**, 16→216, 18→295 — a clear
-/// knee at 14. Below it the subtrees are too small (spawn + lock traffic +
-/// speculative nodes dominate); above it parallelism is left on the table.
-const SPLIT_MIN_EMPTIES: u32 = 14;
+/// ([`Search::par`]); the sequential solver never splits. Re-swept after the
+/// lock-free TT (Step 29) with larger samples and a thread sweep: at 16 threads 14
+/// and 15 are within ~3% (14 wins 20e, 15 wins 22e/24e), but 15 is the robust
+/// choice — it beats 14 by 10–18% at 24/32 threads, where 14's more aggressive
+/// splitting inflates speculative-node and TT-contention overhead. Best wall-clock
+/// is always at 16 threads (= physical cores on the dev box); hyperthreading (32)
+/// is ~12–18% slower — this search is ALU/cache-bound, so SMT siblings only
+/// contend. Below 14 the subtrees are too small (spawn + speculative nodes
+/// dominate); the earlier pre-Step-29 16-thread-only sweep is in git history.
+const SPLIT_MIN_EMPTIES: u32 = 15;
 
 /// Region id per square: one of the four board quadrants, as a single bit
 /// (top-left = 1, top-right = 2, bottom-left = 4, bottom-right = 8). Edax's
