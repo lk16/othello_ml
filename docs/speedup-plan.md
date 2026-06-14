@@ -132,6 +132,25 @@ One line each; see the code and `git log` for detail.
   7.81 ns/call micro) and portable. `Position::get_moves` now delegates to the
   selected variant; search wall-clock unchanged (18e 54.2 vs 54.0 ms baseline).
   See the decision note below.
+- **21** full recursive YBWC parallel search (`src/eval/alphabeta/parallel.rs` +
+  the split path in `search::alphabeta_exact_nws`). Null-window nodes — the bulk
+  of the tree — split: the eldest child is searched first (it usually cuts: young
+  brothers wait), then on a fail-low the younger siblings are fanned across worker
+  threads, each with its own `Search` but sharing the sharded-mutex transposition
+  table; the first to fail high trips a parent-linked `CancelNode`, so the rest
+  abort without storing. The PV spine (`alphabeta_exact`) stays single-threaded —
+  workers only traverse null-window subtrees — so the dominant eldest subtree
+  parallelizes through *its own* null-window descendants (the fix for the failed
+  root-only attempt, see the decision note). Threads come from nested
+  `std::thread::scope` bounded by a shared budget (`ParCtx`): a split spawns
+  helpers only while live threads < cap, else runs the siblings inline — no pool,
+  no unbounded spawn, no new dependency. Opt-in via `bench --threads`; the
+  sequential `Solver`/owned-table path is untouched (identical node counts, one
+  predicted enum branch). Scaling on the AMD 32-core box (ms/pos): 20e 311→179
+  (1.74× @16t), 22e 1601→676 (2.37× @16t) — better at depth as larger subtrees
+  amortize the speculative-node overhead (+45–83% nodes). `SPLIT_MIN_EMPTIES = 14`
+  (swept). Node counts are non-deterministic under threads; scores stay exact
+  (a `ParallelSolver`-vs-`Solver` score-equality test guards it).
 
 ## Dead ends & decisions (not in code)
 
@@ -199,22 +218,24 @@ One line each; see the code and `git log` for detail.
   worth it as a move-gen lever (enumeration was never the bottleneck; cf. Step 19)
   nor as an ordering one. If the parallel split (Step 21) later wants an O(1)
   incremental empties structure, the safe-arena design here is the template.
+- **Step 21 root-only YBWC — built, regressed, superseded.** The first cut split
+  only the *root's* siblings (eldest sequential to set alpha, the rest in
+  parallel). It regressed and got *worse* with threads (20e ms/pos: 337 / 365 /
+  374 at t=1 / 8 / 16; +55% nodes at t=8) — with strong move ordering the eldest
+  child dominates the work and is searched sequentially, so there is almost
+  nothing left to parallelize at the root (Amdahl), while the speculative sibling
+  work and lock traffic only add overhead. Real scaling requires splitting *inside*
+  that eldest subtree, i.e. at the interior null-window nodes — which is exactly
+  the committed full recursive YBWC (Step 21 above). Root-only is precisely why
+  Edax splits recursively rather than at the root.
 
 ## Remaining steps
 
-### Step 21 — Parallel search (YBWC)
-Young Brothers Wait Concept: the standard way to parallelize alpha-beta, and how
-Edax uses multiple cores. At a node, search the eldest child sequentially first
-— that establishes alpha (and at a cut node usually causes the cutoff, so no
-siblings are searched at all). Only once it returns are the younger siblings
-searched in parallel across threads, with the narrowed window making each
-cheaper; a sibling that fails high aborts the rest. Edax carries the machinery:
-a thread pool, per-thread `Search` state, split points (`search->child[]`, task
-stacks, spinlocks), and abort signalling.
-
-Cost on our side: a thread pool, per-thread search state, and a **thread-safe
-transposition table** (today's `&mut Vec<TtEntry>` would become a shared
-concurrent table, or per-thread tables merged periodically — exact scores stay
-path-independent, so lossy sharing is still correct). It is the main lever left
-for wall-clock on multi-core, but the only one that adds real concurrency
-complexity; everything else so far is single-threaded. Not started.
+All roadmap steps (1–24) are implemented or resolved. Possible further parallel
+work, none started: split PV nodes too (the spine is currently sequential — minor,
+the spine is O(depth) nodes); a lock-free transposition table (the sharded mutex
+is the contention ceiling as thread counts grow); NUMA-aware table sharding; and a
+re-sweep of `SPLIT_MIN_EMPTIES` / shard count on an Intel box. The primitive
+harnesses (`bench-flip`, `bench-count-flip`, `bench-get-moves`) also remain to be
+re-run on a Haswell+ CPU where the SIMD variants may finally win (see the Step 11
+/ 23 / 24 notes).

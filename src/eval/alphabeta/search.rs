@@ -4,10 +4,13 @@
 //! to `alpha + 1` on the NWS path — the bulk of the tree — and drop the PVS
 //! re-search machinery there.
 
+use super::parallel::{CancelNode, ParCtx};
 use super::stability::{edge_stability_table, get_stability, STABILITY_THRESHOLD};
-use super::tt::{TtEntry, ETC_MIN_EMPTIES, NO_MOVE, TT_MIN_EMPTIES, TT_SIZE};
+use super::tt::{SharedTt, TtBackend, ETC_MIN_EMPTIES, NO_MOVE, TT_MIN_EMPTIES, TT_SIZE};
 use super::{SCORE_MAX, SCORE_MIN};
 use crate::othello::position::Position;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Minimum empties at which the deep search orders moves (by opponent mobility).
 /// Below this, moves are searched in natural order — near the leaves the ordering
@@ -17,6 +20,16 @@ use crate::othello::position::Position;
 /// flip nudged the crossover toward 7, but 6 and 7 are within noise while 6
 /// visits fewer nodes, so 6 stays. Re-tune when the ordering cost/benefit shifts.
 const SORT_MIN_EMPTIES: u32 = 6;
+
+/// Minimum empties at which a null-window node may split its younger siblings
+/// across worker threads (full recursive YBWC, Step 21). Below this a subtree is
+/// too small to amortize the spawn and shared-table lock traffic, so it runs
+/// sequentially. Only reached when the search carries a parallel context
+/// ([`Search::par`]); the sequential solver never splits. Swept at 20e/16-thread
+/// (ms/pos): 10→466, 11→327, 12→231, 13→187, **14→179**, 16→216, 18→295 — a clear
+/// knee at 14. Below it the subtrees are too small (spawn + lock traffic +
+/// speculative nodes dominate); above it parallelism is left on the table.
+const SPLIT_MIN_EMPTIES: u32 = 14;
 
 /// Region id per square: one of the four board quadrants, as a single bit
 /// (top-left = 1, top-right = 2, bottom-left = 4, bottom-right = 8). Edax's
@@ -95,25 +108,112 @@ fn order_score(child: &Position, cell: u32, parity: u8, parity_weight: i32) -> i
     score
 }
 
+/// Shared state of one null-window split point (full recursive YBWC, Step 21),
+/// borrowed by every participating worker. `work` is the cursor over the younger
+/// siblings (`move_list`); `best` collects the fail-high `(score, cell)`; `cancel`
+/// is tripped on the cutoff; `parent_parity` is the split node's parity (a child's
+/// is `parent_parity ^ QUADRANT_ID[cell]`).
+struct SplitCtx<'a> {
+    move_list: &'a [(i32, u32, Position)],
+    work: &'a AtomicUsize,
+    best: &'a Mutex<(i32, u8)>,
+    cancel: &'a CancelNode,
+    parent_parity: u8,
+    beta: i32,
+    empties: u32,
+}
+
+/// Worker loop for a null-window split point. Each participating thread pulls the
+/// next younger sibling from the shared cursor and null-window-searches it; the
+/// first to fail high records the cut and trips `cancel`, unwinding the rest.
+fn worker_loop_nws(w: &mut Search, ctx: &SplitCtx) {
+    let alpha = ctx.beta - 1;
+    loop {
+        if ctx.cancel.cancelled() {
+            return;
+        }
+        let i = ctx.work.fetch_add(1, Ordering::Relaxed);
+        if i >= ctx.move_list.len() {
+            return;
+        }
+        let (_, cell, ref child) = ctx.move_list[i];
+        w.parity = ctx.parent_parity ^ QUADRANT_ID[cell as usize];
+        let score = -w.search_exact_nws(child, -ctx.beta, ctx.empties - 1);
+        if ctx.cancel.cancelled() {
+            return; // aborted mid-search: discard this (meaningless) result
+        }
+        if score > alpha {
+            // Fail-high: this null-window node cuts. Record and stop the siblings.
+            let mut b = ctx.best.lock().unwrap_or_else(|e| e.into_inner());
+            if score > b.0 {
+                *b = (score, cell as u8);
+            }
+            drop(b);
+            ctx.cancel.cancel();
+            return;
+        }
+    }
+}
+
 /// Mutable state for one exact search: nodes visited, the transposition table,
 /// a borrowed handle to the shared edge-stability table, and the running region
 /// parity (maintained incrementally in the ordered search for move ordering).
 pub(super) struct Search {
     pub(super) nodes: u64,
-    pub(super) tt: Vec<TtEntry>,
+    pub(super) tt: TtBackend,
     edge_stability: &'static [u8; 256 * 256],
     /// Region parity of the current node's empties (Edax `parity`). Seeded at the
     /// root via [`board_parity`], then toggled `^= QUADRANT_ID[move]` per ply.
     pub(super) parity: u8,
+    /// Parallel context: the thread budget shared by all workers of one parallel
+    /// solve (Step 21). `None` for the single-threaded search, which never splits.
+    par: Option<Arc<ParCtx>>,
+    /// Cancellation handle for the nearest enclosing split: a beta-cutoff trips it
+    /// to abort the sibling subtrees. `None` (or an untripped root) when not under
+    /// a split. Checked only on the parallel path.
+    cancel: Option<Arc<CancelNode>>,
 }
 
 impl Search {
+    /// A search with a private (single-threaded) transposition table; never
+    /// splits.
     pub(super) fn new() -> Self {
         Search {
             nodes: 0,
-            tt: vec![TtEntry::default(); TT_SIZE],
+            tt: TtBackend::Owned(vec![Default::default(); TT_SIZE]),
             edge_stability: edge_stability_table(),
             parity: 0,
+            par: None,
+            cancel: None,
+        }
+    }
+
+    /// A worker search for parallel YBWC (Step 21): shares the sharded table and
+    /// the thread budget, and carries a cancellation handle. Per-worker state
+    /// (nodes, parity) is fresh.
+    pub(super) fn worker(tt: Arc<SharedTt>, par: Arc<ParCtx>, cancel: Arc<CancelNode>) -> Self {
+        Search {
+            nodes: 0,
+            tt: TtBackend::Shared(tt),
+            edge_stability: edge_stability_table(),
+            parity: 0,
+            par: Some(par),
+            cancel: Some(cancel),
+        }
+    }
+
+    /// Whether the nearest enclosing split (or an ancestor) has been cancelled.
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.cancel.as_deref().is_some_and(CancelNode::cancelled)
+    }
+
+    /// The shared table handle (only valid on a worker; the single-threaded search
+    /// never reaches the split path).
+    fn shared_tt(&self) -> Arc<SharedTt> {
+        match &self.tt {
+            TtBackend::Shared(t) => Arc::clone(t),
+            TtBackend::Owned(_) => unreachable!("split requested on a private table"),
         }
     }
 
@@ -343,6 +443,12 @@ impl Search {
     fn alphabeta_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
         self.nodes += 1;
         debug_assert_eq!(self.parity, board_parity(pos), "parity desync (nws)");
+        // Aborted by a sibling's cutoff at an enclosing split: bail without storing
+        // (the returned value is discarded by the split owner). Only the parallel
+        // path carries a cancel handle; the sequential search skips this.
+        if self.is_cancelled() {
+            return alpha;
+        }
         let beta = alpha + 1;
 
         let use_tt = empties >= TT_MIN_EMPTIES;
@@ -415,16 +521,48 @@ impl Search {
         }
 
         // Every child shares the null window; the first fail-high cuts the node.
+        // YBW: search the eldest child sequentially (it usually cuts), and only on
+        // a fail-low fan the younger siblings across worker threads — when deep
+        // enough and a parallel context is present (full recursive YBWC, Step 21).
         let mut best = alpha;
         let mut best_cell = NO_MOVE;
-        for &(_, cell, ref child) in &move_list {
-            self.parity ^= QUADRANT_ID[cell as usize];
-            let score = -self.search_exact_nws(child, -beta, empties - 1);
-            self.parity ^= QUADRANT_ID[cell as usize];
-            if score > best {
-                best = score;
-                best_cell = cell as u8;
-                break;
+
+        let (_, c0, ref ch0) = move_list[0];
+        self.parity ^= QUADRANT_ID[c0 as usize];
+        let s0 = -self.search_exact_nws(ch0, -beta, empties - 1);
+        self.parity ^= QUADRANT_ID[c0 as usize];
+        if self.is_cancelled() {
+            return best; // aborted by an ancestor split: discard, do not store
+        }
+        if s0 > best {
+            best = s0;
+            best_cell = c0 as u8;
+        }
+
+        if best <= alpha && move_list.len() > 1 {
+            if self.par.is_some() && empties >= SPLIT_MIN_EMPTIES {
+                let (pb, pc) = self.split_nws(&move_list, beta, empties);
+                if self.is_cancelled() {
+                    return best;
+                }
+                if pb > best {
+                    best = pb;
+                    best_cell = pc;
+                }
+            } else {
+                for &(_, cell, ref child) in &move_list[1..] {
+                    self.parity ^= QUADRANT_ID[cell as usize];
+                    let score = -self.search_exact_nws(child, -beta, empties - 1);
+                    self.parity ^= QUADRANT_ID[cell as usize];
+                    if self.is_cancelled() {
+                        return best;
+                    }
+                    if score > best {
+                        best = score;
+                        best_cell = cell as u8;
+                        break;
+                    }
+                }
             }
         }
 
@@ -440,6 +578,74 @@ impl Search {
         }
 
         best
+    }
+
+    /// Fan the younger siblings (`move_list[1..]`) of a null-window node across
+    /// worker threads (full recursive YBWC, Step 21). Returns `(best, best_cell)`:
+    /// the fail-high `(score, cell)` if a sibling cut, else `(alpha, NO_MOVE)`.
+    /// Acquires up to the remaining thread budget and participates on this thread
+    /// too, so it always finishes the siblings even with no budget. Restores
+    /// `self`'s parity and cancel handle before returning.
+    fn split_nws(
+        &mut self,
+        move_list: &[(i32, u32, Position)],
+        beta: i32,
+        empties: u32,
+    ) -> (i32, u8) {
+        let alpha = beta - 1;
+        let par = match &self.par {
+            Some(p) => Arc::clone(p),
+            None => return (alpha, NO_MOVE),
+        };
+        let n = move_list.len();
+
+        let tt = self.shared_tt();
+        let child_cancel = CancelNode::child(self.cancel.clone());
+        let parent_parity = self.parity;
+        let work = AtomicUsize::new(1); // index 0 (the eldest) is already searched
+        let best = Mutex::new((alpha, NO_MOVE));
+        let helper_nodes = AtomicU64::new(0);
+        let ctx = SplitCtx {
+            move_list,
+            work: &work,
+            best: &best,
+            cancel: &child_cancel,
+            parent_parity,
+            beta,
+            empties,
+        };
+
+        // Acquire helper slots; this thread participates too, so at most one fewer
+        // than the number of remaining siblings.
+        let mut helpers = 0;
+        while helpers + 1 < n && par.try_acquire() {
+            helpers += 1;
+        }
+
+        std::thread::scope(|scope| {
+            for _ in 0..helpers {
+                let tt = tt.clone();
+                let par = par.clone();
+                let cancel = child_cancel.clone();
+                let ctx = &ctx;
+                let helper_nodes = &helper_nodes;
+                scope.spawn(move || {
+                    let mut w = Search::worker(tt, par.clone(), cancel);
+                    worker_loop_nws(&mut w, ctx);
+                    par.release();
+                    helper_nodes.fetch_add(w.nodes, Ordering::Relaxed);
+                });
+            }
+            // This thread participates under the same cancel handle.
+            let saved = self.cancel.replace(child_cancel.clone());
+            worker_loop_nws(self, &ctx);
+            self.cancel = saved;
+        });
+
+        self.nodes += helper_nodes.load(Ordering::Relaxed);
+        self.parity = parent_parity;
+        let outcome = *best.lock().unwrap_or_else(|e| e.into_inner());
+        outcome
     }
 
     /// Null-window counterpart of [`Search::alphabeta_nosort`]: natural order, no

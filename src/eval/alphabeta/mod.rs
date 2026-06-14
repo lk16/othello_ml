@@ -2,12 +2,14 @@
 //!
 //! Submodules: [`search`] (the PVS/null-window core and `Search` state),
 //! [`leaf`] (last-few-empties solvers), [`stability`] (the stability cutoff
-//! estimate), [`tt`] (transposition table), and [`depth`] (the depth-limited
-//! heuristic search used for gameplay).
+//! estimate), [`tt`] (transposition table), [`parallel`] (the root-level YBWC
+//! parallel solver), and [`depth`] (the depth-limited heuristic search used for
+//! gameplay).
 
 mod count_flip;
 mod depth;
 mod leaf;
+mod parallel;
 mod search;
 mod stability;
 mod tt;
@@ -17,6 +19,7 @@ mod testutil;
 
 pub use count_flip::bench_count_flip_variants;
 pub use depth::{best_move, depth_limited_score};
+pub use parallel::ParallelSolver;
 
 use crate::othello::position::Position;
 use search::{board_parity, Search};

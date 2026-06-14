@@ -8,6 +8,7 @@
 
 use super::search::Search;
 use crate::othello::position::Position;
+use std::sync::Mutex;
 
 /// Table size as a power of two. Swept 17..23: node counts barely move above
 /// ~2^19 (collisions already rare at benchmarked depths), so the win is cache
@@ -63,6 +64,100 @@ impl Default for TtEntry {
     }
 }
 
+/// Number of mutex shards for the shared (parallel) table, as a power of two.
+/// Probes scatter across slots, so with a handful of worker threads contention
+/// on any one shard is rare; 1024 keeps lock traffic spread while the per-shard
+/// allocation overhead stays trivial.
+const TT_SHARD_BITS: u32 = 10;
+const TT_SHARDS: usize = 1 << TT_SHARD_BITS;
+/// Slots per shard. The high `TT_SHARD_BITS` of a slot index pick the shard.
+const TT_SHARD_SLOTS: usize = TT_SIZE >> TT_SHARD_BITS;
+
+/// Transposition table backing for a [`Search`]: either a private `Vec` (the
+/// single-threaded path — no synchronization) or a handle to a sharded,
+/// mutex-guarded table shared by parallel YBWC workers (Step 21). A given
+/// `Search` is always one variant, so the dispatch branch is well-predicted.
+pub(super) enum TtBackend {
+    Owned(Vec<TtEntry>),
+    Shared(std::sync::Arc<SharedTt>),
+}
+
+/// Sharded concurrent transposition table for parallel search. The slot array is
+/// split into [`TT_SHARDS`] contiguous mutex-guarded ranges; an entry access
+/// locks only its shard. Full-position-keyed like the owned table, so it stays
+/// exactly correct (no torn reads, no partial-key collisions); a stored bound is
+/// valid for the position's intrinsic score regardless of which worker wrote it.
+pub(super) struct SharedTt {
+    shards: Vec<Mutex<Box<[TtEntry]>>>,
+}
+
+impl SharedTt {
+    pub(super) fn new() -> Self {
+        let shards = (0..TT_SHARDS)
+            .map(|_| Mutex::new(vec![TtEntry::default(); TT_SHARD_SLOTS].into_boxed_slice()))
+            .collect();
+        SharedTt { shards }
+    }
+
+    /// Probe `pos`; returns the entry on an exact (full-position) hit.
+    #[inline]
+    fn probe(&self, pos: &Position) -> Option<TtEntry> {
+        let idx = tt_index(pos.player, pos.opponent);
+        let shard = self.shards[idx >> (TT_BITS - TT_SHARD_BITS)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let e = shard[idx & (TT_SHARD_SLOTS - 1)];
+        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    /// Record a `[lower, upper]` bound (and best move) for `pos`, with the same
+    /// intersect-or-replace policy as the owned table.
+    #[inline]
+    fn store(&self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+        let idx = tt_index(pos.player, pos.opponent);
+        let mut shard = self.shards[idx >> (TT_BITS - TT_SHARD_BITS)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        merge_entry(
+            &mut shard[idx & (TT_SHARD_SLOTS - 1)],
+            pos,
+            lower,
+            upper,
+            best_move,
+        );
+    }
+}
+
+/// Update slot `e` with a bound for `pos`: intersect bounds and keep a real best
+/// move when the slot already holds `pos`, else always-replace. Shared by both
+/// table backings.
+#[inline]
+fn merge_entry(e: &mut TtEntry, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+    if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
+        if lower > e.lower {
+            e.lower = lower;
+        }
+        if upper < e.upper {
+            e.upper = upper;
+        }
+        if best_move != NO_MOVE {
+            e.best_move = best_move;
+        }
+    } else {
+        *e = TtEntry {
+            player: pos.player,
+            opponent: pos.opponent,
+            lower,
+            upper,
+            best_move,
+        };
+    }
+}
+
 /// Hash both bitboards to a table slot.
 #[inline]
 fn tt_index(player: u64, opponent: u64) -> usize {
@@ -78,11 +173,19 @@ impl Search {
     /// Probe `pos`; returns a copy of the entry on an exact (full-position) hit.
     #[inline]
     pub(super) fn tt_probe(&self, pos: &Position) -> Option<TtEntry> {
-        let e = self.tt[tt_index(pos.player, pos.opponent)];
-        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
-            Some(e)
-        } else {
-            None
+        match &self.tt {
+            TtBackend::Owned(v) => {
+                let e = v[tt_index(pos.player, pos.opponent)];
+                if e.player == pos.player
+                    && e.opponent == pos.opponent
+                    && (e.player | e.opponent) != 0
+                {
+                    Some(e)
+                } else {
+                    None
+                }
+            }
+            TtBackend::Shared(s) => s.probe(pos),
         }
     }
 
@@ -91,25 +194,12 @@ impl Search {
     /// the intrinsic score) and a real best move kept; otherwise always-replace.
     #[inline]
     pub(super) fn tt_store(&mut self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
-        let e = &mut self.tt[tt_index(pos.player, pos.opponent)];
-        if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
-            if lower > e.lower {
-                e.lower = lower;
+        match &mut self.tt {
+            TtBackend::Owned(v) => {
+                let e = &mut v[tt_index(pos.player, pos.opponent)];
+                merge_entry(e, pos, lower, upper, best_move);
             }
-            if upper < e.upper {
-                e.upper = upper;
-            }
-            if best_move != NO_MOVE {
-                e.best_move = best_move;
-            }
-        } else {
-            *e = TtEntry {
-                player: pos.player,
-                opponent: pos.opponent,
-                lower,
-                upper,
-                best_move,
-            };
+            TtBackend::Shared(s) => s.store(pos, lower, upper, best_move),
         }
     }
 }

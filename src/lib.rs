@@ -3,7 +3,8 @@ pub mod othello;
 pub mod training;
 
 pub use eval::alphabeta::{
-    batch_evaluate, best_move, depth_limited_score, exact_score, exact_score_with_nodes, Solver,
+    batch_evaluate, best_move, depth_limited_score, exact_score, exact_score_with_nodes,
+    ParallelSolver, Solver,
 };
 pub use eval::cache::{build_examples, EvalCache};
 

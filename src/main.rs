@@ -1,6 +1,6 @@
 use othello_eval::{
-    best_move, build_examples, load_games, Board, Features, Position, Solver, Trainer,
-    TrainingConfig, Weights,
+    best_move, build_examples, load_games, Board, Features, ParallelSolver, Position, Solver,
+    Trainer, TrainingConfig, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -38,6 +38,7 @@ struct PlayArgs {
 struct BenchArgs {
     empties: u32,
     max_boards: Option<usize>,
+    threads: usize,
     paths: Vec<String>,
 }
 
@@ -194,6 +195,7 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
 fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     let mut empties: u32 = 20;
     let mut max_boards: Option<usize> = None;
+    let mut threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -208,6 +210,12 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
                 i += 1;
                 if i < args.len() {
                     max_boards = args[i].parse().ok();
+                }
+            }
+            "--threads" | "-t" => {
+                i += 1;
+                if i < args.len() {
+                    threads = args[i].parse::<usize>().unwrap_or(1).max(1);
                 }
             }
             "--help" | "-h" => {
@@ -225,6 +233,7 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     Some(Command::Bench(BenchArgs {
         empties,
         max_boards,
+        threads,
         paths,
     }))
 }
@@ -463,18 +472,29 @@ fn run_bench(args: BenchArgs) {
     }
 
     eprintln!(
-        "Benchmarking exact_score: {} positions, {} empties each",
+        "Benchmarking exact_score: {} positions, {} empties each, {} thread(s)",
         positions.len(),
-        args.empties
+        args.empties,
+        args.threads,
     );
 
+    // threads == 1 uses the sequential solver (private, lock-free table);
+    // threads > 1 solves each position with root-level YBWC (Step 21).
     let mut total_nodes: u64 = 0;
-    let mut solver = Solver::new();
     let start = Instant::now();
 
-    for board in &positions {
-        let (_, nodes) = solver.exact_score_with_nodes(&board.position);
-        total_nodes += nodes;
+    if args.threads > 1 {
+        let solver = ParallelSolver::new(args.threads);
+        for board in &positions {
+            let (_, nodes) = solver.exact_score_with_nodes(&board.position);
+            total_nodes += nodes;
+        }
+    } else {
+        let mut solver = Solver::new();
+        for board in &positions {
+            let (_, nodes) = solver.exact_score_with_nodes(&board.position);
+            total_nodes += nodes;
+        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -632,6 +652,9 @@ fn print_bench_usage(program: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  -n, --empties N    Only use positions with exactly N empty cells (default: 20)");
     eprintln!("  -m, --max-boards N Cap the number of positions benchmarked (default: all)");
+    eprintln!(
+        "  -t, --threads N    Workers for root-level YBWC per position (default: 1 = sequential)"
+    );
     eprintln!("  -h, --help         Show this help");
     eprintln!();
     eprintln!("INPUT:");
