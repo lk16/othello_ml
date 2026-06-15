@@ -34,8 +34,10 @@ const SPLIT_MIN_EMPTIES: u32 = 15;
 /// the mobility-sorted ordered search. A/B'd against the prior unordered-5 +
 /// ordered-6/7 split (Step 30): +30–40% nodes but neutral-to-faster wall-clock,
 /// the win growing with depth and larger in parallel (22e: ~4.5% sequential,
-/// ~11% at 16 threads). NB the empties-list enumeration Edax also ships is not yet
-/// implemented — this uses `get_moves` + a parity mask — so Step 30 is partial.
+/// ~11% at 16 threads). Enumerates moves with `get_moves` + this parity mask;
+/// Edax's empties-list walk (one flip per empty) was also implemented and A/B'd
+/// (identical node counts) but ran ~3–4% slower here, so it was reverted — see the
+/// dead-ends note in docs/speedup-plan.md.
 const SHALLOW_MAX_EMPTIES: u32 = 7;
 
 /// Region id per square: one of the four board quadrants, as a single bit

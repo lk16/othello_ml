@@ -190,7 +190,7 @@ One line each; see the code and `git log` for detail.
   nodes/pos, ms unchanged). Parallel wall-clock at 16t: **20e 179 → 141 ms
   (~1.27×), 22e 676 → 519 ms (~1.30×)**. The 16-thread `ParallelSolver`-vs-`Solver`
   score-equality test guards the torn-read path under real contention.
-- **30 (partial)** shallow tier (`Search::shallow`/`shallow_nws`), empties
+- **30** shallow tier (`Search::shallow`/`shallow_nws`), empties
   `5 ..= SHALLOW_MAX_EMPTIES = 7`. Edax's `search_shallow` deliberately drops the
   mobility sort in this band: parity-only ordering (odd-quadrant moves first, via a
   precomputed `PARITY_MASK`), **no move list, no sort, no transposition table**,
@@ -205,11 +205,9 @@ One line each; see the code and `git log` for detail.
   list/sort) more than offsets the weaker order. This is the **first win in this
   design space** — the pieces each lost alone (parity-primary ordering Step 19;
   empties `SquareList` and static order Step 22; cheap mobility Step 27); the
-  *combination*, confined to a thin band, is what pays. **Partial**: Edax's shallow
-  tier also walks an **empties list** (O(1) remove/restore, flip-per-empty
-  legality) instead of `get_moves`; we still call `get_moves` + a parity mask.
-  Adding the empties-list enumeration (the reverted Step 22 arena is the template)
-  is the remaining work before Step 30 is complete — see remaining steps.
+  *combination*, confined to a thin band, is what pays. Enumerates moves with
+  `get_moves` + the parity mask; Edax's empties-list walk was also tried and lost
+  (see the dead-ends note), so this is the final design.
 
 ## Dead ends & decisions (not in code)
 
@@ -292,6 +290,23 @@ One line each; see the code and `git log` for detail.
   loosen the order — none of the cheap candidates (static `SQUARE_VALUE`, parity,
   potential mobility) clear that bar. The `get_moves`-in-`order_score` cost is real
   but the exact key is load-bearing.
+- **Step 30 empties-list enumeration — built, A/B'd, reverted.** The committed
+  shallow tier enumerates moves with `get_moves` + a parity mask. Edax instead
+  walks an **empties list** (the safe-arena `EmptyList` ring: `[u8; 65]`
+  `next`/`prev`, O(1) `remove`/`restore`, built once at shallow entry), computing a
+  flip per empty square (`flip != 0` ⇒ legal) and applying via a flip-reusing
+  `do_move_with_flip` — no `get_moves`. Built it in the *same* parity order
+  (odd-quadrant pass then even, ascending within each) so **node counts are
+  identical** (79,106 / 393,323 / 1,919,923 at 14/16/18e — exact match), making it
+  a pure per-node wall-clock test. It ran **~3–4% slower** back-to-back (16e 10.9 vs
+  10.45, 18e 56.0 vs 54.15, 20e 271.8 vs 263.7 ms). Cause: the empties walk computes
+  a flip for *every* empty (incl. illegal, `flip == 0`) plus list bookkeeping,
+  whereas one branchless `get_moves` Kogge-Stone fill finds all legal moves at once
+  and only the legal ones are then flipped. Same verdict as the Step 22 `SquareList`
+  it reuses: the incremental empties structure is not worth it in our bitboard
+  representation. **Reverted** — `get_moves` + parity mask is the shallow tier's
+  final form, completing Step 30. (Copy-make vs make/unmake was confirmed a
+  non-lever: a `Position` is 16 bytes on the stack.)
 - **Step 21 root-only YBWC — built, regressed, superseded.** The first cut split
   only the *root's* siblings (eldest sequential to set alpha, the rest in
   parallel). It regressed and got *worse* with threads (20e ms/pos: 337 / 365 /
@@ -305,10 +320,9 @@ One line each; see the code and `git log` for detail.
 
 ## Remaining steps
 
-Steps 1–25, 27, 29 are implemented or resolved, and 30 is committed-partial (the
-shallow tier ships; the empties-list enumeration below remains). Steps 26 and 28
-come from a **callgrind profile of the sequential hot path** (release + debug
-symbols, 16e, 150 boards).
+Steps 1–25, 27, 29, 30 are implemented or resolved. The two below (26, 28) come
+from a **callgrind profile of the sequential hot path** (release + debug symbols,
+16e, 150 boards).
 These are *instruction counts*, so cache misses, branch mispredicts, and the
 parallel TT contention are not captured — `perf` is the missing wall-clock /
 cache view, blocked on this box by `perf_event_paranoid = 4` (needs root to
@@ -335,26 +349,6 @@ AMD re-bench has lost (microcoded PEXT; `target_feature` boundary blocks
 inlining). Re-run `bench-flip` / `bench-get-moves` and the search on a Haswell+
 box and wire a `cfg`/runtime override only if measured. The single largest latent
 lever, but gated on hardware we do not have here.
-
-### Step 30 (remaining half) — empties-list enumeration for the shallow tier
-The shallow tier itself shipped (committed steps above): parity-only ordering, no
-move list, no sort, no TT, confined to empties 5–7 — a measured net win (+30–40%
-nodes at neutral-to-faster wall-clock, growing with depth, ~11% in parallel at
-22e). The combination paid off where the pieces each failed alone (Steps 19/22/27).
-
-What is *not* yet done is Edax's other shallow-tier ingredient: it enumerates moves
-by **walking an empties list** (O(1) `remove`/`restore`, computing a flip per empty
-square — `flip != 0` ⇒ legal) rather than calling `get_moves`. Our `shallow` still
-calls `get_moves` + a `PARITY_MASK`. Trade per node: empties-walk drops the
-`get_moves` (~7 ns) but computes a flip for *every* empty (incl. illegal, flip==0)
-plus list bookkeeping — could go either way, and it requires an incremental empties
-structure maintained from the root (exactly the safe-arena `SquareList` built and
-reverted in Step 22; that design is the template). Note copy-make vs make/unmake is
-*not* a lever here — a `Position` is 16 bytes on the stack, so `do_move` is already
-as cheap as an in-place XOR-in/XOR-out. A/B the empties-walk against the current
-`get_moves` shallow tier (node counts identical — same order — so this is purely a
-per-node wall-clock question); keep only if it wins. This is the work that would
-let Step 30 be called *done*.
 
 Minor / opportunistic, not numbered: split PV nodes too (the spine is O(depth)
 nodes — small); NUMA-aware shard placement; re-sweep `SPLIT_MIN_EMPTIES` and the
