@@ -39,6 +39,10 @@ struct BenchArgs {
     empties: u32,
     max_boards: Option<usize>,
     threads: usize,
+    /// When set (sequential only), print one OBF line per board to stdout (for
+    /// cross-checking against another solver) and per-board score/nodes/time to
+    /// stderr, instead of only the aggregate summary.
+    per_board: bool,
     paths: Vec<String>,
 }
 
@@ -196,10 +200,14 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     let mut empties: u32 = 20;
     let mut max_boards: Option<usize> = None;
     let mut threads: usize = 1;
+    let mut per_board = false;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--per-board" => {
+                per_board = true;
+            }
             "--empties" | "-n" => {
                 i += 1;
                 if i < args.len() {
@@ -234,6 +242,7 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
         empties,
         max_boards,
         threads,
+        per_board,
         paths,
     }))
 }
@@ -477,6 +486,40 @@ fn run_bench(args: BenchArgs) {
         args.empties,
         args.threads,
     );
+
+    // Per-board mode (sequential only): one OBF line per board to stdout, plus
+    // per-board score/nodes/time to stderr. A fresh `Solver` per board avoids the
+    // warm shared TT skewing later boards — each is solved cold, matching how a
+    // one-shot external solver sees it.
+    if args.per_board {
+        let mut total_nodes: u64 = 0;
+        let mut total_time = 0.0;
+        for (idx, board) in positions.iter().enumerate() {
+            let mut solver = Solver::new();
+            let t = Instant::now();
+            let (score, nodes) = solver.exact_score_with_nodes(&board.position);
+            let secs = t.elapsed().as_secs_f64();
+            total_nodes += nodes;
+            total_time += secs;
+            // OBF line for the external solver (player = X, X to move).
+            println!("{};", board.position.to_fen(true));
+            eprintln!(
+                "board {idx}: score={score} nodes={nodes} time={:.1}ms",
+                secs * 1000.0
+            );
+        }
+        let n = positions.len() as f64;
+        eprintln!("Per-board totals:");
+        eprintln!("  Total time   : {total_time:.3}s");
+        eprintln!("  Time/position: {:.1}ms", total_time / n * 1000.0);
+        eprintln!("  Total nodes  : {total_nodes}");
+        eprintln!("  Nodes/pos    : {:.0}", total_nodes as f64 / n);
+        eprintln!(
+            "  Nodes/s      : {:.2}M",
+            total_nodes as f64 / total_time / 1_000_000.0
+        );
+        return;
+    }
 
     // threads == 1 uses the sequential solver (private, lock-free table);
     // threads > 1 solves each position with root-level YBWC (Step 21).
