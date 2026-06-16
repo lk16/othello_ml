@@ -318,11 +318,72 @@ One line each; see the code and `git log` for detail.
   the committed full recursive YBWC (Step 21 above). Root-only is precisely why
   Edax splits recursively rather than at the root.
 
+## Edax comparison — where the remaining gap is (evidence)
+
+Benchmarked our sequential exact solver against Edax (the reference engine) to find
+out whether more speed is available and, if so, in which part. Method: 6 boards of
+exactly 24 empties from the PGN set (`bench --per-board` emits them as OBF plus our
+per-board score/nodes/time), solved single-threaded by both; exact scores agree on
+all 6 (confirming both solve the same problem). Edax run from its repo:
+`lEdax-x64-modern -solve <obf> -l 60 -n 1` (level 60 = exact). Both cold per board.
+
+Headline: **Edax is ~8× faster wall-clock** (9.1s vs 72.2s) for the identical exact
+result — and it is almost entirely **node count**, not per-node speed:
+
+| solver / mode | nodes | wall-clock | nodes/s |
+|---|---|---|---|
+| Ours (cold exact PVS, full window) | 2,463M | 72.2s | 34.1M |
+| Edax modern, default (ID + MPC) | 344M | 9.10s | 37.8M |
+| Edax modern, `-selectivity 100` (ID, no MPC) | 353M | 9.44s | 37.4M |
+| Edax popcnt, default | 344M | 10.07s | 34.2M |
+
+Each finding measured:
+- **Per-node speed is a non-issue.** Our 34.1M nodes/s equals Edax's popcnt build
+  (34.2M) and is ~10% behind the AVX2 modern build (37.8M). That ~10% is exactly
+  the SIMD-primitive gap (Steps 26/28) — confirmed the *wrong* target. (The matching
+  nodes/s also shows the node counts are comparable, not a counting artifact.)
+- **MPC / selectivity is NOT the lever.** Forcing Edax to pure exact
+  (`-selectivity 100`, no probcut — accepted on the command line, no rebuild)
+  changed its node count <3% (344M → 353M).
+- **The ~7× is node count from iterative deepening + move ordering** — Edax's
+  shallow eval-guided searches seed the TT with near-perfect best moves and bounds
+  before the deep exact pass. We do a single cold full-window PVS.
+
+Decomposed the ~7× by prototyping each half against our own solver (same 6 boards;
+both prototypes A/B'd behind a `const`, then reverted — throwaway):
+
+| configuration | nodes | vs our baseline |
+|---|---|---|
+| Ours, baseline | 2,463M | 1.0× |
+| + move-seeding (cheap-eval ID prototype) | 2,461M | 1.0× (no effect) |
+| + perfect tight window `[S-1,S+1]` (aspiration ceiling) | 1,264M | 1.95× |
+| Edax | 344M | 7.2× |
+
+- **Move-ordering seeding with our mobility heuristic: ~0.** A depth-limited
+  lookahead with our crude eval picks the same moves `order_score` already does, so
+  the TT hint adds no information. Improving ordering needs a *positional/pattern*
+  eval, not another mobility signal.
+- **Window narrowing: ~2× (ceiling, perfect estimate).** Achievable via
+  MTD-f/aspiration; the smaller lever, and it does *not* need a strong eval.
+- **The remaining ~3.7× is move-ordering quality**, reachable only with a real
+  evaluation function (Edax's `eval.dat`). This project trains one
+  (`src/training/`) but it is not yet strong enough, and it is not wired into the
+  solver (and `Weights::evaluate` allocates per call — a hot path would need an
+  alloc-free eval).
+
+**Direction (supersedes the SIMD steps 26/28 as the priority):**
+1. **MTD-f / aspiration** for the ~2× window lever — no eval needed (Step 31, in
+   progress).
+2. Later, **eval-guided move ordering** for the ~3.7× — deferred until the trained
+   weights are much stronger *and* a fast alloc-free eval path exists in the solver.
+
 ## Remaining steps
 
-Steps 1–25, 27, 29, 30 are implemented or resolved. The two below (26, 28) come
-from a **callgrind profile of the sequential hot path** (release + debug symbols,
-16e, 150 boards).
+Steps 1–25, 27, 29, 30 are implemented or resolved; Step 31 (MTD-f) is in progress.
+Steps 26 and 28 below come from a **callgrind profile of the sequential hot path**
+(release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
+they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
+priority behind the search-algorithm work.
 These are *instruction counts*, so cache misses, branch mispredicts, and the
 parallel TT contention are not captured — `perf` is the missing wall-clock /
 cache view, blocked on this box by `perf_event_paranoid = 4` (needs root to
@@ -334,6 +395,18 @@ per-node `get_stability` ~1%. (The `find_edge_stable` ~17% seen in a *short* run
 is the one-time `OnceLock` edge-table build, not a hot-path cost — it amortizes
 to ~0 as boards grow; likewise `memchr`/`CharSearcher` ~1% is PGN parsing at
 load.)
+
+### Step 31 — MTD-f / aspiration root (window narrowing)
+The Edax comparison shows a ~2× node-count ceiling from searching the exact tree
+with a tight window instead of the full `[-64, 64]`. Replace the single
+full-window root search with repeated null-window searches that converge on the
+exact score (MTD-style), reusing the (never-cleared) transposition table across
+probes so each successive probe is cheap. No evaluation function required — a
+guess-free bisection over odd thresholds (`S` is always even) needs ~6 probes; an
+MTD-f first guess (e.g. 0) can cut that. Each probe is the existing exact
+null-window search, so the result stays exact (each "S ≥ t?" test is exact). A/B
+node count and wall-clock against the full-window baseline; keep if it wins.
+Sequential first (the `Solver` path); the parallel root can follow.
 
 ### Step 26 — AVX2 `get_moves` in the real search
 `get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-
