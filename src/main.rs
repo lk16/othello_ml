@@ -1,6 +1,6 @@
 use othello_eval::{
-    best_move, build_examples, load_games, Board, Features, ParallelSolver, Position, Solver,
-    Trainer, TrainingConfig, Weights,
+    best_move, build_examples, load_games, Board, Features, FlatEval, ParallelSolver, Position,
+    Solver, Trainer, TrainingConfig, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -43,6 +43,10 @@ struct BenchArgs {
     /// cross-checking against another solver) and per-board score/nodes/time to
     /// stderr, instead of only the aggregate summary.
     per_board: bool,
+    /// Optional trained-weights file: when set, the sequential solver uses
+    /// eval-guided move ordering (Step 34). Absence = the mobility-only baseline,
+    /// so `bench` vs `bench --weights` is a node-count A/B.
+    weights: Option<String>,
     paths: Vec<String>,
 }
 
@@ -201,12 +205,19 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     let mut max_boards: Option<usize> = None;
     let mut threads: usize = 1;
     let mut per_board = false;
+    let mut weights: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--per-board" => {
                 per_board = true;
+            }
+            "--weights" | "-w" => {
+                i += 1;
+                if i < args.len() {
+                    weights = Some(args[i].clone());
+                }
             }
             "--empties" | "-n" => {
                 i += 1;
@@ -243,6 +254,7 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
         max_boards,
         threads,
         per_board,
+        weights,
         paths,
     }))
 }
@@ -486,6 +498,28 @@ fn run_bench(args: BenchArgs) {
         args.threads,
     );
 
+    // Step 34: optional eval-guided ordering. Build the flat eval once and share it.
+    let eval: Option<Arc<FlatEval>> = match &args.weights {
+        Some(path) => match Weights::load(path) {
+            Ok(w) => {
+                eprintln!("Eval-guided ordering: loaded weights from {path}");
+                Some(Arc::new(FlatEval::from_weights(&w)))
+            }
+            Err(e) => {
+                eprintln!("Error loading weights from {path}: {e}");
+                return;
+            }
+        },
+        None => None,
+    };
+    if eval.is_some() && args.threads > 1 {
+        eprintln!("Note: eval-guided ordering is sequential-only; ignored with --threads > 1.");
+    }
+    let make_solver = || match &eval {
+        Some(e) => Solver::with_eval(Arc::clone(e)),
+        None => Solver::new(),
+    };
+
     // Per-board mode (sequential only): one OBF line per board to stdout, plus
     // per-board score/nodes/time to stderr. A fresh `Solver` per board avoids the
     // warm shared TT skewing later boards — each is solved cold, matching how a
@@ -494,7 +528,7 @@ fn run_bench(args: BenchArgs) {
         let mut total_nodes: u64 = 0;
         let mut total_time = 0.0;
         for (idx, board) in positions.iter().enumerate() {
-            let mut solver = Solver::new();
+            let mut solver = make_solver();
             let t = Instant::now();
             let (score, nodes) = solver.exact_score_with_nodes(&board.position);
             let secs = t.elapsed().as_secs_f64();
@@ -532,7 +566,7 @@ fn run_bench(args: BenchArgs) {
             total_nodes += nodes;
         }
     } else {
-        let mut solver = Solver::new();
+        let mut solver = make_solver();
         for board in &positions {
             let (_, nodes) = solver.exact_score_with_nodes(&board.position);
             total_nodes += nodes;
@@ -697,6 +731,10 @@ fn print_bench_usage(program: &str) {
     eprintln!(
         "  -t, --threads N    Workers for root-level YBWC per position (default: 1 = sequential)"
     );
+    eprintln!(
+        "  -w, --weights PATH Use eval-guided move ordering from a trained-weights file (Step 34;"
+    );
+    eprintln!("                     sequential only). Omit for the mobility-only baseline.");
     eprintln!("  -h, --help         Show this help");
     eprintln!();
     eprintln!("INPUT:");

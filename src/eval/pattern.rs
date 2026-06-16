@@ -130,8 +130,8 @@ impl FlatEval {
     pub fn score(&self, indices: &[u16], empties: u32) -> f32 {
         let base = Self::range_index(empties) * self.range_stride;
         let mut sum = 0.0f32;
-        for f in 0..self.n_features {
-            sum += self.weights[base + self.offset[f] as usize + indices[f] as usize];
+        for (&off, &pattern) in self.offset.iter().zip(&indices[..self.n_features]) {
+            sum += self.weights[base + off as usize + pattern as usize];
         }
         sum
     }

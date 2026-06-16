@@ -395,7 +395,9 @@ current priority phase** — the eval-gated node-count levers (~2× window, ~3.7
 ordering): Step 32 makes training fast enough to produce a strong eval (**core done:
 ~2700× single-thread, see below**), Step 33 adds an alloc-free flat pattern eval to
 the solver (**core done: `FlatEval`, bit-identical to `Weights::evaluate`**), Step 34
-wires it into ordering and MTD-f. Steps 26 and 28 below come from
+wires it into ordering and MTD-f (**mechanism built + A/B harness done; net-negative
+with current weak weights — gate confirmed, now blocked on a stronger eval**). Steps
+26 and 28 below come from
 a **callgrind profile of the sequential hot path**
 (release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
 they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
@@ -563,6 +565,29 @@ Sequence within this step: (1) iterative-deepening driver + TT hash-move orderin
 (2) `sort_depth`/`min_depth_table` schedule calling the Step-33 eval; (3)
 `inc_sort_depth`; (4) feed the estimate to MTD-f. A/B each against the 6×24e set and
 the standard `bench` levels — the target is node count, not nodes/s.
+
+**Built the simplest cut (static-eval ordering term) — measured net-negative with
+the current weights, confirming the eval-quality gate.** `Search` now carries an
+optional `Arc<FlatEval>` (`Solver::with_eval`, wired through `bench --weights` as a
+node-count A/B; absent = the mobility-only baseline, so the default path is
+unchanged by construction — the term sits behind `if let Some`). `ordered_moves`
+adds Edax's `sort_depth = 0` term `(SCORE_MAX − clamp(eval(child))) · W_EVAL`
+(`W_EVAL = 1<<13`, the `w_eval>>2` static case, `move.c:442`) at
+`empties >= EVAL_ORDER_MIN_EMPTIES = 12` (the `min_depth_table` analogue — the eval
+is the expensive signal, so it is confined to the upper plies). A/B on the standard
+levels with the existing `trained_weights.bin`: **+0.7 % nodes (14e), +1.0 % (16e),
++1.8 % (18e)** — slightly *worse*, the penalty growing with depth. This is the
+signature of a *weak* ordering signal displacing the good mobility order (same shape
+as the reverted Step-22 static order and Step-27 potential-mobility), **not** an
+inverted sign (which would ~double nodes). So the mechanism is correct and the
+gate is confirmed empirically: **the eval is not yet strong enough**, exactly as the
+Direction note predicted. Kept opt-in (off by default, zero-cost) as the validated
+scaffold — re-run `bench --weights` after training a stronger eval (now fast and
+feasible post-Step-32). **Still open** (deferred until a stronger eval flips the A/B
+positive): the shallow-search bonus (`sort_depth` 1–6, needs the incremental
+`eval_update`), iterative deepening + hash-move ordering, `inc_sort_depth`, and
+eval-seeded MTD-f. Parallel workers still run `None` (sequential-first, as planned).
+The gating next move is not more search wiring — it is **training a stronger eval**.
 
 ### Step 26 — AVX2 `get_moves` in the real search
 `get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-

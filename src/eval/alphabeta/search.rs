@@ -8,6 +8,7 @@ use super::parallel::{CancelNode, ParCtx};
 use super::stability::{edge_stability_table, get_stability, STABILITY_THRESHOLD};
 use super::tt::{SharedTt, TtBackend, ETC_MIN_EMPTIES, NO_MOVE, TT_MIN_EMPTIES, TT_SIZE};
 use super::{SCORE_MAX, SCORE_MIN};
+use crate::eval::pattern::FlatEval;
 use crate::othello::position::Position;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -109,6 +110,19 @@ const SQUARE_VALUE: [i32; 64] = [
 // parity are minor tie-breaks.
 const W_MOBILITY: i32 = 1 << 15;
 const W_CORNER: i32 = 1 << 11;
+
+/// Weight of the eval-guided ordering term (Step 34), mirroring Edax's static-eval
+/// sort bonus `(SCORE_MAX − search_eval_0) * (w_eval >> 2)` (`move.c:442`).
+/// Co-dominant with mobility (`w_eval >> 2 = 1 << 13` vs `w_mobility = 1 << 15`, and
+/// the eval spans 0..128 vs mobility's 0..36). Only applied when a [`FlatEval`] is
+/// attached to the search and only at `empties >= EVAL_ORDER_MIN_EMPTIES`.
+const W_EVAL: i32 = 1 << 13;
+
+/// Minimum empties at which the eval-guided ordering term is added. The eval is the
+/// expensive ordering signal (a from-scratch `FlatEval::set` per child), so it is
+/// confined to the upper plies where ordering quality matters most and such nodes
+/// are few — the analogue of Edax's `min_depth_table` gate (`move.c:370`). Tunable.
+const EVAL_ORDER_MIN_EMPTIES: u32 = 12;
 
 /// Quick corner-anchored stability count for `p`: held corners plus their edge
 /// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap
@@ -268,6 +282,11 @@ pub(super) struct Search {
     /// to abort the sibling subtrees. `None` (or an untripped root) when not under
     /// a split. Checked only on the parallel path.
     cancel: Option<Arc<CancelNode>>,
+    /// Optional trained pattern eval for eval-guided move ordering (Step 34). When
+    /// `Some`, the ordered search adds the eval term to each move's order score at
+    /// `empties >= EVAL_ORDER_MIN_EMPTIES`. `None` = the mobility-only baseline
+    /// ordering (Steps 6b/30). Sequential `Solver` only; parallel workers run `None`.
+    eval: Option<Arc<FlatEval>>,
 }
 
 impl Search {
@@ -281,7 +300,13 @@ impl Search {
             parity: 0,
             par: None,
             cancel: None,
+            eval: None,
         }
+    }
+
+    /// Attach a trained pattern eval for eval-guided move ordering (Step 34).
+    pub(super) fn set_eval(&mut self, eval: Arc<FlatEval>) {
+        self.eval = Some(eval);
     }
 
     /// A worker search for parallel YBWC (Step 21): shares the sharded table and
@@ -295,6 +320,7 @@ impl Search {
             parity: 0,
             par: Some(par),
             cancel: Some(cancel),
+            eval: None,
         }
     }
 
@@ -377,17 +403,32 @@ impl Search {
     fn ordered_moves(&self, pos: &Position, moves: u64, empties: u32) -> MoveBuf {
         let parity = self.parity;
         let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
+        // Eval-guided ordering (Step 34): attach the pattern-eval term only when a
+        // `FlatEval` is present and high enough in the tree to amortize its cost.
+        let eval = if empties >= EVAL_ORDER_MIN_EMPTIES {
+            self.eval.as_deref()
+        } else {
+            None
+        };
         let mut buf = MoveBuf::new();
         let mut remaining = moves;
         while remaining != 0 {
             let cell = remaining.trailing_zeros();
             remaining &= remaining - 1;
             let child = pos.do_move(cell);
-            buf.push((
-                order_score(&child, cell, parity, parity_weight),
-                cell,
-                child,
-            ));
+            let mut score = order_score(&child, cell, parity, parity_weight);
+            if let Some(ev) = eval {
+                // `child` is opponent-to-move, so its eval is from the opponent's
+                // perspective: a low child score is good for us. Mirrors Edax's
+                // `(SCORE_MAX − search_eval_0(child)) * (w_eval >> 2)` (move.c:442).
+                let child_eval = ev
+                    .eval_position(&child)
+                    .round()
+                    .clamp((SCORE_MIN + 1) as f32, (SCORE_MAX - 1) as f32)
+                    as i32;
+                score += (SCORE_MAX - child_eval) * W_EVAL;
+            }
+            buf.push((score, cell, child));
         }
         buf
     }

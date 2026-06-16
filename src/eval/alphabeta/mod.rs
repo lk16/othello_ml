@@ -21,8 +21,10 @@ pub use count_flip::bench_count_flip_variants;
 pub use depth::{best_move, depth_limited_score};
 pub use parallel::ParallelSolver;
 
+use crate::eval::pattern::FlatEval;
 use crate::othello::position::Position;
 use search::{board_parity, Search};
+use std::sync::Arc;
 
 /// Score bounds.
 pub(crate) const SCORE_MIN: i32 = -64;
@@ -72,6 +74,16 @@ impl Solver {
         Solver {
             search: Search::new(),
         }
+    }
+
+    /// Allocate a solver that uses a trained pattern eval for eval-guided move
+    /// ordering (Step 34). The `eval` is shared (`Arc`) so callers solving many
+    /// positions build the flat table once and clone the handle. Sequential only —
+    /// the parallel `ParallelSolver` does not yet carry the eval.
+    pub fn with_eval(eval: Arc<FlatEval>) -> Self {
+        let mut search = Search::new();
+        search.set_eval(eval);
+        Solver { search }
     }
 
     /// Exact score for `pos`, reusing this solver's transposition table.
