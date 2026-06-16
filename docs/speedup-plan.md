@@ -381,10 +381,20 @@ both prototypes A/B'd behind a `const`, then reverted — throwaway):
    a fast alloc-free eval path exists in the solver. Training the eval is therefore
    the gating next phase.
 
+The eval is now the critical path, so it gets its own steps below, in dependency
+order: **Step 32** (make training fast/correct enough to *produce* a strong eval),
+**Step 33** (an alloc-free flat pattern eval in the solver), **Step 34** (wire it
+into move ordering and MTD-f). Steps 33/34 are modelled directly on Edax's
+`eval.c`/`move.c`/`midgame.c` — see those steps for the specific mechanisms.
+
 ## Remaining steps
 
 Steps 1–25, 27, 29, 30 are implemented or resolved; Step 31 (MTD-f) is built but
-shelved (net-neutral without an eval — see above). Steps 26 and 28 below come from
+shelved (net-neutral without an eval — see above). **Steps 32–34 below are the
+current priority phase** — the eval-gated node-count levers (~2× window, ~3.7×
+ordering): Step 32 makes training fast enough to produce a strong eval, Step 33 adds
+an alloc-free flat pattern eval to the solver, Step 34 wires it into ordering and
+MTD-f. Steps 26 and 28 below come from
 a **callgrind profile of the sequential hot path**
 (release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
 they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
@@ -416,6 +426,103 @@ only wins with a **good first guess**, which needs an evaluation function. So th
 lever is **eval-gated, same as move ordering**. Kept behind `USE_MTD = false` as the
 scaffold for eval-seeded MTD-f (feed the eval's estimate as the first guess) once
 the trained weights are usable; revisit then, sequential first, parallel root later.
+
+### Step 32 — training speedup (gating: produce a strong eval)
+Training (`src/training/`) is the gate on Steps 33/34, but the current trainer is
+slow *and* its parallel path is mis-designed. Findings from reading
+`trainer.rs`/`weights.rs`/`features.rs`:
+
+- **The clone+full-merge runs per 32-example batch — even single-threaded.**
+  `train_epochs` never calls the clean in-place `train_batch`; instead, for *every*
+  batch it `weights.clone()`s the whole table per worker (`trainer.rs:219`), spawns
+  a fresh `std::thread` (no pool, `:222`), and `merge_from_workers` (`:291` →
+  `weights.rs:205`) scans **all weights** to average deltas. The table is 30
+  empty-ranges × ~892K patterns ≈ **26.7M f32 ≈ 107 MB**, so each batch of 32 pays a
+  107 MB copy + a 27M-element scan regardless of the ≤47×32 slots actually touched.
+  With `threads = 1` this path still runs (`workers = 1`). **Fix (biggest win, do
+  first): single-thread calls `train_batch(&mut weights, …)` in place** — deletes
+  the clone/spawn/merge entirely. Likely 1–2 orders of magnitude faster on its own.
+- **Feature indices are recomputed every epoch with a `Vec` alloc + per-cell
+  `get_cell`.** `features.extract()` allocates a fresh `Vec<u32>` and loops
+  cell-by-cell (`features.rs:135`), and is called **twice per example per epoch** —
+  in `weights.evaluate` (`weights.rs:68`) and again in `train_batch`
+  (`trainer.rs:122`). Positions are fixed across epochs, so **precompute the 47
+  indices once at load and store `[u16; 47]` + the range index on
+  `TrainingExample`**; every epoch then becomes a pure dot-product + scatter update,
+  zero extraction, zero alloc (removes ~95% of feature work over 10+ epochs).
+- **Flatten weights to one `Vec<f32>`** with per-(feature,range) base offsets
+  (Edax's flat layout, Step 33). Kills the `Vec<Vec<Vec<f32>>>` triple pointer-chase
+  in the hot dot-product and makes a *sparse* merge (only touched slots) trivial.
+- **Parallel: don't clone/merge the whole table.** SGD over examples is
+  embarrassingly parallel — either Hogwild-style shared `&[AtomicU32]` updates, or
+  accumulate **sparse** deltas (touched `(feature,range,pattern)` only) and merge
+  those, from a persistent pool, not per-batch spawns.
+
+The current merge also averages a minibatch-of-1-per-example; once weights are flat
++ shared this can become proper accumulated-gradient minibatch SGD. None of this
+changes the model — only its speed — so it is pure prep for a stronger eval.
+
+### Step 33 — alloc-free flat pattern eval in the solver
+`Weights::evaluate` allocates per call (the `extract` `Vec`) and triple-chases
+`Vec<Vec<Vec<f32>>>` — unusable in the hot path. Edax's eval (`eval.c`, `eval.h`,
+`midgame.c`) is the alloc-free template to copy:
+
+- **Incremental feature state carried in the search.** Edax's `struct Eval`
+  (`eval.h:36`) is just `unsigned short feature[48]` (each = a feature's trinary
+  index, pre-offset) + `n_empties` + `parity` — ~96 B, lives on the stack/search
+  node, never heap-allocated. Add an analogous `[u16; 47]` (+ range index) to the
+  solver state.
+- **O(touched) make/unmake via a coordinate→feature table.** `EVAL_X2F[square]`
+  (`eval.c:104`) lists, per square, the ≤7 features it belongs to and the power-of-3
+  weight of that square in each. `eval_update_0/1` (`eval.c:782`) on a move:
+  subtract 2× the moved square's contribution, then add/subtract each flipped bit's
+  contribution — a short switch, no loop over all 47 features, no alloc.
+  `eval_update_leaf` (`:893`) copies parent features first (the copy-make analogue,
+  cheap at 96 B). **Build the inverse of `Features` once** (a `[Vec<(feat,pow)>; 64]`
+  scatter table) — also reusable to speed up Step 32's one-time extraction.
+- **Score = flat dot-product, int16 weights, indexed by ply.** `accumlate_eval`
+  (`midgame.c:36`) is literally `sum = w->C9[f[0]] + … + w->S7654[f[45]]` — ~46
+  lookups into a flat per-ply weight array, no indirection, no alloc (AVX2 path uses
+  gather). Edax stores weights as `short`, mirror-symmetry-**packed** in `eval.dat`,
+  unpacked once at load into flat per-ply arrays (`eval.c:660`). Our per-empties
+  ranges already mirror Edax's ply = `60 - n_empties` table selection. **Deliverable:
+  flatten + (optionally) quantize trained weights to a per-range flat `[i16]`/`[f32]`
+  and an `eval(&Eval) -> i32` that is a straight-line sum.** Eval need not run at
+  every leaf — only at the shallow nodes where ordering/MTD use it (Step 34).
+
+### Step 34 — eval-guided move ordering (the ~3.7× lever) + eval-seeded MTD-f
+With Step 33 in place, replicate Edax's **two-tier, depth-gated** midgame ordering
+(`move.c`). Our current `order_score` (Step 6b) + the shallow parity tier (Step 30)
+already match **tier 1** (`movelist_evaluate_fast`, `move.c:299`: corner stability +
+potential/real mobility + `SQUARE_VALUE` + parity, hash moves shortcut to big
+constants). The missing piece is **tier 2** (`movelist_evaluate`, `move.c:368`):
+
+- **Depth-gated dispatch.** Per node Edax computes `sort_depth = (depth - 15) / 3`
+  (clamped 0..6) and gates on `min_depth_table[empties]` (`move.c:370`). Below the
+  gate it falls back to tier 1; at/above it adds a **shallow-search bonus**.
+- **The shallow-search bonus is the new signal** (`move.c:440`): make the move
+  (incremental `search_update_midgame` → `eval_update`), then add
+  `(SCORE_MAX − shallow_score) · w_eval` where `shallow_score` comes from
+  `search_eval_0` (1-ply) / `search_eval_1` (2-ply) / `search_eval_2` (3-ply) /
+  `PVS_shallow` (depth 3–6) by `sort_depth`; restore. Weight `w_eval = 1<<15` is
+  co-dominant with mobility. This is a *positional/pattern* score — new information —
+  which is why the plan's mobility-only seeding prototype was ~0: it duplicated
+  `order_score`'s signal. The score layering (move.c:351, wipeout 1<<30 … parity
+  1<<0) keeps each term strictly dominating the next.
+- **Two structural prerequisites we lack.** (a) **Iterative deepening**: Edax's
+  shallow passes seed the TT with near-perfect best move + bounds, and
+  `movelist_evaluate` reads `hash_data->move[0/1]` as the top-2 ordering keys — we do
+  a single cold full-window PVS, so there are no hash moves to promote. (b)
+  **`inc_sort_depth[node_type]`** (`midgame.c:647,791`): PV nodes get a deeper
+  `sort_depth` than cut nodes. Both are part of this step, not optional polish.
+- **Same machinery feeds eval-seeded MTD-f (Step 31).** The eval's score estimate is
+  the MTD-f first guess; the iterative-deepening shallow result is even better. Do
+  ordering first (it also produces the estimate), then revisit `USE_MTD`.
+
+Sequence within this step: (1) iterative-deepening driver + TT hash-move ordering;
+(2) `sort_depth`/`min_depth_table` schedule calling the Step-33 eval; (3)
+`inc_sort_depth`; (4) feed the estimate to MTD-f. A/B each against the 6×24e set and
+the standard `bench` levels — the target is node count, not nodes/s.
 
 ### Step 26 — AVX2 `get_moves` in the real search
 `get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-
