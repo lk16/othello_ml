@@ -80,6 +80,49 @@ impl Weights {
         score
     }
 
+    /// Evaluate from precomputed feature-pattern indices (one per feature).
+    ///
+    /// Alloc-free hot path used by training: the caller extracts the indices
+    /// once (positions are fixed across epochs) and reuses them, so this skips
+    /// the per-call `Features::extract` `Vec` and the per-cell `get_cell` loop.
+    /// The `range_idx` is computed once instead of per feature.
+    pub fn evaluate_indices(&self, indices: &[u32], empties: u32) -> f32 {
+        let range_idx = self.empty_range_index(empties);
+        let mut score = 0.0f32;
+        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
+            let row = &self.feature_weights[feat_idx][range_idx];
+            let p = pattern_idx as usize;
+            if p < row.len() {
+                score += row[p];
+            }
+        }
+        score
+    }
+
+    /// In-place SGD step over precomputed feature-pattern indices.
+    ///
+    /// Equivalent to calling [`Weights::update_weight_sgd`] for every feature,
+    /// but computes `range_idx` once and indexes directly (no per-feature
+    /// `get`/`set` round-trip). Same `MAX_WEIGHT` clamp.
+    pub fn sgd_step_indices(
+        &mut self,
+        indices: &[u32],
+        empties: u32,
+        learning_rate: f32,
+        gradient: f32,
+    ) {
+        const MAX_WEIGHT: f32 = 100.0;
+        let range_idx = self.empty_range_index(empties);
+        let step = learning_rate * gradient;
+        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
+            let row = &mut self.feature_weights[feat_idx][range_idx];
+            let p = pattern_idx as usize;
+            if p < row.len() {
+                row[p] = (row[p] + step).clamp(-MAX_WEIGHT, MAX_WEIGHT);
+            }
+        }
+    }
+
     /// Get weight for a specific feature, pattern, and empty range
     pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> f32 {
         if feature_idx >= self.feature_weights.len() {

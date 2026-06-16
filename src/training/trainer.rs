@@ -4,9 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Message sent from worker threads back to the main thread.
-enum WorkerMsg {
-    Done { weights: Weights, loss: f64 },
+/// A training example "compiled" once for the epoch loop: the feature-pattern
+/// indices are extracted a single time (positions are fixed across epochs) and
+/// reused every epoch, eliminating the per-epoch `Features::extract` `Vec`
+/// alloc and per-cell `get_cell` loop. Shuffled together so indices stay paired
+/// with their target.
+struct CompiledExample {
+    indices: Vec<u32>,
+    empties: u32,
+    target: f32,
 }
 
 /// Training data point: a board position paired with its ground truth evaluation.
@@ -138,29 +144,44 @@ impl Trainer {
     /// Uses [`TrainingConfig`] to control epochs, LR schedule offset,
     /// optional early stopping via an interrupt flag, and thread count.
     ///
-    /// When `threads > 1`, each batch is processed in parallel: the batch
-    /// is split across worker threads, each with a cloned copy of the
-    /// weights.  Results are sent back via channels and merged by
-    /// averaging the weight deltas.
+    /// Feature indices are extracted **once** up front ([`CompiledExample`]) and
+    /// reused every epoch — positions are fixed, so re-extracting per epoch (and
+    /// the `Vec`/`get_cell` cost) is pure waste.
+    ///
+    /// Single-threaded (`threads <= 1`) runs online SGD **in place** over the
+    /// compiled examples — no per-batch weight clone or full-table merge (the
+    /// old path cloned the ~107 MB table and scanned all weights per 32-example
+    /// batch, even single-threaded). With `threads > 1`, each thread trains its
+    /// shard on a cloned copy and the weight deltas are averaged **once per
+    /// epoch** (model-averaging SGD), so the clone/merge cost is paid `threads`
+    /// times per epoch instead of once per batch.
     pub fn train_epochs(
         &self,
         weights: &mut Weights,
-        examples: &mut [TrainingExample],
+        examples: &[TrainingExample],
         config: &TrainingConfig,
     ) {
-        use std::io::{self, Write};
-        use std::sync::mpsc;
-
         let epochs = config.epochs;
         let epoch_offset = config.epoch_offset;
         let n_examples = examples.len();
-        let n_batches = n_examples.div_ceil(self.batch_size);
         let total_updates = n_examples * weights.feature_count() * epochs;
         let n_threads = config.threads.max(1);
 
+        // Compile once: extract feature indices for every example a single time.
+        let features = weights.features().clone();
+        let n_features = features.count() as f32;
+        let mut compiled: Vec<CompiledExample> = examples
+            .iter()
+            .map(|ex| CompiledExample {
+                indices: features.extract(&ex.position),
+                empties: ex.position.empties(),
+                target: ex.target_score as f32,
+            })
+            .collect();
+
         eprintln!(
-            "Training: {} epochs × {} examples ({} batches/epoch, batch_size={})",
-            epochs, n_examples, n_batches, self.batch_size
+            "Training: {} epochs × {} examples (online SGD, batch_size={})",
+            epochs, n_examples, self.batch_size
         );
         eprintln!(
             "  weight updates: {} examples × {} features × {} epochs ≈ {:.1}M total",
@@ -200,96 +221,42 @@ impl Trainer {
 
             let global_epoch = epoch_offset + epoch;
             let mut rng = XorShift32::new(global_epoch as u32);
-            shuffle(examples, &mut rng);
+            shuffle(&mut compiled, &mut rng);
 
             let current_lr = self.effective_lr(global_epoch);
 
             let epoch_start = Instant::now();
-            let mut loss: f64 = 0.0;
 
-            for chunk in examples.chunks(self.batch_size) {
-                let workers = n_threads.min(chunk.len());
-                let chunk: Vec<TrainingExample> = chunk.to_vec();
-                let chunk_size = chunk.len();
+            let loss: f64 = if n_threads <= 1 {
+                train_shard_in_place(weights, &compiled, n_features, current_lr)
+            } else {
+                // Model-averaging SGD: split the epoch across threads, each
+                // training a shard on its own clone; average the deltas once.
+                let shard = n_examples.div_ceil(n_threads);
+                let results: Vec<(Weights, f64)> = std::thread::scope(|s| {
+                    let handles: Vec<_> = compiled
+                        .chunks(shard)
+                        .map(|part| {
+                            let mut w = weights.clone();
+                            s.spawn(move || {
+                                let loss =
+                                    train_shard_in_place(&mut w, part, n_features, current_lr);
+                                (w, loss)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
 
-                let (tx, rx) = mpsc::channel::<WorkerMsg>();
-
-                for part in chunk.chunks(chunk_size.div_ceil(workers)) {
-                    let tx = tx.clone();
-                    let mut w = weights.clone();
-                    let part = part.to_vec();
-                    let lr = current_lr;
-                    std::thread::spawn(move || {
-                        let loss = {
-                            let features = w.features().clone();
-                            let n_features = features.count() as f32;
-                            let mut loss: f64 = 0.0;
-                            for example in &part {
-                                let predicted = w.evaluate(&example.position, &features);
-                                let error = example.target_score as f32 - predicted;
-                                loss += (error as f64) * (error as f64);
-                                let gradient = 2.0 * error / n_features;
-                                let feature_indices = features.extract(&example.position);
-                                for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
-                                    w.update_weight_sgd(
-                                        feat_idx,
-                                        pattern_idx,
-                                        example.position.empties(),
-                                        lr,
-                                        gradient,
-                                    );
-                                }
-                            }
-                            loss
-                        };
-                        let _ = tx.send(WorkerMsg::Done { weights: w, loss });
-                    });
+                let mut loss = 0.0;
+                let mut worker_weights = Vec::with_capacity(results.len());
+                for (w, l) in results {
+                    loss += l;
+                    worker_weights.push(w);
                 }
-                drop(tx);
-
-                let mut worker_weights = Vec::with_capacity(workers);
-                let mut done = 0usize;
-                let spin = b"|/-\\";
-
-                while done < workers {
-                    match rx.recv() {
-                        Ok(WorkerMsg::Done {
-                            weights: w,
-                            loss: l,
-                        }) => {
-                            done += 1;
-                            loss += l;
-                            worker_weights.push(w);
-                            let elapsed = epoch_start.elapsed().as_secs_f64();
-                            let throughput = if elapsed > 0.01 {
-                                (done * chunk_size / workers) as f64 / elapsed
-                            } else {
-                                0.0
-                            };
-                            eprint!(
-                                "\r  {} {}/{} workers  {:.0} ex/s          ",
-                                spin[done % spin.len()] as char,
-                                done,
-                                workers,
-                                throughput,
-                            );
-                            let _ = io::stderr().flush();
-                        }
-                        Err(_) => break,
-                    }
-                }
-
-                if let Some(ref flag) = config.interrupt {
-                    if flag.load(Ordering::Relaxed) {
-                        eprintln!(
-                            "\nInterrupted during epoch {global_epoch} — keeping weights from last completed epoch."
-                        );
-                        return;
-                    }
-                }
-
                 weights.merge_from_workers(&worker_weights);
-            }
+                loss
+            };
 
             let epoch_elapsed = epoch_start.elapsed();
             let total_elapsed = total_start.elapsed();
@@ -300,7 +267,7 @@ impl Trainer {
             let remaining_secs = avg_epoch_secs * (epochs - epoch - 1) as f64;
 
             eprintln!(
-                "\rEpoch {}/{} (global {}) | loss: {:.4} | lr: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s   ",
+                "Epoch {}/{} (global {}) | loss: {:.4} | lr: {:.4} | time: {:.1}s | {:.0} ex/s | ETA: {:.0}s",
                 epoch + 1, epochs, global_epoch + 1, avg_loss, current_lr, epoch_elapsed.as_secs_f64(), throughput, remaining_secs
             );
 
@@ -311,9 +278,29 @@ impl Trainer {
         let total_secs = total_start.elapsed().as_secs_f64();
         let overall_throughput = (n_examples * completed) as f64 / total_secs.max(0.001);
         eprintln!(
-            "\rComplete        | loss: {last_loss:.4} | time: {total_secs:.1}s | {overall_throughput:.0} ex/s   "
+            "Complete | loss: {last_loss:.4} | time: {total_secs:.1}s | {overall_throughput:.0} ex/s"
         );
     }
+}
+
+/// Run online SGD over one shard of compiled examples, mutating `weights` in
+/// place and returning the accumulated squared error. Shared by the
+/// single-threaded path and the per-thread workers.
+fn train_shard_in_place(
+    weights: &mut Weights,
+    shard: &[CompiledExample],
+    n_features: f32,
+    lr: f32,
+) -> f64 {
+    let mut loss = 0.0f64;
+    for ce in shard {
+        let predicted = weights.evaluate_indices(&ce.indices, ce.empties);
+        let error = ce.target - predicted;
+        loss += (error as f64) * (error as f64);
+        let gradient = 2.0 * error / n_features;
+        weights.sgd_step_indices(&ce.indices, ce.empties, lr, gradient);
+    }
+    loss
 }
 
 #[cfg(test)]

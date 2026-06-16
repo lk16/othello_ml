@@ -392,9 +392,9 @@ into move ordering and MTD-f). Steps 33/34 are modelled directly on Edax's
 Steps 1–25, 27, 29, 30 are implemented or resolved; Step 31 (MTD-f) is built but
 shelved (net-neutral without an eval — see above). **Steps 32–34 below are the
 current priority phase** — the eval-gated node-count levers (~2× window, ~3.7×
-ordering): Step 32 makes training fast enough to produce a strong eval, Step 33 adds
-an alloc-free flat pattern eval to the solver, Step 34 wires it into ordering and
-MTD-f. Steps 26 and 28 below come from
+ordering): Step 32 makes training fast enough to produce a strong eval (**core done:
+~2700× single-thread, see below**), Step 33 adds an alloc-free flat pattern eval to
+the solver, Step 34 wires it into ordering and MTD-f. Steps 26 and 28 below come from
 a **callgrind profile of the sequential hot path**
 (release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
 they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
@@ -461,6 +461,22 @@ slow *and* its parallel path is mis-designed. Findings from reading
 The current merge also averages a minibatch-of-1-per-example; once weights are flat
 + shared this can become proper accumulated-gradient minibatch SGD. None of this
 changes the model — only its speed — so it is pure prep for a stronger eval.
+
+**Done (the first two items; model unchanged, verified by identical per-epoch
+loss).** `CompiledExample` extracts the 47 feature indices **once** up front and
+reuses them every epoch (`evaluate_indices`/`sgd_step_indices` on `Weights` are the
+alloc-free, single-`range_idx` accessors). The single-threaded path now runs online
+SGD **in place** — no per-batch clone or merge. Measured, identical config (one PGN,
+empties ≤ 14, 2624 examples, 2 epochs, threads 1): **356 → ~960K ex/s overall
+(~2700×)**, loss bit-identical (epoch 1 499.0375, epoch 2 208.3582). At scale (10
+PGNs, 31,777 examples × 10 epochs) the whole run is **~0.1 s at ~4M ex/s/epoch** —
+the speedup grows with dataset size because the old per-batch clone/merge cost was
+O(weights)·n_batches, independent of batch content. The **third/fourth items
+(flatten + lock-free parallel) are still open** but now low-value: at ~4M ex/s
+single-threaded the parallel path is *counter-productive* (the 107 MB clone + merge
+dwarfs the trivial per-example compute and epoch-level model-averaging converges
+worse), so `threads = 1` is the right default. Revisit flattening only as part of
+Step 33 (the solver eval needs the flat layout anyway).
 
 ### Step 33 — alloc-free flat pattern eval in the solver
 `Weights::evaluate` allocates per call (the `extract` `Vec`) and triple-chases

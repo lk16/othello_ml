@@ -335,8 +335,7 @@ fn run_train(args: TrainArgs) {
         }
     }
 
-    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads)
-    {
+    let examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads) {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -355,7 +354,7 @@ fn run_train(args: TrainArgs) {
         interrupt: Some(interrupted),
         threads: args.threads,
     };
-    trainer.train_epochs(&mut weights, &mut examples, &train_config);
+    trainer.train_epochs(&mut weights, &examples, &train_config);
 
     weights.print_sample(&features, 10);
 
