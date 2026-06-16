@@ -4,9 +4,9 @@ use othello_eval::{
 };
 use std::env;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 enum Command {
     Train(TrainArgs),
@@ -607,43 +607,93 @@ fn run_train_boot(args: TrainBootArgs) {
 }
 
 /// Label a band of positions by bootstrapped shallow search, parallelised across
-/// `threads` (the labels are independent). Training stays single-threaded.
+/// `threads` (the labels are independent). Training stays single-threaded. Reports
+/// live progress + ETA on a single updating line (`done` is shared so a monitor
+/// thread can read it while the workers label).
 fn bootstrap_label(
     band: &[Board],
     flat: &Arc<FlatEval>,
     depth: u32,
     threads: usize,
 ) -> Vec<TrainingExample> {
-    let label = |b: &Board| TrainingExample {
-        position: b.position,
-        target_score: bootstrap_score(&b.position, flat, depth),
+    let total = band.len();
+    let done = AtomicUsize::new(0);
+    let start = Instant::now();
+
+    let out: Vec<TrainingExample> = if threads <= 1 {
+        band.iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let ex = TrainingExample {
+                    position: b.position,
+                    target_score: bootstrap_score(&b.position, flat, depth),
+                };
+                if i % 512 == 0 {
+                    print_progress("labelling", i, total, start);
+                }
+                ex
+            })
+            .collect()
+    } else {
+        let done = &done;
+        let chunk = total.div_ceil(threads);
+        std::thread::scope(|s| {
+            // Monitor: print progress until every position is labelled.
+            s.spawn(move || loop {
+                let d = done.load(Ordering::Relaxed);
+                print_progress("labelling", d, total, start);
+                if d >= total {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            });
+            // Workers: each labels its chunk, bumping the shared counter.
+            let handles: Vec<_> = band
+                .chunks(chunk)
+                .map(|part| {
+                    let flat = Arc::clone(flat);
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|b| {
+                                let ex = TrainingExample {
+                                    position: b.position,
+                                    target_score: bootstrap_score(&b.position, &flat, depth),
+                                };
+                                done.fetch_add(1, Ordering::Relaxed);
+                                ex
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
     };
 
-    if threads <= 1 {
-        return band.iter().map(label).collect();
-    }
+    print_progress("labelling", total, total, start);
+    eprintln!(); // finish the progress line
+    out
+}
 
-    let chunk = band.len().div_ceil(threads);
-    std::thread::scope(|s| {
-        let handles: Vec<_> = band
-            .chunks(chunk)
-            .map(|part| {
-                let flat = Arc::clone(flat);
-                s.spawn(move || {
-                    part.iter()
-                        .map(|b| TrainingExample {
-                            position: b.position,
-                            target_score: bootstrap_score(&b.position, &flat, depth),
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+/// Print a single-line `\r` progress indicator with rate and ETA.
+fn print_progress(what: &str, done: usize, total: usize, start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = done as f64 / elapsed.max(0.001);
+    let pct = if total > 0 {
+        done as f64 / total as f64 * 100.0
+    } else {
+        100.0
+    };
+    let eta = if rate > 0.0 {
+        (total.saturating_sub(done)) as f64 / rate
+    } else {
+        0.0
+    };
+    eprint!("\r  {what} {done}/{total} ({pct:.0}%) | {rate:.0}/s | ETA {eta:.0}s        ");
+    let _ = io::stderr().flush();
 }
 
 fn run_play(args: PlayArgs) {
