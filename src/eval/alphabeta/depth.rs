@@ -4,6 +4,7 @@
 
 use super::search::Search;
 use super::{SCORE_MAX, SCORE_MIN};
+use crate::eval::pattern::FlatEval;
 use crate::othello::position::Position;
 use crate::training::features::Features;
 use crate::training::weights::Weights;
@@ -16,6 +17,53 @@ pub fn depth_limited_score(
     features: &Features,
 ) -> i32 {
     alphabeta(pos, depth, weights, features, SCORE_MIN, SCORE_MAX)
+}
+
+/// Bootstrapped training label for `pos`: the backed-up score of a depth-`depth`
+/// negamax whose horizon leaves are scored by the alloc-free trained pattern eval
+/// [`FlatEval`] (Step 33). Side-to-move perspective, in `[-64, 64]`.
+///
+/// Used by `train-boot` to label positions with empties > N, where exact search
+/// is infeasible. The eval is exact-trained at empties ≤ N, so a shallow search
+/// from a position just above N bottoms out in that well-trained band — anchoring
+/// the label to (near-)ground-truth. Identical in structure to [`alphabeta`], but
+/// with `FlatEval::eval_position` at the leaves instead of [`heuristic`].
+pub fn bootstrap_score(pos: &Position, flat: &FlatEval, depth: u32) -> i32 {
+    boot_ab(pos, depth, flat, SCORE_MIN, SCORE_MAX)
+}
+
+/// Negamax with alpha-beta and a depth limit, [`FlatEval`] at the horizon.
+fn boot_ab(pos: &Position, depth: u32, flat: &FlatEval, mut alpha: i32, beta: i32) -> i32 {
+    let moves = pos.get_moves();
+    if moves == 0 {
+        let passed = pos.pass_move();
+        if passed.get_moves() == 0 {
+            return pos.final_score();
+        }
+        return -boot_ab(&passed, depth, flat, -beta, -alpha);
+    }
+
+    if depth == 0 {
+        return flat
+            .eval_position(pos)
+            .round()
+            .clamp(SCORE_MIN as f32, SCORE_MAX as f32) as i32;
+    }
+
+    let mut remaining = moves;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        let child = pos.do_move(cell);
+        let score = -boot_ab(&child, depth - 1, flat, -beta, -alpha);
+        if score > alpha {
+            alpha = score;
+            if alpha >= beta {
+                break;
+            }
+        }
+    }
+    alpha
 }
 
 /// Best legal move for the side to move, or `None` when there are no moves.
@@ -201,6 +249,43 @@ mod tests {
         let features = Features::edax();
         let weights = Weights::new(features.clone());
         assert!(best_move(&pos, 4, 12, &weights, &features).is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_score_game_end_is_exact() {
+        // At game end, the search returns the true final score regardless of eval.
+        let pos = Position {
+            player: u64::MAX,
+            opponent: 0,
+        };
+        let weights = Weights::new(Features::edax());
+        let flat = crate::eval::pattern::FlatEval::from_weights(&weights);
+        assert_eq!(bootstrap_score(&pos, &flat, 4), 64);
+    }
+
+    #[test]
+    fn test_bootstrap_score_depth0_is_leaf_eval() {
+        // With depth 0 the score is just the clamped leaf eval of the position.
+        let pos = Position::initial();
+        let weights = Weights::new(Features::edax());
+        let flat = crate::eval::pattern::FlatEval::from_weights(&weights);
+        let expected = flat
+            .eval_position(&pos)
+            .round()
+            .clamp(SCORE_MIN as f32, SCORE_MAX as f32) as i32;
+        assert_eq!(bootstrap_score(&pos, &flat, 0), expected);
+    }
+
+    #[test]
+    fn test_bootstrap_score_bounded() {
+        let pos = Position::initial();
+        let weights = Weights::new(Features::edax());
+        let flat = crate::eval::pattern::FlatEval::from_weights(&weights);
+        let s = bootstrap_score(&pos, &flat, 4);
+        assert!(
+            (SCORE_MIN..=SCORE_MAX).contains(&s),
+            "score {s} out of bounds"
+        );
     }
 
     #[test]

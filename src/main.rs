@@ -1,6 +1,6 @@
 use othello_eval::{
-    best_move, build_examples, load_games, Board, Features, FlatEval, ParallelSolver, Position,
-    Solver, Trainer, TrainingConfig, Weights,
+    best_move, bootstrap_score, build_examples, load_games, Board, Features, FlatEval,
+    ParallelSolver, Position, Solver, Trainer, TrainingConfig, TrainingExample, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -10,6 +10,7 @@ use std::time::Instant;
 
 enum Command {
     Train(TrainArgs),
+    TrainBoot(TrainBootArgs),
     Play(PlayArgs),
     Bench(BenchArgs),
     BenchFlip,
@@ -24,6 +25,28 @@ struct TrainArgs {
     resume_epoch: usize,
     eval_file: Option<String>,
     weights_file: String,
+    threads: usize,
+    paths: Vec<String>,
+}
+
+/// Args for `train-boot`: bootstrapped training of empties > N against shallow-search
+/// estimates that use the current weights at their leaves (see `run_train_boot`).
+struct TrainBootArgs {
+    /// Exact-trained frontier N: the eval is trusted at empties ≤ N (anchor).
+    exact_empties: u32,
+    /// Train bands up to this many empties (M).
+    max_empties: u32,
+    /// Shallow-search depth for labels — also the curriculum band width, so each
+    /// band's leaves land in the already-trained band below it.
+    depth: u32,
+    /// SGD epochs per band.
+    epochs: usize,
+    /// Inverse-time LR decay (per band; each band restarts the schedule).
+    lr_decay: f32,
+    /// Weights file: loaded for the starting eval (must already be exact-trained)
+    /// and overwritten after each band.
+    weights_file: String,
+    /// Threads for label generation (training itself is single-threaded online SGD).
     threads: usize,
     paths: Vec<String>,
 }
@@ -64,7 +87,9 @@ fn parse_args() -> Option<Command> {
     }
 
     match args[1].as_str() {
-        "train" => parse_train_args(&args[0], &args[2..]),
+        // `train` is kept as an alias for `train-exact` (the original behaviour).
+        "train" | "train-exact" => parse_train_args(&args[0], &args[2..]),
+        "train-boot" => parse_train_boot_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
         "bench" => parse_bench_args(&args[0], &args[2..]),
         "bench-flip" => Some(Command::BenchFlip),
@@ -143,6 +168,73 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
         lr_decay,
         resume_epoch,
         eval_file,
+        weights_file,
+        threads,
+        paths,
+    }))
+}
+
+fn parse_train_boot_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut exact_empties: u32 = 16;
+    let mut max_empties: u32 = 24;
+    let mut depth: u32 = 4;
+    let mut epochs: usize = 100;
+    let mut lr_decay: f32 = 0.01;
+    let mut weights_file: String = String::from("trained_weights.bin");
+    let mut threads: usize = 1;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--exact-empties" {
+            i += 1;
+            if i < args.len() {
+                exact_empties = args[i].parse::<u32>().unwrap_or(16);
+            }
+        } else if args[i] == "--max-empties" || args[i] == "-n" {
+            i += 1;
+            if i < args.len() {
+                max_empties = args[i].parse::<u32>().unwrap_or(24);
+            }
+        } else if args[i] == "--depth" {
+            i += 1;
+            if i < args.len() {
+                depth = args[i].parse::<u32>().unwrap_or(4);
+            }
+        } else if args[i] == "--epochs" || args[i] == "-e" {
+            i += 1;
+            if i < args.len() {
+                epochs = args[i].parse::<usize>().unwrap_or(100);
+            }
+        } else if args[i] == "--lr-decay" || args[i] == "-d" {
+            i += 1;
+            if i < args.len() {
+                lr_decay = args[i].parse::<f32>().unwrap_or(0.01);
+            }
+        } else if args[i] == "--weights" || args[i] == "-w" {
+            i += 1;
+            if i < args.len() {
+                weights_file = args[i].clone();
+            }
+        } else if args[i] == "--threads" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+            }
+        } else if args[i] == "--help" || args[i] == "-h" {
+            print_train_boot_usage(program);
+            return None;
+        } else {
+            paths.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    Some(Command::TrainBoot(TrainBootArgs {
+        exact_empties,
+        max_empties,
+        depth,
+        epochs,
+        lr_decay,
         weights_file,
         threads,
         paths,
@@ -276,6 +368,7 @@ fn main() {
 
     match cmd {
         Command::Train(args) => run_train(args),
+        Command::TrainBoot(args) => run_train_boot(args),
         Command::Play(args) => run_play(args),
         Command::Bench(args) => run_bench(args),
         Command::BenchFlip => othello_eval::bench_flip_variants(),
@@ -377,6 +470,180 @@ fn run_train(args: TrainArgs) {
     }
 
     eprintln!("\nDone!");
+}
+
+/// Bootstrapped training of deeper positions (empties > N).
+///
+/// The eval is exact-trained at empties ≤ N (the `train-exact` output). This
+/// command extends it outward, one **band of width `depth`** at a time: each band
+/// `(frontier, frontier+depth]` is labelled by a depth-`depth` shallow search whose
+/// leaves are scored by the *current* weights (frozen `FlatEval` snapshot), then
+/// trained. Because a depth-`depth` search from empties ≤ frontier+depth bottoms out
+/// at empties ≤ frontier — already trained — every label is anchored to the band
+/// below it, expanding the well-trained frontier upward without unanchored drift.
+/// Weights are per-empty-range buckets, so each band updates disjoint buckets (no
+/// forgetting of lower bands). Training is single-threaded online SGD; `--threads`
+/// parallelises only the (independent) label generation.
+fn run_train_boot(args: TrainBootArgs) {
+    if args.paths.is_empty() {
+        eprintln!("Error: No input files or directories specified.\n");
+        let program = env::args().next().unwrap_or_default();
+        print_train_boot_usage(&program);
+        return;
+    }
+
+    eprintln!("=== Othello ML Bootstrapped Training ===");
+    eprintln!("Exact frontier N : {}", args.exact_empties);
+    eprintln!("Train up to      : {} empties", args.max_empties);
+    eprintln!("Search depth/band: {}", args.depth);
+    eprintln!("Epochs per band  : {}", args.epochs);
+    eprintln!("Label threads    : {}", args.threads);
+    eprintln!("Weights file     : {}", args.weights_file);
+
+    if args.depth == 0 {
+        eprintln!("Error: --depth must be >= 1 (depth 0 = bare eval, no bootstrapping).");
+        return;
+    }
+
+    // The starting eval must already be exact-trained; a fresh (all-zero) table
+    // produces meaningless labels, so require the file to load.
+    let mut weights = match Weights::load(&args.weights_file) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "Error: could not load weights from {} ({e}).\n\
+                 train-boot needs an exact-trained eval to bootstrap from — run `train-exact` first.",
+                args.weights_file
+            );
+            return;
+        }
+    };
+
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+    let positions: Vec<Board> = games
+        .iter()
+        .flat_map(|game| game.positions.iter())
+        .filter(|p| p.empties() > args.exact_empties && p.empties() <= args.max_empties)
+        .cloned()
+        .collect();
+    eprintln!(
+        "Extracted {} positions with empties in ({}, {}]",
+        positions.len(),
+        args.exact_empties,
+        args.max_empties
+    );
+    if positions.is_empty() {
+        eprintln!("No positions in the bootstrap range. Exiting.");
+        return;
+    }
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!("\nInterrupt received — finishing current band, then stopping...");
+            interrupted.store(true, Ordering::Relaxed);
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
+    }
+
+    let trainer = Trainer::new(0.1, 32, args.lr_decay);
+
+    let mut frontier = args.exact_empties;
+    while frontier < args.max_empties {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        let hi = (frontier + args.depth).min(args.max_empties);
+        let band: Vec<Board> = positions
+            .iter()
+            .filter(|p| p.empties() > frontier && p.empties() <= hi)
+            .cloned()
+            .collect();
+
+        eprintln!(
+            "\n--- Band empties ({frontier}, {hi}]: {} positions ---",
+            band.len()
+        );
+        if band.is_empty() {
+            frontier = hi;
+            continue;
+        }
+
+        // Freeze the current weights as the leaf eval for this band's labels.
+        let flat = Arc::new(FlatEval::from_weights(&weights));
+        let t = Instant::now();
+        let examples = bootstrap_label(&band, &flat, args.depth, args.threads);
+        eprintln!(
+            "Labelled {} positions in {:.1}s (depth-{} shallow search)",
+            examples.len(),
+            t.elapsed().as_secs_f64(),
+            args.depth
+        );
+
+        let train_config = TrainingConfig {
+            epochs: args.epochs,
+            epoch_offset: 0, // each band is its own disjoint weight region
+            interrupt: Some(Arc::clone(&interrupted)),
+            threads: 1, // single-threaded online SGD (best convergence)
+        };
+        trainer.train_epochs(&mut weights, &examples, &train_config);
+
+        match weights.save(&args.weights_file) {
+            Ok(()) => eprintln!("Saved weights after band ({frontier}, {hi}]"),
+            Err(e) => eprintln!("Error saving weights: {e}"),
+        }
+        frontier = hi;
+    }
+
+    eprintln!("\nDone (trained up to empties {frontier}).");
+}
+
+/// Label a band of positions by bootstrapped shallow search, parallelised across
+/// `threads` (the labels are independent). Training stays single-threaded.
+fn bootstrap_label(
+    band: &[Board],
+    flat: &Arc<FlatEval>,
+    depth: u32,
+    threads: usize,
+) -> Vec<TrainingExample> {
+    let label = |b: &Board| TrainingExample {
+        position: b.position,
+        target_score: bootstrap_score(&b.position, flat, depth),
+    };
+
+    if threads <= 1 {
+        return band.iter().map(label).collect();
+    }
+
+    let chunk = band.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = band
+            .chunks(chunk)
+            .map(|part| {
+                let flat = Arc::clone(flat);
+                s.spawn(move || {
+                    part.iter()
+                        .map(|b| TrainingExample {
+                            position: b.position,
+                            target_score: bootstrap_score(&b.position, &flat, depth),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 fn run_play(args: PlayArgs) {
@@ -672,7 +939,10 @@ fn print_usage(program: &str) {
     eprintln!("Othello ML training and playing.");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  train    Train evaluation weights from game files");
+    eprintln!("  train-exact  Train weights on exact-search labels (empties <= N). Alias: train");
+    eprintln!(
+        "  train-boot   Extend the eval to empties > N via bootstrapped shallow-search labels"
+    );
     eprintln!("  play     Play a game against the CLI");
     eprintln!("  bench    Benchmark exact alpha-beta search speed");
     eprintln!("  bench-flip  Micro-benchmark the flip-computation variants");
@@ -718,6 +988,35 @@ fn print_train_usage(program: &str) {
     eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
     eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
     eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
+}
+
+fn print_train_boot_usage(program: &str) {
+    eprintln!("Usage: {program} train-boot [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Extend a trained eval to positions with empties > N using bootstrapped labels:");
+    eprintln!("each position is labelled by a shallow search whose leaves use the current");
+    eprintln!("weights, expanding the well-trained frontier outward one band at a time.");
+    eprintln!();
+    eprintln!("Requires an already exact-trained weights file (run `train-exact` first).");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("      --exact-empties N Exact-trained frontier to bootstrap from (default: 16)");
+    eprintln!("  -n, --max-empties N   Train bands up to N empties (default: 24)");
+    eprintln!("      --depth N         Shallow-search depth = curriculum band width (default: 4)");
+    eprintln!("  -e, --epochs N        SGD epochs per band (default: 100)");
+    eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01)");
+    eprintln!("  -w, --weights PATH    Weights file: loaded and overwritten (default: trained_weights.bin)");
+    eprintln!("  -t, --threads N       Threads for label generation (training is single-threaded)");
+    eprintln!("  -h, --help            Show this help message");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  Same game-file paths as train-exact (.wtb/.pgn/.txt/directories).");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {program} train-boot -w ignored/trained_weights.bin training_data/");
+    eprintln!(
+        "  {program} train-boot --exact-empties 16 -n 28 --depth 4 -t 8 -w w.bin training_data/"
+    );
 }
 
 fn print_bench_usage(program: &str) {

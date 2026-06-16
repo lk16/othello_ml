@@ -18,7 +18,7 @@ mod tt;
 mod testutil;
 
 pub use count_flip::bench_count_flip_variants;
-pub use depth::{best_move, depth_limited_score};
+pub use depth::{best_move, bootstrap_score, depth_limited_score};
 pub use parallel::ParallelSolver;
 
 use crate::eval::pattern::FlatEval;
