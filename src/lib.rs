@@ -7,6 +7,7 @@ pub use eval::alphabeta::{
     ParallelSolver, Solver,
 };
 pub use eval::cache::{build_examples, EvalCache};
+pub use eval::pattern::FlatEval;
 
 /// Micro-benchmark the flip-computation variants (Step 11). See
 /// [`othello::flip`].

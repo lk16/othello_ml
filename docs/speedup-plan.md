@@ -394,7 +394,8 @@ shelved (net-neutral without an eval — see above). **Steps 32–34 below are t
 current priority phase** — the eval-gated node-count levers (~2× window, ~3.7×
 ordering): Step 32 makes training fast enough to produce a strong eval (**core done:
 ~2700× single-thread, see below**), Step 33 adds an alloc-free flat pattern eval to
-the solver, Step 34 wires it into ordering and MTD-f. Steps 26 and 28 below come from
+the solver (**core done: `FlatEval`, bit-identical to `Weights::evaluate`**), Step 34
+wires it into ordering and MTD-f. Steps 26 and 28 below come from
 a **callgrind profile of the sequential hot path**
 (release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
 they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
@@ -505,6 +506,29 @@ Step 33 (the solver eval needs the flat layout anyway).
   flatten + (optionally) quantize trained weights to a per-range flat `[i16]`/`[f32]`
   and an `eval(&Eval) -> i32` that is a straight-line sum.** Eval need not run at
   every leaf — only at the shallow nodes where ordering/MTD use it (Step 34).
+
+**Done (the flat alloc-free evaluator).** [`FlatEval`] (`src/eval/pattern.rs`)
+copies a trained `Weights` table **once** into a single contiguous `Vec<f32>`,
+range-major (`weights[r * range_stride + offset[f] + pattern]`, `offset` = prefix
+sum of per-feature `3^cells`) — replacing the `Vec<Vec<Vec<f32>>>` triple chase.
+`set(&Position, &mut [u16])` fills the 47 pattern indices alloc-free into a
+caller-owned buffer; `score(&[u16], empties)` is the straight-line dot product;
+`eval_position` does both into a `[u16; 64]` stack scratch (zero heap). Scores are
+**bit-identical** to `Weights::evaluate` (same f32 values, same feature order — a
+unit test asserts `to_bits()` equality across a spread of positions with randomized
+touched weights, plus a `set`+`score` vs `eval_position` test). Micro-bench (1M
+positions, real trained weights, checksums bit-identical): `Weights::evaluate`
+1.3 M/s → `FlatEval::eval_position` 1.4 M/s (**1.12×** — modest, because the
+per-cell index build in `set` dominates, same cost as `extract`) → `FlatEval::score`
+with precomputed indices **4.0 M/s (3.17×)**. The 3.17× on the bare dot product is
+the real prize, and it is unlocked **only** by maintaining indices incrementally
+(Step 34's `eval_update`) so the per-node cost is `score` alone, not `set`. **Deferred
+to Step 34** (where they're used and validated in-context): the `i16` quantization
+(kept f32
+for exact-match now) and the **incremental make/unmake update** (`eval_update`,
+`eval.c:782`) — at shallow ordering/MTD nodes a from-scratch `set` is affordable, so
+incremental is a later optimization, not a blocker. The coordinate→feature scatter
+table is only needed for that incremental path, so it too lands in Step 34.
 
 ### Step 34 — eval-guided move ordering (the ~3.7× lever) + eval-seeded MTD-f
 With Step 33 in place, replicate Edax's **two-tier, depth-gated** midgame ordering
