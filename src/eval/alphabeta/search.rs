@@ -332,6 +332,31 @@ impl Search {
         }
     }
 
+    /// Solve `pos` exactly via repeated null-window searches (MTD / bisection,
+    /// Step 31) rather than one full-window search. Each probe tests "score ≥ t"
+    /// for an odd threshold `t` (the exact score is always even), bisecting
+    /// `[SCORE_MIN, SCORE_MAX]` down to the exact value in ~6 probes. The
+    /// transposition table (never cleared) carries bounds across probes, so
+    /// successive probes are cheap. Exact: every probe is the exact null-window
+    /// search, so each "score ≥ t" answer is exact. The first probe (`t = 1`) is
+    /// the most informative split (sign of the score), MTD-f-style from a guess of 0.
+    pub(super) fn solve_mtd(&mut self, pos: &Position, empties: u32) -> i32 {
+        let mut lo = SCORE_MIN; // proven lower bound: score >= lo
+        let mut hi = SCORE_MAX; // proven upper bound: score <= hi
+        while lo < hi {
+            // `lo`/`hi` stay even, so `mid` is exact; pick the odd threshold
+            // strictly inside `(lo, hi)`.
+            let mid = (lo + hi) / 2;
+            let t = if mid & 1 != 0 { mid } else { mid + 1 };
+            if self.search_exact_nws(pos, t - 1, empties) >= t {
+                lo = t + 1; // score >= t (odd) => score >= t + 1 (even)
+            } else {
+                hi = t - 1; // score <  t        => score <= t - 1 (even)
+            }
+        }
+        lo
+    }
+
     /// Null-window dispatch: the window is implicitly `[alpha, alpha + 1]`, so
     /// `beta` is not passed. Used for every non-PV node. The leaf solvers are
     /// window-agnostic, so the leaf case reuses them with an explicit `alpha + 1`.

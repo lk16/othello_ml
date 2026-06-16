@@ -372,15 +372,20 @@ both prototypes A/B'd behind a `const`, then reverted — throwaway):
   alloc-free eval).
 
 **Direction (supersedes the SIMD steps 26/28 as the priority):**
-1. **MTD-f / aspiration** for the ~2× window lever — no eval needed (Step 31, in
-   progress).
-2. Later, **eval-guided move ordering** for the ~3.7× — deferred until the trained
-   weights are much stronger *and* a fast alloc-free eval path exists in the solver.
+1. **MTD-f / aspiration** for the ~2× window lever (Step 31). *Built and measured:
+   guess-free MTD is net-neutral — the ceiling needs a good score estimate, so this
+   lever is eval-gated too. Shelved behind `USE_MTD = false` as the scaffold for
+   eval-seeded MTD-f.*
+2. Then **eval-guided move ordering** for the ~3.7× — and the eval estimate also
+   unblocks (1). Both are deferred until the trained weights are much stronger *and*
+   a fast alloc-free eval path exists in the solver. Training the eval is therefore
+   the gating next phase.
 
 ## Remaining steps
 
-Steps 1–25, 27, 29, 30 are implemented or resolved; Step 31 (MTD-f) is in progress.
-Steps 26 and 28 below come from a **callgrind profile of the sequential hot path**
+Steps 1–25, 27, 29, 30 are implemented or resolved; Step 31 (MTD-f) is built but
+shelved (net-neutral without an eval — see above). Steps 26 and 28 below come from
+a **callgrind profile of the sequential hot path**
 (release + debug symbols, 16e, 150 boards) — but the Edax comparison above shows
 they target the ~10% per-node gap, not the ~7× node-count gap, so they are now low
 priority behind the search-algorithm work.
@@ -396,17 +401,21 @@ is the one-time `OnceLock` edge-table build, not a hot-path cost — it amortize
 to ~0 as boards grow; likewise `memchr`/`CharSearcher` ~1% is PGN parsing at
 load.)
 
-### Step 31 — MTD-f / aspiration root (window narrowing)
-The Edax comparison shows a ~2× node-count ceiling from searching the exact tree
-with a tight window instead of the full `[-64, 64]`. Replace the single
-full-window root search with repeated null-window searches that converge on the
-exact score (MTD-style), reusing the (never-cleared) transposition table across
-probes so each successive probe is cheap. No evaluation function required — a
-guess-free bisection over odd thresholds (`S` is always even) needs ~6 probes; an
-MTD-f first guess (e.g. 0) can cut that. Each probe is the existing exact
-null-window search, so the result stays exact (each "S ≥ t?" test is exact). A/B
-node count and wall-clock against the full-window baseline; keep if it wins.
-Sequential first (the `Solver` path); the parallel root can follow.
+### Step 31 — MTD-f / aspiration root (window narrowing) — built, net-neutral, shelved
+The Edax comparison shows a ~2× node-count *ceiling* from searching the exact tree
+with a tight window instead of the full `[-64, 64]`. Implemented it as
+[`Search::solve_mtd`]: repeated exact null-window probes ("score ≥ t?" for odd `t`,
+since `S` is always even) bisecting `[SCORE_MIN, SCORE_MAX]` to the exact value
+(~6 probes), reusing the never-cleared TT across probes. Result stays exact (every
+probe is the exact null-window search). A/B'd behind `USE_MTD` on the 6×24e set:
+**net-neutral, −0.1% nodes** (helps on extreme/near-zero scores, hurts on moderate
+ones — they cancel; wall-clock identical). The ceiling assumed a *perfect* estimate;
+guess-free bisection pays for the journey — the first probe ("S ≥ 1?") is nearly a
+full solve, and for scores far from 0 the extra probes outweigh the savings. MTD-f
+only wins with a **good first guess**, which needs an evaluation function. So this
+lever is **eval-gated, same as move ordering**. Kept behind `USE_MTD = false` as the
+scaffold for eval-seeded MTD-f (feed the eval's estimate as the first guess) once
+the trained weights are usable; revisit then, sequential first, parallel root later.
 
 ### Step 26 — AVX2 `get_moves` in the real search
 `get_moves` is ~17% of the hot path, yet Step 24 shelved `avx2` on a *micro*-

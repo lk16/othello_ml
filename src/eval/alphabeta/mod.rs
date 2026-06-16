@@ -28,6 +28,17 @@ use search::{board_parity, Search};
 pub(crate) const SCORE_MIN: i32 = -64;
 pub(crate) const SCORE_MAX: i32 = 64;
 
+/// A/B switch (Step 31): solve the root via MTD / aspiration ([`Search::solve_mtd`],
+/// repeated null-window probes converging on the exact score) instead of one
+/// full-window search. Same exact result; node count differs. Sequential `Solver`
+/// path only. **Off**: guess-free bisection measured net-neutral on 24e (−0.1%
+/// nodes — helps on extreme/near-zero scores, hurts on moderate ones) because the
+/// ~2× window-narrowing ceiling needs a *good score estimate*, which needs an
+/// evaluation function we don't yet have. Kept as the scaffold for eval-seeded
+/// MTD-f: once a usable eval exists, feed its estimate as the first guess. See the
+/// Edax-comparison section in docs/speedup-plan.md.
+const USE_MTD: bool = false;
+
 /// Exact score for `pos` from the side-to-move's perspective, in `[-64, 64]`.
 ///
 /// A one-shot wrapper that allocates a fresh transposition table per call;
@@ -67,17 +78,24 @@ impl Solver {
     pub fn exact_score(&mut self, pos: &Position) -> i32 {
         self.search.nodes = 0;
         self.search.parity = board_parity(pos);
-        self.search
-            .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+        if USE_MTD {
+            self.search.solve_mtd(pos, pos.empties())
+        } else {
+            self.search
+                .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+        }
     }
 
     /// Exact score plus the number of search nodes visited for this position.
     pub fn exact_score_with_nodes(&mut self, pos: &Position) -> (i32, u64) {
         self.search.nodes = 0;
         self.search.parity = board_parity(pos);
-        let score = self
-            .search
-            .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
+        let score = if USE_MTD {
+            self.search.solve_mtd(pos, pos.empties())
+        } else {
+            self.search
+                .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+        };
         (score, self.search.nodes)
     }
 }
