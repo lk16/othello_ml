@@ -11,8 +11,8 @@
 //! Layout is range-major: for a given empty-range `r` and feature `f`, the
 //! weight for pattern `p` lives at `weights[r * range_stride + offset[f] + p]`,
 //! where `offset[f]` is the prefix sum of the per-feature pattern counts. This
-//! mirrors Edax's per-ply flat `Eval_weight` block (`eval.h:47`); our 30
-//! empty-ranges play the role of Edax's per-ply tables (`ply = 60 - empties`).
+//! mirrors Edax's per-ply flat `Eval_weight` block (`eval.h:47`); our 61
+//! per-empties buckets play the role of Edax's per-ply tables (`ply = 60 - empties`).
 //!
 //! Scores are bit-identical to [`Weights::evaluate`] (same f32 values summed in
 //! the same feature order) — see the equality test. Quantization to `i16` (the
@@ -21,7 +21,7 @@
 //! wired into move ordering / MTD-f and only runs at shallow nodes.
 
 use crate::othello::position::{Cell, Position};
-use crate::training::weights::Weights;
+use crate::training::weights::{empty_range_index, Weights};
 
 /// Maximum features we support inline (the Edax set is 47); the scratch index
 /// buffer is sized to this so `set` never allocates.
@@ -84,15 +84,6 @@ impl FlatEval {
         }
     }
 
-    /// Empty-range bucket index for `empties` (matches `Weights::empty_range_index`:
-    /// clamp to `2..=60`, round down to even, map to `0..=29`).
-    #[inline]
-    fn range_index(empties: u32) -> usize {
-        let clamped = empties.clamp(2, 60);
-        let even = (clamped / 2) * 2;
-        ((even / 2) - 1) as usize
-    }
-
     /// Number of features (length of the index buffer `set` fills).
     pub fn n_features(&self) -> usize {
         self.n_features
@@ -128,7 +119,7 @@ impl FlatEval {
     /// range block.
     #[inline]
     pub fn score(&self, indices: &[u16], empties: u32) -> f32 {
-        let base = Self::range_index(empties) * self.range_stride;
+        let base = empty_range_index(empties) * self.range_stride;
         let mut sum = 0.0f32;
         for (&off, &pattern) in self.offset.iter().zip(&indices[..self.n_features]) {
             sum += self.weights[base + off as usize + pattern as usize];
