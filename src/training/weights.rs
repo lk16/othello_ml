@@ -132,6 +132,19 @@ impl Weights {
         }
     }
 
+    /// Multiply every weight by `retain` — decoupled L2 weight decay. Applied once
+    /// per epoch with `retain = 1 - effective_lr * l2`, shrinking all weights toward
+    /// zero (AdamW-style decoupled decay; cheap and frequency-independent).
+    pub fn decay_all(&mut self, retain: f32) {
+        for shape in &mut self.shape_weights {
+            for range in shape {
+                for w in range {
+                    *w *= retain;
+                }
+            }
+        }
+    }
+
     /// Get weight for a specific feature, pattern, and empty range.
     /// Reads the feature's tied shape table.
     pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> f32 {

@@ -23,6 +23,8 @@ struct TrainArgs {
     max_empties: u32,
     epochs: usize,
     lr_decay: f32,
+    l2: f32,
+    batch_size: usize,
     resume_epoch: usize,
     eval_file: Option<String>,
     weights_file: String,
@@ -123,6 +125,8 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     let mut max_empties: u32 = 60;
     let mut epochs: usize = 10;
     let mut lr_decay: f32 = 0.01;
+    let mut l2: f32 = 0.0;
+    let mut batch_size: usize = 32;
     let mut resume_epoch: usize = 0;
     let mut eval_file: Option<String> = None;
     let mut weights_file: String = String::from("trained_weights.bin");
@@ -139,6 +143,16 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
             i += 1;
             if i < args.len() {
                 epochs = args[i].parse::<usize>().unwrap_or(10);
+            }
+        } else if args[i] == "--l2" {
+            i += 1;
+            if i < args.len() {
+                l2 = args[i].parse::<f32>().unwrap_or(0.0);
+            }
+        } else if args[i] == "--batch-size" || args[i] == "-b" {
+            i += 1;
+            if i < args.len() {
+                batch_size = args[i].parse::<usize>().unwrap_or(32).max(1);
             }
         } else if args[i] == "--eval-file" || args[i] == "-f" {
             i += 1;
@@ -178,6 +192,8 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
         max_empties,
         epochs,
         lr_decay,
+        l2,
+        batch_size,
         resume_epoch,
         eval_file,
         weights_file,
@@ -520,7 +536,7 @@ fn run_train(args: TrainArgs) {
     eprintln!("\n--- Training ---");
     eprintln!("(press Ctrl+C to stop early and save weights)");
 
-    let trainer = Trainer::new(0.1, 32, args.lr_decay);
+    let trainer = Trainer::with_l2(0.1, args.batch_size, args.lr_decay, args.l2);
     let train_config = TrainingConfig {
         epochs: args.epochs,
         epoch_offset: args.resume_epoch,
@@ -1179,6 +1195,10 @@ fn print_train_usage(program: &str) {
         "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
     );
     eprintln!("  -e, --epochs N        Number of training epochs (default: 10)");
+    eprintln!(
+        "  -b, --batch-size N    Mini-batch size, gradients summed at frozen weights (default: 32)"
+    );
+    eprintln!("      --l2 F            L2 weight-decay coefficient (default: 0 = off)");
     eprintln!(
         "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
     );

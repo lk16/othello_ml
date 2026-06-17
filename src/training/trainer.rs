@@ -36,7 +36,8 @@ pub struct TrainingExample {
 pub struct Trainer {
     learning_rate: f32, // Initial step size (before decay)
     lr_decay: f32,      // Inverse-time decay factor (0 = no decay)
-    batch_size: usize,  // Number of examples per training batch
+    batch_size: usize,  // Examples per mini-batch (gradients summed at frozen weights)
+    l2: f32,            // L2 weight-decay coefficient (0 = off)
 }
 
 /// Simple xorshift32 PRNG for deterministic shuffling (no external crates needed).
@@ -84,10 +85,15 @@ pub struct TrainingConfig {
 
 impl Trainer {
     pub fn new(learning_rate: f32, batch_size: usize, lr_decay: f32) -> Self {
+        Trainer::with_l2(learning_rate, batch_size, lr_decay, 0.0)
+    }
+
+    pub fn with_l2(learning_rate: f32, batch_size: usize, lr_decay: f32, l2: f32) -> Self {
         Trainer {
             learning_rate,
             lr_decay,
-            batch_size,
+            batch_size: batch_size.max(1),
+            l2,
         }
     }
 
@@ -180,8 +186,8 @@ impl Trainer {
             .collect();
 
         eprintln!(
-            "Training: {} epochs × {} examples (online SGD, batch_size={})",
-            epochs, n_examples, self.batch_size
+            "Training: {} epochs × {} examples (mini-batch SGD, batch_size={}, l2={})",
+            epochs, n_examples, self.batch_size, self.l2
         );
         eprintln!(
             "  weight updates: {} examples × {} features × {} epochs ≈ {:.1}M total",
@@ -228,7 +234,13 @@ impl Trainer {
             let epoch_start = Instant::now();
 
             let loss: f64 = if n_threads <= 1 {
-                train_shard_in_place(weights, &compiled, n_features, current_lr)
+                let l =
+                    train_minibatch(weights, &compiled, n_features, current_lr, self.batch_size);
+                // Decoupled L2 weight decay, once per epoch.
+                if self.l2 > 0.0 {
+                    weights.decay_all(1.0 - current_lr * self.l2);
+                }
+                l
             } else {
                 // Model-averaging SGD: split the epoch across threads, each
                 // training a shard on its own clone; average the deltas once.
@@ -283,9 +295,45 @@ impl Trainer {
     }
 }
 
+/// Run **mini-batch** SGD over the compiled examples for one epoch, mutating
+/// `weights` in place and returning the accumulated squared error.
+///
+/// Each batch's gradients are computed against the weights **frozen at the start
+/// of the batch** (forward pass), then summed and applied (apply pass) — so updates
+/// within a batch don't chase each other, reducing gradient noise versus pure
+/// online SGD (which matters here: with tied weights, many positions in a batch hit
+/// the same shape table). Summed (not averaged) gradients keep the per-example step
+/// magnitude — and hence the learning-rate scale — identical to the old online path.
+fn train_minibatch(
+    weights: &mut Weights,
+    compiled: &[CompiledExample],
+    n_features: f32,
+    lr: f32,
+    batch_size: usize,
+) -> f64 {
+    let mut loss = 0.0f64;
+    let mut grads: Vec<f32> = Vec::with_capacity(batch_size);
+    for batch in compiled.chunks(batch_size) {
+        // Forward pass: errors/gradients at the frozen batch-start weights.
+        grads.clear();
+        for ce in batch {
+            let predicted = weights.evaluate_indices(&ce.indices, ce.empties);
+            let error = ce.target - predicted;
+            loss += (error as f64) * (error as f64);
+            grads.push(2.0 * error / n_features);
+        }
+        // Apply pass: sequential adds accumulate to the summed batch gradient
+        // (w += g1 then w += g2 == w += g1+g2).
+        for (ce, &g) in batch.iter().zip(&grads) {
+            weights.sgd_step_indices(&ce.indices, ce.empties, lr, g);
+        }
+    }
+    loss
+}
+
 /// Run online SGD over one shard of compiled examples, mutating `weights` in
-/// place and returning the accumulated squared error. Shared by the
-/// single-threaded path and the per-thread workers.
+/// place and returning the accumulated squared error. Used by the (now unused)
+/// parallel worker path.
 fn train_shard_in_place(
     weights: &mut Weights,
     shard: &[CompiledExample],
