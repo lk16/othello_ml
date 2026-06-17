@@ -78,8 +78,17 @@ corpus (1.2M games, 1.8 GB; `wthor/` dwarfed) holds **~1.1M positions at empties
 the deep endgame; counted via `"N. "` move-number tokens, see git history of this
 doc). Training doesn't dedup (`build_examples`, `cache.rs:365`), so that raw count
 *is* the example count. ~1.1M exact-labelable examples is plenty for the 10-cell
-features (~18 samples/pattern), so a 6-disc MAE points elsewhere. In order of
-suspected impact:
+features (~18 samples/pattern), so a 6-disc MAE points elsewhere.
+
+**Label correctness is also ruled out — measured.** The cached label file
+(`ignored/edax_evals.txt`, ~8M lines, Edax-generated) was validated against our own
+exact solver via uniform random sampling per empties bucket: **340/340 positions
+matched bit-exact across empties 4–20** (0 disc diff), *including* the deep 17–20e
+buckets where selective (Edax level < 60) labels would have diverged. So the labels
+are true exact ground truth, not approximations. Bucket sizes: ~460–520k labels
+each at 4–16e, a thin ~42k tail at 17–20e. The base eval was therefore trained on
+*correct, exact, plentiful* ground truth — the weakness is in **training**, not data
+or labels. In order of suspected impact:
 
 1. **Was the base actually trained on this much?** `train-exact` must exact-solve
    every ≤16e position (~2 ms at 14e, ~10 ms at 16e), so labelling the full ~1.1M+
