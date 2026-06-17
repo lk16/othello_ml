@@ -63,6 +63,34 @@ impl Position {
         (self.player | self.opponent).count_ones()
     }
 
+    /// The 8 board symmetries (dihedral group D4) of this position, applied to
+    /// both bitboards. The exact game value is invariant under every one of them,
+    /// so a training example and its 7 images share the same target score — this is
+    /// what `train-exact`'s 8-fold augmentation exploits (see docs/eval-quality.md).
+    /// Element 0 is the identity (`== *self`).
+    pub fn symmetries(&self) -> [Position; 8] {
+        // Each maps a board to its image under one symmetry (bit permutation). They
+        // compose `flip_vertical` (`swap_bytes`), `rotate180` (`reverse_bits`),
+        // `mirror_files`, and `flip_diag_a1h8` — the standard LERF routines.
+        let transforms: [fn(u64) -> u64; 8] = [
+            |b| b,                                // identity
+            |b| b.swap_bytes(),                   // flip vertical (mirror ranks)
+            mirror_files,                         // flip horizontal (mirror files)
+            |b| b.reverse_bits(),                 // rotate 180
+            flip_diag_a1h8,                       // transpose (a1-h8 diagonal)
+            |b| flip_diag_a1h8(b.reverse_bits()), // anti-diagonal (a8-h1)
+            |b| flip_diag_a1h8(b).swap_bytes(),   // rotate 90
+            |b| mirror_files(flip_diag_a1h8(b)),  // rotate 270
+        ];
+        std::array::from_fn(|k| {
+            let t = transforms[k];
+            Position {
+                player: t(self.player),
+                opponent: t(self.opponent),
+            }
+        })
+    }
+
     /// Bitboard of all opponent discs that would be flipped by playing at `mv`.
     ///
     /// Returns 0 if `mv` is occupied or would not flip any discs.
@@ -199,6 +227,31 @@ impl Position {
     }
 }
 
+/// Mirror a bitboard horizontally (file a <-> h): reverse the bits within each
+/// rank byte. Standard Chess-Programming-Wiki `mirrorHorizontal` for LERF boards.
+fn mirror_files(b: u64) -> u64 {
+    const K1: u64 = 0x5555555555555555;
+    const K2: u64 = 0x3333333333333333;
+    const K4: u64 = 0x0f0f0f0f0f0f0f0f;
+    let b = ((b >> 1) & K1) | ((b & K1) << 1);
+    let b = ((b >> 2) & K2) | ((b & K2) << 2);
+    ((b >> 4) & K4) | ((b & K4) << 4)
+}
+
+/// Transpose a bitboard about the a1-h8 diagonal (swap ranks and files). Standard
+/// Chess-Programming-Wiki `flipDiagA1H8` for LERF boards.
+fn flip_diag_a1h8(b: u64) -> u64 {
+    const K1: u64 = 0x5500550055005500;
+    const K2: u64 = 0x3333000033330000;
+    const K4: u64 = 0x0f0f0f0f00000000;
+    let t = K4 & (b ^ (b << 28));
+    let b = b ^ t ^ (t >> 28);
+    let t = K2 & (b ^ (b << 14));
+    let b = b ^ t ^ (t >> 14);
+    let t = K1 & (b ^ (b << 7));
+    b ^ t ^ (t >> 7)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
     Player,
@@ -222,6 +275,55 @@ mod tests {
         assert_eq!(board.player_discs(), 2);
         assert_eq!(board.opponent_discs(), 2);
         assert_eq!(board.empties(), 60);
+    }
+
+    #[test]
+    fn symmetries_are_structurally_consistent() {
+        // An asymmetric position: a1 (player) + b1 (opponent) only.
+        let p = Position {
+            player: 1 << 0,
+            opponent: 1 << 1,
+        };
+        let syms = p.symmetries();
+        // Element 0 is the identity.
+        assert_eq!(syms[0], p);
+        // All 8 images are distinct for an asymmetric board, and each preserves the
+        // disc counts and legal-move count (legality is symmetry-invariant) — a
+        // strong check that every transform is a genuine board symmetry.
+        for (i, a) in syms.iter().enumerate() {
+            assert_eq!(a.player_discs(), p.player_discs());
+            assert_eq!(a.opponent_discs(), p.opponent_discs());
+            assert_eq!(a.get_moves().count_ones(), p.get_moves().count_ones());
+            for (j, b) in syms.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "symmetries {i} and {j} collide");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symmetries_preserve_exact_score() {
+        use crate::eval::alphabeta::exact_score;
+        // A near-full board (8 empties → cheap exact) with an asymmetric disc split.
+        let empties_mask: u64 = (1 << 0)
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (1 << 9)
+            | (1 << 10)
+            | (1 << 18)
+            | (1 << 27);
+        let occ = !empties_mask;
+        let p = Position {
+            player: occ & 0xAAAA_AAAA_AAAA_AAAA,
+            opponent: occ & 0x5555_5555_5555_5555,
+        };
+        let base = exact_score(&p);
+        for (i, s) in p.symmetries().iter().enumerate() {
+            assert_eq!(s.empties(), p.empties());
+            assert_eq!(exact_score(s), base, "symmetry {i} changed the exact score");
+        }
     }
 
     #[test]
