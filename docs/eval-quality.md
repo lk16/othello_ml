@@ -112,18 +112,47 @@ Each physical pattern therefore sees only ~1/4–1/8 of its occurrences, and the
 isn't symmetry-consistent. Edax mirror-packs weights over the 8-fold symmetry → ~8×
 the effective samples per pattern. We get 1×.
 
-## Levers (in order of expected value)
+## Symmetry handling — DONE (augmentation → weight tying)
 
-1. **8-fold symmetry** (biggest, cheapest — no new labels). Either augment each
-   training example with its 8 board symmetries, or tie weights across symmetric
-   features (Edax's mirror-packing). Multiplies effective data ~8× *and* makes the
-   eval symmetry-consistent — directly attacks the overfitting.
-2. **More data.** Train `-t 1` on the full cached set (all ~570 cached files /
-   ~6.4M ≤16e), not a slice. Confirmed to help; labels load instantly from the
-   cache. Pair with (1).
-3. **Regularization** (L2 / weight decay) and weight-sharing across adjacent empties
-   buckets (Edax-style ply grouping) so rare patterns borrow strength.
-4. **Ground-truth depth.** Exact labels are cheap only at ≤ ~16e; pushing them
+Implemented and measured. The feature set first had to be fixed: `Features::edax()`
+was hand-transcribed with **bugs** (`corner_a8`, `ext_corner_*`, `diag_4_*` had wrong
+cells; a bogus `edge_parity`), surfaced by deriving symmetry orbits. It is now
+transcribed **verbatim from Edax `eval.c` `EVAL_F2X`** (46 features = 12 symmetry
+shapes; validated by `edax_features_form_clean_symmetry_orbits`).
+
+Two mechanisms tried, same regularization effect:
+- **8-fold augmentation** (feed each example's 8 board symmetries): 500f held-out 14e
+  **9.10 → 8.11**, collapsed the gap (in-sample 6.70 vs held-out 8.11). Cost: 8×
+  examples, 419 s.
+- **Weight tying** (`Weights` stores one shared table per symmetry shape — 12 vs 46;
+  Edax mirror-packing): 500f held-out **8.13** (≈ augmentation) at **56 s — ~7×
+  cheaper**, smaller model, exact symmetry. **This is the committed approach**
+  (augmentation removed). `--threads` now only parallelizes missing-label solving;
+  weight training is always sequential.
+
+More data on top of tying: 1000 files (4.5M ≤16e) → held-out **7.86**, in-sample
+**6.32**. (The base's "6.04" is *not* a clean baseline — it was trained on the whole
+corpus incl. the 760* "held-out" set, so it's effectively in-sample; on equal
+in-sample footing tied ≈ base.)
+
+**The remaining ceiling: ~6-disc MAE even IN-SAMPLE** (21% within ±2). Symmetry fixed
+the *generalization gap* and the feature bugs, but not the absolute accuracy. Edax
+reaches <2 MAE from the *same* features, so the gap is now the **training method**,
+not symmetry or data quantity.
+
+## Remaining levers (in order of expected value)
+
+1. **Training method / objective** (the ceiling). Our trainer is per-example online
+   SGD with inverse-time LR decay and a fixed `gradient = 2·error/n_features` step
+   (`trainer.rs`). Edax fits by **batched least-squares regression** over the whole
+   corpus. Try: true mini-batch / full-batch gradient accumulation, proper LR tuning,
+   more epochs to convergence, L2 regularization, and weight-sharing across adjacent
+   empties buckets (Edax-style ply grouping) so rare patterns borrow strength. This
+   is now the gating lever for breaking the ~6-MAE ceiling.
+2. **More data**, cheap now that tying is 1× cost and `-t N` solves uncached labels:
+   train on the full corpus (extend the cache once with `-t 16`). Helps the gap but
+   has diminishing returns against the ceiling above.
+3. **Ground-truth depth.** Exact labels are cheap only at ≤ ~16e; pushing them
    deeper (via the cache) widens the directly-supervised base for `train-boot`.
 
 Run `eval-check -n 14` on a **held-out** file after each change — target "within ±2"
