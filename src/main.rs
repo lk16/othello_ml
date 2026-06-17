@@ -513,27 +513,9 @@ fn run_train(args: TrainArgs) {
         }
     };
     eprintln!("Training examples: {}", examples.len());
-
-    // 8-fold symmetry augmentation: the exact score is invariant under the 8 board
-    // symmetries, so expand each example into its dihedral images. This multiplies
-    // effective data ~8× and ties the symmetric features (corner_a1 vs corner_h1, …)
-    // toward consistent weights — the overfitting fix from docs/eval-quality.md.
-    let examples: Vec<TrainingExample> = examples
-        .into_iter()
-        .flat_map(|ex| {
-            ex.position
-                .symmetries()
-                .into_iter()
-                .map(move |position| TrainingExample {
-                    position,
-                    target_score: ex.target_score,
-                })
-        })
-        .collect();
-    eprintln!(
-        "After 8-fold symmetry augmentation: {} examples",
-        examples.len()
-    );
+    // Note: symmetric features now share weights (tied per shape in `Weights`), so
+    // the exact score's 8-fold symmetry is captured at 1× training cost — no data
+    // augmentation needed (see docs/eval-quality.md).
 
     eprintln!("\n--- Training ---");
     eprintln!("(press Ctrl+C to stop early and save weights)");

@@ -55,22 +55,35 @@ impl FlatEval {
             "FlatEval supports at most {MAX_FEATURES} features, got {n_features}"
         );
 
-        let mut offset = Vec::with_capacity(n_features);
-        let mut cells = Vec::with_capacity(n_features);
+        // Weights are tied per symmetry shape; the flat block holds one slot range
+        // per *shape*, and every feature points (via `offset`) at its shape's block.
+        // Symmetric features therefore share weights, exactly as in `Weights`.
+        let table = weights.shape_weights();
+        let feature_to_shape = weights.feature_to_shape();
+        let n_shapes = table.len();
+
+        // Offset of each shape's block within one range, = prefix sum of shape sizes.
+        let mut shape_offset = vec![0u32; n_shapes];
         let mut acc = 0u32;
-        for feature in features.all() {
-            offset.push(acc);
-            acc += feature.max_index() + 1;
-            cells.push(feature.cells.iter().map(|&c| c as u8).collect());
+        for (s, shape_weights) in table.iter().enumerate() {
+            shape_offset[s] = acc;
+            acc += shape_weights[0].len() as u32;
         }
         let range_stride = acc as usize;
 
-        let table = weights.get_all_weights();
+        // Per-feature: offset = its shape's block; cells for index extraction.
+        let mut offset = Vec::with_capacity(n_features);
+        let mut cells = Vec::with_capacity(n_features);
+        for (f, feature) in features.all().iter().enumerate() {
+            offset.push(shape_offset[feature_to_shape[f]]);
+            cells.push(feature.cells.iter().map(|&c| c as u8).collect());
+        }
+
         let n_ranges = weights.empty_range_count();
         let mut flat = vec![0.0f32; n_ranges * range_stride];
-        for (f, feature_weights) in table.iter().enumerate() {
-            for (r, range_weights) in feature_weights.iter().enumerate() {
-                let base = r * range_stride + offset[f] as usize;
+        for (s, shape_weights) in table.iter().enumerate() {
+            for (r, range_weights) in shape_weights.iter().enumerate() {
+                let base = r * range_stride + shape_offset[s] as usize;
                 flat[base..base + range_weights.len()].copy_from_slice(range_weights);
             }
         }

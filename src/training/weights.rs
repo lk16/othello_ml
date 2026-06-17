@@ -25,38 +25,40 @@ pub(crate) fn empty_range_index(empties: u32) -> usize {
 /// Position evaluation = sum of all feature weights for the current board state.
 #[derive(Clone)]
 pub struct Weights {
-    // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
-    feature_weights: Vec<Vec<Vec<f32>>>,
-    empty_ranges: Vec<u32>, // one entry per empties value 0..=60
+    // Weights are **tied by symmetry shape**: features that are board-symmetry
+    // images of one another (e.g. the 4 corners) share one weight table, so the
+    // same physical pattern always updates the same weights (Edax mirror-packing;
+    // see `Features::symmetry_shapes`). Storage is per shape, not per feature:
+    //   shape_weights[shape][empty_range][pattern] = score (f32 for SGD precision)
+    shape_weights: Vec<Vec<Vec<f32>>>,
+    // feature index -> shape id (the shared table it reads/updates).
+    feature_to_shape: Vec<usize>,
     features: Features,
 }
 
 impl Weights {
-    /// Create a new weight table with Edax features and SGD training
+    /// Create a new weight table with Edax features and SGD training.
+    ///
+    /// Symmetric features are tied: one shared `[empty_range][pattern]` table per
+    /// symmetry shape (12 shapes for the 46 Edax features).
     pub fn new(features: Features) -> Self {
-        let n_features = features.count();
         let n_empty_ranges = EMPTY_RANGE_COUNT; // one per empties value 0..=60
+        let (feature_to_shape, n_shapes) = features.symmetry_shapes();
 
-        // One bucket per empties value 0..=60.
-        let empty_ranges: Vec<u32> = (0..EMPTY_RANGE_COUNT as u32).collect();
-
-        // Pre-allocate weight tables
-        let mut feature_weights = Vec::with_capacity(n_features);
-        for feature in features.all() {
-            let max_pattern = (feature.max_index() + 1) as usize;
-            let mut feature_scores = Vec::with_capacity(n_empty_ranges);
-
-            for _ in 0..n_empty_ranges {
-                // Initialize all weights to 0.0
-                feature_scores.push(vec![0.0f32; max_pattern]);
-            }
-
-            feature_weights.push(feature_scores);
+        // Pattern count of each shape = 3^cells of any of its member features.
+        let mut shape_pattern_count = vec![0usize; n_shapes];
+        for (f, feature) in features.all().iter().enumerate() {
+            shape_pattern_count[feature_to_shape[f]] = (feature.max_index() + 1) as usize;
         }
 
+        let shape_weights = shape_pattern_count
+            .iter()
+            .map(|&pc| vec![vec![0.0f32; pc]; n_empty_ranges])
+            .collect();
+
         Weights {
-            feature_weights,
-            empty_ranges,
+            shape_weights,
+            feature_to_shape,
             features,
         }
     }
@@ -75,10 +77,11 @@ impl Weights {
 
         let mut score = 0.0f32;
         for (feat_idx, &pattern_idx) in feature_indices.iter().enumerate() {
-            if feat_idx < self.feature_weights.len() {
+            if let Some(&shape) = self.feature_to_shape.get(feat_idx) {
+                let row = &self.shape_weights[shape][range_idx];
                 let pattern_idx = pattern_idx as usize;
-                if pattern_idx < self.feature_weights[feat_idx][range_idx].len() {
-                    score += self.feature_weights[feat_idx][range_idx][pattern_idx];
+                if pattern_idx < row.len() {
+                    score += row[pattern_idx];
                 }
             }
         }
@@ -96,7 +99,7 @@ impl Weights {
         let range_idx = self.empty_range_index(empties);
         let mut score = 0.0f32;
         for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
-            let row = &self.feature_weights[feat_idx][range_idx];
+            let row = &self.shape_weights[self.feature_to_shape[feat_idx]][range_idx];
             let p = pattern_idx as usize;
             if p < row.len() {
                 score += row[p];
@@ -121,7 +124,7 @@ impl Weights {
         let range_idx = self.empty_range_index(empties);
         let step = learning_rate * gradient;
         for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
-            let row = &mut self.feature_weights[feat_idx][range_idx];
+            let row = &mut self.shape_weights[self.feature_to_shape[feat_idx]][range_idx];
             let p = pattern_idx as usize;
             if p < row.len() {
                 row[p] = (row[p] + step).clamp(-MAX_WEIGHT, MAX_WEIGHT);
@@ -129,33 +132,33 @@ impl Weights {
         }
     }
 
-    /// Get weight for a specific feature, pattern, and empty range
+    /// Get weight for a specific feature, pattern, and empty range.
+    /// Reads the feature's tied shape table.
     pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> f32 {
-        if feature_idx >= self.feature_weights.len() {
+        let Some(&shape) = self.feature_to_shape.get(feature_idx) else {
             return 0.0;
-        }
-
+        };
         let range_idx = self.empty_range_index(empties);
         let pattern_idx = pattern_idx as usize;
-
-        if pattern_idx < self.feature_weights[feature_idx][range_idx].len() {
-            self.feature_weights[feature_idx][range_idx][pattern_idx]
+        let row = &self.shape_weights[shape][range_idx];
+        if pattern_idx < row.len() {
+            row[pattern_idx]
         } else {
             0.0
         }
     }
 
-    /// Set weight for a specific feature, pattern, and empty range
+    /// Set weight for a specific feature, pattern, and empty range.
+    /// Writes the feature's tied shape table (shared with symmetric features).
     pub fn set_weight(&mut self, feature_idx: usize, pattern_idx: u32, empties: u32, weight: f32) {
-        if feature_idx >= self.feature_weights.len() {
+        let Some(&shape) = self.feature_to_shape.get(feature_idx) else {
             return;
-        }
-
+        };
         let range_idx = self.empty_range_index(empties);
         let pattern_idx = pattern_idx as usize;
-
-        if pattern_idx < self.feature_weights[feature_idx][range_idx].len() {
-            self.feature_weights[feature_idx][range_idx][pattern_idx] = weight;
+        let row = &mut self.shape_weights[shape][range_idx];
+        if pattern_idx < row.len() {
+            row[pattern_idx] = weight;
         }
     }
 
@@ -183,12 +186,22 @@ impl Weights {
 
     /// Number of features in the weight table.
     pub fn feature_count(&self) -> usize {
-        self.feature_weights.len()
+        self.feature_to_shape.len()
+    }
+
+    /// Number of symmetry shapes (tied weight tables; 12 for the Edax set).
+    pub fn shape_count(&self) -> usize {
+        self.shape_weights.len()
+    }
+
+    /// Map from feature index to its tied shape id.
+    pub fn feature_to_shape(&self) -> &[usize] {
+        &self.feature_to_shape
     }
 
     /// Number of empty-count buckets (61: one per empties value 0..=60).
     pub fn empty_range_count(&self) -> usize {
-        self.empty_ranges.len()
+        EMPTY_RANGE_COUNT
     }
 
     /// Load weights from `path` or create a fresh table if the file doesn't exist
@@ -236,14 +249,9 @@ impl Weights {
         }
     }
 
-    /// Get all weights as f32.
-    pub fn get_all_weights(&self) -> &Vec<Vec<Vec<f32>>> {
-        &self.feature_weights
-    }
-
-    /// Replace all weights (used during deserialization).
-    pub fn set_all_weights(&mut self, weights: Vec<Vec<Vec<f32>>>) {
-        self.feature_weights = weights;
+    /// All weights as f32, per **shape**: `[shape][empty_range][pattern]`.
+    pub fn shape_weights(&self) -> &Vec<Vec<Vec<f32>>> {
+        &self.shape_weights
     }
 
     /// Merge weight deltas from parallel workers.
@@ -253,15 +261,15 @@ impl Weights {
     /// average delta: `self += sum(workers[i] - self) / n_workers`.
     pub fn merge_from_workers(&mut self, workers: &[Weights]) {
         let n = workers.len() as f32;
-        for f in 0..self.feature_weights.len() {
-            for e in 0..self.feature_weights[f].len() {
-                for p in 0..self.feature_weights[f][e].len() {
-                    let original = self.feature_weights[f][e][p];
+        for s in 0..self.shape_weights.len() {
+            for e in 0..self.shape_weights[s].len() {
+                for p in 0..self.shape_weights[s][e].len() {
+                    let original = self.shape_weights[s][e][p];
                     let delta: f32 = workers
                         .iter()
-                        .map(|w| w.feature_weights[f][e][p] - original)
+                        .map(|w| w.shape_weights[s][e][p] - original)
                         .sum();
-                    self.feature_weights[f][e][p] = original + delta / n;
+                    self.shape_weights[s][e][p] = original + delta / n;
                 }
             }
         }
@@ -270,9 +278,10 @@ impl Weights {
     // ─── Serialization ──────────────────────────────────────────────
 
     const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-    // v3: one weight table per empties value 0..=60 (61 buckets). v1/v2 used 30
-    // paired-empties buckets and are no longer loadable — re-train from scratch.
-    const FORMAT_VERSION: u32 = 3;
+    // v4: weights tied by symmetry shape (one table per shape, 12 for the Edax set)
+    // and the corrected 46-feature set. Weight data is written per shape in
+    // `Features::symmetry_shapes` order. v1/v2/v3 are no longer loadable — re-train.
+    const FORMAT_VERSION: u32 = 4;
 
     /// Save weights to a file as f32 (lossless).
     pub fn save(&self, path: &str) -> Result<(), String> {
@@ -307,9 +316,11 @@ impl Weights {
             }
         }
 
-        // Write weight data as f32 (lossless, no rounding)
-        for feature_weights in &self.feature_weights {
-            for empty_range_weights in feature_weights {
+        // Write weight data as f32 (lossless, no rounding), per shape. The shape
+        // structure is re-derived from the features on load (deterministic), so it
+        // need not be stored.
+        for shape_weights in &self.shape_weights {
+            for empty_range_weights in shape_weights {
                 for &weight in empty_range_weights {
                     file.write_all(&weight.to_le_bytes())
                         .map_err(|e| e.to_string())?;
@@ -394,34 +405,19 @@ impl Weights {
             ));
         }
 
-        // Create weights structure
+        // Create weights structure (allocates the per-shape tables) and fill them
+        // in the same shape/range/pattern order they were written.
         let mut weights = Weights::new(features);
-
-        // Read weight data
-        let mut all_weights = Vec::new();
-        for feature_idx in 0..n_features {
-            let feature = weights
-                .features()
-                .get(feature_idx)
-                .ok_or("Feature index out of range")?;
-            let max_pattern = (feature.max_index() + 1) as usize;
-            let n_empty_ranges = weights.empty_range_count();
-
-            let mut feature_weights = Vec::new();
-            for _ in 0..n_empty_ranges {
-                let mut empty_range_weights = Vec::new();
-                for _ in 0..max_pattern {
+        for s in 0..weights.shape_weights.len() {
+            for r in 0..weights.shape_weights[s].len() {
+                for p in 0..weights.shape_weights[s][r].len() {
                     let mut weight_bytes = [0u8; 4];
                     file.read_exact(&mut weight_bytes)
                         .map_err(|e| e.to_string())?;
-                    empty_range_weights.push(f32::from_le_bytes(weight_bytes));
+                    weights.shape_weights[s][r][p] = f32::from_le_bytes(weight_bytes);
                 }
-                feature_weights.push(empty_range_weights);
             }
-            all_weights.push(feature_weights);
         }
-
-        weights.set_all_weights(all_weights);
         Ok(weights)
     }
 }
@@ -435,8 +431,26 @@ mod tests {
     fn test_weights_creation() {
         let features = Features::edax();
         let weights = Weights::new(features);
-        assert!(weights.feature_count() > 0);
+        assert_eq!(weights.feature_count(), 46);
+        assert_eq!(weights.shape_count(), 12); // tied: 46 features → 12 shape tables
         assert_eq!(weights.empty_range_count(), 61);
+    }
+
+    #[test]
+    fn symmetric_features_share_storage() {
+        let features = Features::edax();
+        let (map, _) = features.symmetry_shapes();
+        // Features 0 and 2 are both corners → same shape.
+        assert_eq!(map[0], map[2]);
+
+        let mut w = Weights::new(features);
+        // Writing via one corner is visible via another at the same (pattern, range):
+        // they are tied to one shared table.
+        w.set_weight(0, 7, 30, 3.5);
+        assert_eq!(w.get_weight(2, 7, 30), 3.5);
+        // A feature in a different shape is untouched.
+        let other = (0..map.len()).find(|&f| map[f] != map[0]).unwrap();
+        assert_eq!(w.get_weight(other, 7, 30), 0.0);
     }
 
     #[test]
