@@ -69,25 +69,9 @@ impl Position {
     /// what `train-exact`'s 8-fold augmentation exploits (see docs/eval-quality.md).
     /// Element 0 is the identity (`== *self`).
     pub fn symmetries(&self) -> [Position; 8] {
-        // Each maps a board to its image under one symmetry (bit permutation). They
-        // compose `flip_vertical` (`swap_bytes`), `rotate180` (`reverse_bits`),
-        // `mirror_files`, and `flip_diag_a1h8` — the standard LERF routines.
-        let transforms: [fn(u64) -> u64; 8] = [
-            |b| b,                                // identity
-            |b| b.swap_bytes(),                   // flip vertical (mirror ranks)
-            mirror_files,                         // flip horizontal (mirror files)
-            |b| b.reverse_bits(),                 // rotate 180
-            flip_diag_a1h8,                       // transpose (a1-h8 diagonal)
-            |b| flip_diag_a1h8(b.reverse_bits()), // anti-diagonal (a8-h1)
-            |b| flip_diag_a1h8(b).swap_bytes(),   // rotate 90
-            |b| mirror_files(flip_diag_a1h8(b)),  // rotate 270
-        ];
-        std::array::from_fn(|k| {
-            let t = transforms[k];
-            Position {
-                player: t(self.player),
-                opponent: t(self.opponent),
-            }
+        std::array::from_fn(|k| Position {
+            player: board_symmetry(self.player, k),
+            opponent: board_symmetry(self.opponent, k),
         })
     }
 
@@ -224,6 +208,25 @@ impl Position {
         fen.push(' ');
         fen.push(if black_to_move { 'X' } else { 'O' });
         fen
+    }
+}
+
+/// Apply the `k`-th board symmetry (0..8, dihedral group D4) to a bitboard.
+/// `k == 0` is the identity. Composes the standard LERF routines `flip_vertical`
+/// (`swap_bytes`), `rotate180` (`reverse_bits`), `mirror_files`, `flip_diag_a1h8`.
+/// Shared by [`Position::symmetries`] and the feature-symmetry grouping
+/// (`Features::symmetry_shapes`), which needs the induced cell permutation.
+pub fn board_symmetry(b: u64, k: usize) -> u64 {
+    match k {
+        0 => b,                                // identity
+        1 => b.swap_bytes(),                   // flip vertical (mirror ranks)
+        2 => mirror_files(b),                  // flip horizontal (mirror files)
+        3 => b.reverse_bits(),                 // rotate 180
+        4 => flip_diag_a1h8(b),                // transpose (a1-h8 diagonal)
+        5 => flip_diag_a1h8(b.reverse_bits()), // anti-diagonal (a8-h1)
+        6 => flip_diag_a1h8(b).swap_bytes(),   // rotate 90
+        7 => mirror_files(flip_diag_a1h8(b)),  // rotate 270
+        _ => panic!("board symmetry index out of range: {k}"),
     }
 }
 

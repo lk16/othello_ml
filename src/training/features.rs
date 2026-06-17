@@ -110,6 +110,55 @@ impl Features {
         self.features.len()
     }
 
+    /// Group features into symmetry **shapes** for weight tying.
+    ///
+    /// Returns `feature_to_shape` (one shape id per feature) and the shape count.
+    /// Two features share a shape iff their *ordered* cell-lists are images of one
+    /// another under one of the 8 board symmetries (dihedral group D4). When that
+    /// holds, `index(f_j, transform_k(P)) == index(f_i, P)` for the mapping symmetry
+    /// `k` (the cells line up position-for-position), so the same physical pattern
+    /// always lands on the same trinary index — which is exactly what lets their
+    /// weights be tied into one shared table (Edax-style mirror-packing).
+    ///
+    /// Shapes are numbered by first appearance in feature order, so shape 0 contains
+    /// feature 0. Derived deterministically, so save/load can reconstruct it without
+    /// storing the mapping.
+    pub fn symmetry_shapes(&self) -> (Vec<usize>, usize) {
+        // Induced cell permutations: cell_perm[k][c] = image of cell c under the
+        // k-th board symmetry (read off by transforming the single-bit board 1<<c).
+        let cell_perm: [[u32; 64]; 8] = std::array::from_fn(|k| {
+            std::array::from_fn(|c| {
+                crate::othello::position::board_symmetry(1u64 << c, k).trailing_zeros()
+            })
+        });
+
+        // Canonical key of a feature = the lexicographically smallest image of its
+        // ordered cell-list over the 8 symmetries. Equal keys ⇒ same shape.
+        let canon = |cells: &[u32]| -> Vec<u32> {
+            (0..8)
+                .map(|k| {
+                    cells
+                        .iter()
+                        .map(|&c| cell_perm[k][c as usize])
+                        .collect::<Vec<u32>>()
+                })
+                .min()
+                .unwrap_or_default()
+        };
+
+        let mut keys: Vec<Vec<u32>> = Vec::new();
+        let mut feature_to_shape = Vec::with_capacity(self.features.len());
+        for feature in &self.features {
+            let key = canon(&feature.cells);
+            let id = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+                keys.push(key);
+                keys.len() - 1
+            });
+            feature_to_shape.push(id);
+        }
+        (feature_to_shape, keys.len())
+    }
+
     /// Look up a feature by index.
     pub fn get(&self, idx: usize) -> Option<&Feature> {
         self.features.get(idx)
@@ -182,5 +231,92 @@ mod tests {
     fn test_edax_features() {
         let features = Features::edax();
         assert!(features.count() > 0);
+    }
+
+    /// Every feature in a derived shape must share the same cell count (so they can
+    /// share one `3^cells` weight table).
+    #[test]
+    fn symmetry_shapes_consistent_cell_counts() {
+        let features = Features::edax();
+        let (map, n_shapes) = features.symmetry_shapes();
+        assert_eq!(map.len(), features.count());
+        for s in 0..n_shapes {
+            let members: Vec<usize> = (0..map.len()).filter(|&f| map[f] == s).collect();
+            let len0 = features.get(members[0]).unwrap().cells.len();
+            for &m in &members {
+                assert_eq!(features.get(m).unwrap().cells.len(), len0);
+            }
+        }
+    }
+
+    /// Tying is only correct if, for two features in the same shape, the same
+    /// physical pattern produces the same trinary index. Concretely: there is a
+    /// board symmetry `k` with `index(f_i, P) == index(f_j, transform_k(P))` for
+    /// all `P`. Verify it directly over a spread of positions.
+    #[test]
+    fn symmetric_features_share_pattern_indices() {
+        use crate::othello::position::board_symmetry;
+        let features = Features::edax();
+        let (map, n_shapes) = features.symmetry_shapes();
+
+        // A spread of positions via random legal play.
+        let mut positions = vec![Position::initial()];
+        let mut pos = Position::initial();
+        let mut s = 0x1234_5678u32;
+        for _ in 0..40 {
+            let moves = pos.get_moves();
+            if moves == 0 {
+                pos = pos.pass_move();
+                if pos.get_moves() == 0 {
+                    break;
+                }
+                continue;
+            }
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let mut pick = s % moves.count_ones();
+            let mut m = moves;
+            let cell = loop {
+                let c = m.trailing_zeros();
+                m &= m - 1;
+                if pick == 0 {
+                    break c;
+                }
+                pick -= 1;
+            };
+            pos = pos.do_move(cell);
+            positions.push(pos);
+        }
+
+        for s in 0..n_shapes {
+            let members: Vec<usize> = (0..map.len()).filter(|&f| map[f] == s).collect();
+            let rep = features.get(members[0]).unwrap();
+            for &m in &members[1..] {
+                let f = features.get(m).unwrap();
+                // Find the symmetry k mapping the representative's cells to f's.
+                let k = (0..8)
+                    .find(|&k| {
+                        rep.cells
+                            .iter()
+                            .zip(&f.cells)
+                            .all(|(&c, &d)| board_symmetry(1u64 << c, k).trailing_zeros() == d)
+                    })
+                    .expect("shape members must be cell-wise symmetry images");
+                for p in &positions {
+                    let tp = Position {
+                        player: board_symmetry(p.player, k),
+                        opponent: board_symmetry(p.opponent, k),
+                    };
+                    assert_eq!(
+                        rep.extract_index(p),
+                        f.extract_index(&tp),
+                        "shape {s}: {} vs {} disagree under symmetry {k}",
+                        rep.name,
+                        f.name
+                    );
+                }
+            }
+        }
     }
 }
