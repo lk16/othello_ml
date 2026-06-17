@@ -32,13 +32,18 @@ othello_eval
 
 ```
 [Magic: 0xDEADBEEF (4 bytes)]
-[Version: 2 (4 bytes)]          ← f32 weights (v1 = i16, still readable)
+[Version: 3 (4 bytes)]          ← f32 weights; older v1/v2 are rejected (re-train)
 [N Features: 47 (4 bytes)]
 [Feature 0: name_len + name + cells_count + cells...]
 ...
 [Feature 46: name_len + name + cells_count + cells...]
 [Weight data: all f32 weights in row-major order]
 ```
+
+Weights are indexed `[feature][empties-bucket][pattern]`, with **one bucket per
+empties value** (61 buckets, empties `0..=60`) — so each ply has its own per-feature
+table. (v1/v2 paired adjacent empties into 30 buckets; v3 is incompatible, hence the
+re-train.) The table is ~218 MB of f32 (`61 × ~892K patterns`).
 
 ## Eval File Format
 
