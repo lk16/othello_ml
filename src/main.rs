@@ -1,15 +1,22 @@
 use othello_eval::{
-    best_move, build_examples, load_games, Board, Features, Position, Trainer, TrainingConfig,
-    Weights,
+    best_move, bootstrap_score, build_examples, load_games, Board, Features, FlatEval,
+    ParallelSolver, Position, Solver, Trainer, TrainingConfig, TrainingExample, Weights,
 };
 use std::env;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 enum Command {
     Train(TrainArgs),
+    TrainBoot(TrainBootArgs),
     Play(PlayArgs),
+    Bench(BenchArgs),
+    EvalCheck(EvalCheckArgs),
+    BenchFlip,
+    BenchCountFlip,
+    BenchGetMoves,
 }
 
 struct TrainArgs {
@@ -23,11 +30,58 @@ struct TrainArgs {
     paths: Vec<String>,
 }
 
+/// Args for `train-boot`: bootstrapped training of empties > N against shallow-search
+/// estimates that use the current weights at their leaves (see `run_train_boot`).
+struct TrainBootArgs {
+    /// Exact-trained frontier N: the eval is trusted at empties ≤ N (anchor).
+    exact_empties: u32,
+    /// Train bands up to this many empties (M).
+    max_empties: u32,
+    /// Shallow-search depth for labels — also the curriculum band width, so each
+    /// band's leaves land in the already-trained band below it.
+    depth: u32,
+    /// SGD epochs per band.
+    epochs: usize,
+    /// Inverse-time LR decay (per band; each band restarts the schedule).
+    lr_decay: f32,
+    /// Weights file: loaded for the starting eval (must already be exact-trained)
+    /// and overwritten after each band.
+    weights_file: String,
+    /// Threads for label generation (training itself is single-threaded online SGD).
+    threads: usize,
+    paths: Vec<String>,
+}
+
 struct PlayArgs {
     depth: u32,
     exact_empties: u32,
     player_color: Option<PlayerColor>,
     weights_file: Option<String>,
+}
+
+struct BenchArgs {
+    empties: u32,
+    max_boards: Option<usize>,
+    threads: usize,
+    /// When set (sequential only), print one OBF line per board to stdout (for
+    /// cross-checking against another solver) and per-board score/nodes/time to
+    /// stderr, instead of only the aggregate summary.
+    per_board: bool,
+    /// Optional trained-weights file: when set, the sequential solver uses
+    /// eval-guided move ordering (Step 34). Absence = the mobility-only baseline,
+    /// so `bench` vs `bench --weights` is a node-count A/B.
+    weights: Option<String>,
+    paths: Vec<String>,
+}
+
+/// Args for `eval-check`: measure a trained eval's accuracy against exact ground
+/// truth (see `run_eval_check`). The exact score is the negamax solve, so this is
+/// only feasible at empties shallow enough to solve cheaply (~<= 22).
+struct EvalCheckArgs {
+    empties: u32,
+    max_boards: Option<usize>,
+    weights_file: String,
+    paths: Vec<String>,
 }
 
 enum PlayerColor {
@@ -44,8 +98,15 @@ fn parse_args() -> Option<Command> {
     }
 
     match args[1].as_str() {
-        "train" => parse_train_args(&args[0], &args[2..]),
+        // `train` is kept as an alias for `train-exact` (the original behaviour).
+        "train" | "train-exact" => parse_train_args(&args[0], &args[2..]),
+        "train-boot" => parse_train_boot_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
+        "bench" => parse_bench_args(&args[0], &args[2..]),
+        "eval-check" => parse_eval_check_args(&args[0], &args[2..]),
+        "bench-flip" => Some(Command::BenchFlip),
+        "bench-count-flip" => Some(Command::BenchCountFlip),
+        "bench-get-moves" => Some(Command::BenchGetMoves),
         "--help" | "-h" => {
             print_usage(&args[0]);
             None
@@ -125,6 +186,73 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     }))
 }
 
+fn parse_train_boot_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut exact_empties: u32 = 16;
+    let mut max_empties: u32 = 24;
+    let mut depth: u32 = 4;
+    let mut epochs: usize = 100;
+    let mut lr_decay: f32 = 0.01;
+    let mut weights_file: String = String::from("trained_weights.bin");
+    let mut threads: usize = 1;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--exact-empties" {
+            i += 1;
+            if i < args.len() {
+                exact_empties = args[i].parse::<u32>().unwrap_or(16);
+            }
+        } else if args[i] == "--max-empties" || args[i] == "-n" {
+            i += 1;
+            if i < args.len() {
+                max_empties = args[i].parse::<u32>().unwrap_or(24);
+            }
+        } else if args[i] == "--depth" {
+            i += 1;
+            if i < args.len() {
+                depth = args[i].parse::<u32>().unwrap_or(4);
+            }
+        } else if args[i] == "--epochs" || args[i] == "-e" {
+            i += 1;
+            if i < args.len() {
+                epochs = args[i].parse::<usize>().unwrap_or(100);
+            }
+        } else if args[i] == "--lr-decay" || args[i] == "-d" {
+            i += 1;
+            if i < args.len() {
+                lr_decay = args[i].parse::<f32>().unwrap_or(0.01);
+            }
+        } else if args[i] == "--weights" || args[i] == "-w" {
+            i += 1;
+            if i < args.len() {
+                weights_file = args[i].clone();
+            }
+        } else if args[i] == "--threads" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+            }
+        } else if args[i] == "--help" || args[i] == "-h" {
+            print_train_boot_usage(program);
+            return None;
+        } else {
+            paths.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    Some(Command::TrainBoot(TrainBootArgs {
+        exact_empties,
+        max_empties,
+        depth,
+        epochs,
+        lr_decay,
+        weights_file,
+        threads,
+        paths,
+    }))
+}
+
 fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     let mut player_color = None;
     let mut depth: u32 = 6;
@@ -176,6 +304,117 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     }))
 }
 
+fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut empties: u32 = 20;
+    let mut max_boards: Option<usize> = None;
+    let mut threads: usize = 1;
+    let mut per_board = false;
+    let mut weights: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--per-board" => {
+                per_board = true;
+            }
+            "--weights" | "-w" => {
+                i += 1;
+                if i < args.len() {
+                    weights = Some(args[i].clone());
+                }
+            }
+            "--empties" | "-n" => {
+                i += 1;
+                if i < args.len() {
+                    empties = args[i].parse().unwrap_or(20);
+                }
+            }
+            "--max-boards" | "-m" => {
+                i += 1;
+                if i < args.len() {
+                    max_boards = args[i].parse().ok();
+                }
+            }
+            "--threads" | "-t" => {
+                i += 1;
+                if i < args.len() {
+                    threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+                }
+            }
+            "--help" | "-h" => {
+                print_bench_usage(program);
+                return None;
+            }
+            _ => paths.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if paths.is_empty() {
+        print_bench_usage(program);
+        return None;
+    }
+    Some(Command::Bench(BenchArgs {
+        empties,
+        max_boards,
+        threads,
+        per_board,
+        weights,
+        paths,
+    }))
+}
+
+fn parse_eval_check_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut empties: u32 = 18;
+    let mut max_boards: Option<usize> = Some(500);
+    let mut weights_file: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--empties" | "-n" => {
+                i += 1;
+                if i < args.len() {
+                    empties = args[i].parse().unwrap_or(18);
+                }
+            }
+            "--max-boards" | "-m" => {
+                i += 1;
+                if i < args.len() {
+                    // "0" / unparseable means "all".
+                    max_boards = args[i].parse().ok().filter(|&n| n > 0);
+                }
+            }
+            "--weights" | "-w" => {
+                i += 1;
+                if i < args.len() {
+                    weights_file = Some(args[i].clone());
+                }
+            }
+            "--help" | "-h" => {
+                print_eval_check_usage(program);
+                return None;
+            }
+            _ => paths.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let Some(weights_file) = weights_file else {
+        eprintln!("Error: --weights/-w is required for eval-check.\n");
+        print_eval_check_usage(program);
+        return None;
+    };
+    if paths.is_empty() {
+        print_eval_check_usage(program);
+        return None;
+    }
+    Some(Command::EvalCheck(EvalCheckArgs {
+        empties,
+        max_boards,
+        weights_file,
+        paths,
+    }))
+}
+
 fn parse_player_color(s: &str) -> Option<PlayerColor> {
     match s.to_lowercase().as_str() {
         "b" | "black" => Some(PlayerColor::Black),
@@ -193,7 +432,13 @@ fn main() {
 
     match cmd {
         Command::Train(args) => run_train(args),
+        Command::TrainBoot(args) => run_train_boot(args),
         Command::Play(args) => run_play(args),
+        Command::Bench(args) => run_bench(args),
+        Command::EvalCheck(args) => run_eval_check(args),
+        Command::BenchFlip => othello_eval::bench_flip_variants(),
+        Command::BenchCountFlip => othello_eval::bench_count_flip_variants(),
+        Command::BenchGetMoves => othello_eval::bench_get_moves_variants(),
     }
 }
 
@@ -260,8 +505,7 @@ fn run_train(args: TrainArgs) {
         }
     }
 
-    let mut examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads)
-    {
+    let examples = match build_examples(&args.eval_file, &positions, &interrupted, args.threads) {
         Ok(ex) => ex,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -280,7 +524,7 @@ fn run_train(args: TrainArgs) {
         interrupt: Some(interrupted),
         threads: args.threads,
     };
-    trainer.train_epochs(&mut weights, &mut examples, &train_config);
+    trainer.train_epochs(&mut weights, &examples, &train_config);
 
     weights.print_sample(&features, 10);
 
@@ -291,6 +535,230 @@ fn run_train(args: TrainArgs) {
     }
 
     eprintln!("\nDone!");
+}
+
+/// Bootstrapped training of deeper positions (empties > N).
+///
+/// The eval is exact-trained at empties ≤ N (the `train-exact` output). This
+/// command extends it outward, one **band of width `depth`** at a time: each band
+/// `(frontier, frontier+depth]` is labelled by a depth-`depth` shallow search whose
+/// leaves are scored by the *current* weights (frozen `FlatEval` snapshot), then
+/// trained. Because a depth-`depth` search from empties ≤ frontier+depth bottoms out
+/// at empties ≤ frontier — already trained — every label is anchored to the band
+/// below it, expanding the well-trained frontier upward without unanchored drift.
+/// Weights are per-empty-range buckets, so each band updates disjoint buckets (no
+/// forgetting of lower bands). Training is single-threaded online SGD; `--threads`
+/// parallelises only the (independent) label generation.
+fn run_train_boot(args: TrainBootArgs) {
+    if args.paths.is_empty() {
+        eprintln!("Error: No input files or directories specified.\n");
+        let program = env::args().next().unwrap_or_default();
+        print_train_boot_usage(&program);
+        return;
+    }
+
+    eprintln!("=== Othello ML Bootstrapped Training ===");
+    eprintln!("Exact frontier N : {}", args.exact_empties);
+    eprintln!("Train up to      : {} empties", args.max_empties);
+    eprintln!("Search depth/band: {}", args.depth);
+    eprintln!("Epochs per band  : {}", args.epochs);
+    eprintln!("Label threads    : {}", args.threads);
+    eprintln!("Weights file     : {}", args.weights_file);
+
+    if args.depth == 0 {
+        eprintln!("Error: --depth must be >= 1 (depth 0 = bare eval, no bootstrapping).");
+        return;
+    }
+
+    // The starting eval must already be exact-trained; a fresh (all-zero) table
+    // produces meaningless labels, so require the file to load.
+    let mut weights = match Weights::load(&args.weights_file) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "Error: could not load weights from {} ({e}).\n\
+                 train-boot needs an exact-trained eval to bootstrap from — run `train-exact` first.",
+                args.weights_file
+            );
+            return;
+        }
+    };
+
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+    let positions: Vec<Board> = games
+        .iter()
+        .flat_map(|game| game.positions.iter())
+        .filter(|p| p.empties() > args.exact_empties && p.empties() <= args.max_empties)
+        .cloned()
+        .collect();
+    eprintln!(
+        "Extracted {} positions with empties in ({}, {}]",
+        positions.len(),
+        args.exact_empties,
+        args.max_empties
+    );
+    if positions.is_empty() {
+        eprintln!("No positions in the bootstrap range. Exiting.");
+        return;
+    }
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!("\nInterrupt received — finishing current band, then stopping...");
+            interrupted.store(true, Ordering::Relaxed);
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
+    }
+
+    let trainer = Trainer::new(0.1, 32, args.lr_decay);
+
+    let mut frontier = args.exact_empties;
+    while frontier < args.max_empties {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        let hi = (frontier + args.depth).min(args.max_empties);
+        let band: Vec<Board> = positions
+            .iter()
+            .filter(|p| p.empties() > frontier && p.empties() <= hi)
+            .cloned()
+            .collect();
+
+        eprintln!(
+            "\n--- Band empties ({frontier}, {hi}]: {} positions ---",
+            band.len()
+        );
+        if band.is_empty() {
+            frontier = hi;
+            continue;
+        }
+
+        // Freeze the current weights as the leaf eval for this band's labels.
+        let flat = Arc::new(FlatEval::from_weights(&weights));
+        let t = Instant::now();
+        let examples = bootstrap_label(&band, &flat, args.depth, args.threads);
+        eprintln!(
+            "Labelled {} positions in {:.1}s (depth-{} shallow search)",
+            examples.len(),
+            t.elapsed().as_secs_f64(),
+            args.depth
+        );
+
+        let train_config = TrainingConfig {
+            epochs: args.epochs,
+            epoch_offset: 0, // each band is its own disjoint weight region
+            interrupt: Some(Arc::clone(&interrupted)),
+            threads: 1, // single-threaded online SGD (best convergence)
+        };
+        trainer.train_epochs(&mut weights, &examples, &train_config);
+
+        match weights.save(&args.weights_file) {
+            Ok(()) => eprintln!("Saved weights after band ({frontier}, {hi}]"),
+            Err(e) => eprintln!("Error saving weights: {e}"),
+        }
+        frontier = hi;
+    }
+
+    eprintln!("\nDone (trained up to empties {frontier}).");
+}
+
+/// Label a band of positions by bootstrapped shallow search, parallelised across
+/// `threads` (the labels are independent). Training stays single-threaded. Reports
+/// live progress + ETA on a single updating line (`done` is shared so a monitor
+/// thread can read it while the workers label).
+fn bootstrap_label(
+    band: &[Board],
+    flat: &Arc<FlatEval>,
+    depth: u32,
+    threads: usize,
+) -> Vec<TrainingExample> {
+    let total = band.len();
+    let done = AtomicUsize::new(0);
+    let start = Instant::now();
+
+    let out: Vec<TrainingExample> = if threads <= 1 {
+        band.iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let ex = TrainingExample {
+                    position: b.position,
+                    target_score: bootstrap_score(&b.position, flat, depth),
+                };
+                if i % 512 == 0 {
+                    print_progress("labelling", i, total, start);
+                }
+                ex
+            })
+            .collect()
+    } else {
+        let done = &done;
+        let chunk = total.div_ceil(threads);
+        std::thread::scope(|s| {
+            // Monitor: print progress until every position is labelled.
+            s.spawn(move || loop {
+                let d = done.load(Ordering::Relaxed);
+                print_progress("labelling", d, total, start);
+                if d >= total {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            });
+            // Workers: each labels its chunk, bumping the shared counter.
+            let handles: Vec<_> = band
+                .chunks(chunk)
+                .map(|part| {
+                    let flat = Arc::clone(flat);
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|b| {
+                                let ex = TrainingExample {
+                                    position: b.position,
+                                    target_score: bootstrap_score(&b.position, &flat, depth),
+                                };
+                                done.fetch_add(1, Ordering::Relaxed);
+                                ex
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+
+    print_progress("labelling", total, total, start);
+    eprintln!(); // finish the progress line
+    out
+}
+
+/// Print a single-line `\r` progress indicator with rate and ETA.
+fn print_progress(what: &str, done: usize, total: usize, start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = done as f64 / elapsed.max(0.001);
+    let pct = if total > 0 {
+        done as f64 / total as f64 * 100.0
+    } else {
+        100.0
+    };
+    let eta = if rate > 0.0 {
+        (total.saturating_sub(done)) as f64 / rate
+    } else {
+        0.0
+    };
+    eprint!("\r  {what} {done}/{total} ({pct:.0}%) | {rate:.0}/s | ETA {eta:.0}s        ");
+    let _ = io::stderr().flush();
 }
 
 fn run_play(args: PlayArgs) {
@@ -380,6 +848,222 @@ fn run_play(args: PlayArgs) {
     }
 }
 
+fn run_bench(args: BenchArgs) {
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+
+    let iter = games
+        .iter()
+        .flat_map(|g| g.positions.iter())
+        .filter(|b| b.empties() == args.empties);
+    let positions: Vec<Board> = if let Some(limit) = args.max_boards {
+        iter.take(limit).cloned().collect()
+    } else {
+        iter.cloned().collect()
+    };
+
+    if positions.is_empty() {
+        eprintln!("No positions found with exactly {} empties.", args.empties);
+        eprintln!("Try a different --empties value.");
+        return;
+    }
+
+    eprintln!(
+        "Benchmarking exact_score: {} positions, {} empties each, {} thread(s)",
+        positions.len(),
+        args.empties,
+        args.threads,
+    );
+
+    // Step 34: optional eval-guided ordering. Build the flat eval once and share it.
+    let eval: Option<Arc<FlatEval>> = match &args.weights {
+        Some(path) => match Weights::load(path) {
+            Ok(w) => {
+                eprintln!("Eval-guided ordering: loaded weights from {path}");
+                Some(Arc::new(FlatEval::from_weights(&w)))
+            }
+            Err(e) => {
+                eprintln!("Error loading weights from {path}: {e}");
+                return;
+            }
+        },
+        None => None,
+    };
+    if eval.is_some() && args.threads > 1 {
+        eprintln!("Note: eval-guided ordering is sequential-only; ignored with --threads > 1.");
+    }
+    let make_solver = || match &eval {
+        Some(e) => Solver::with_eval(Arc::clone(e)),
+        None => Solver::new(),
+    };
+
+    // Per-board mode (sequential only): one OBF line per board to stdout, plus
+    // per-board score/nodes/time to stderr. A fresh `Solver` per board avoids the
+    // warm shared TT skewing later boards — each is solved cold, matching how a
+    // one-shot external solver sees it.
+    if args.per_board {
+        let mut total_nodes: u64 = 0;
+        let mut total_time = 0.0;
+        for (idx, board) in positions.iter().enumerate() {
+            let mut solver = make_solver();
+            let t = Instant::now();
+            let (score, nodes) = solver.exact_score_with_nodes(&board.position);
+            let secs = t.elapsed().as_secs_f64();
+            total_nodes += nodes;
+            total_time += secs;
+            // OBF line for the external solver (player = X, X to move).
+            println!("{};", board.position.to_fen(true));
+            eprintln!(
+                "board {idx}: score={score} nodes={nodes} time={:.1}ms",
+                secs * 1000.0
+            );
+        }
+        let n = positions.len() as f64;
+        eprintln!("Per-board totals:");
+        eprintln!("  Total time   : {total_time:.3}s");
+        eprintln!("  Time/position: {:.1}ms", total_time / n * 1000.0);
+        eprintln!("  Total nodes  : {total_nodes}");
+        eprintln!("  Nodes/pos    : {:.0}", total_nodes as f64 / n);
+        eprintln!(
+            "  Nodes/s      : {:.2}M",
+            total_nodes as f64 / total_time / 1_000_000.0
+        );
+        return;
+    }
+
+    // threads == 1 uses the sequential solver (private, lock-free table);
+    // threads > 1 solves each position with root-level YBWC (Step 21).
+    let mut total_nodes: u64 = 0;
+    let start = Instant::now();
+
+    if args.threads > 1 {
+        let solver = ParallelSolver::new(args.threads);
+        for board in &positions {
+            let (_, nodes) = solver.exact_score_with_nodes(&board.position);
+            total_nodes += nodes;
+        }
+    } else {
+        let mut solver = make_solver();
+        for board in &positions {
+            let (_, nodes) = solver.exact_score_with_nodes(&board.position);
+            total_nodes += nodes;
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let n = positions.len() as f64;
+
+    eprintln!("Results:");
+    eprintln!("  Positions    : {}", positions.len());
+    eprintln!("  Total time   : {elapsed:.3}s");
+    eprintln!("  Time/position: {:.1}ms", elapsed / n * 1000.0);
+    eprintln!("  Positions/s  : {:.0}", n / elapsed);
+    eprintln!("  Total nodes  : {total_nodes}");
+    eprintln!("  Nodes/pos    : {:.0}", total_nodes as f64 / n);
+    eprintln!(
+        "  Nodes/s      : {:.2}M",
+        total_nodes as f64 / elapsed / 1_000_000.0
+    );
+}
+
+/// Measure a trained eval's accuracy against exact ground truth: for each position
+/// at the requested empties, compare `FlatEval::eval_position` to the exact negamax
+/// score (both side-to-move). Reports error in discs — a direct, eval-quality signal
+/// that doesn't conflate accuracy with move-ordering depth the way `bench --weights`
+/// does. Exact search bounds this to shallow empties (~<= 22); a `--max-boards` cap
+/// keeps it quick.
+fn run_eval_check(args: EvalCheckArgs) {
+    let weights = match Weights::load(&args.weights_file) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error loading weights from {}: {e}", args.weights_file);
+            return;
+        }
+    };
+    let eval = FlatEval::from_weights(&weights);
+
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+    let iter = games
+        .iter()
+        .flat_map(|g| g.positions.iter())
+        .filter(|b| b.empties() == args.empties);
+    let positions: Vec<Board> = if let Some(limit) = args.max_boards {
+        iter.take(limit).cloned().collect()
+    } else {
+        iter.cloned().collect()
+    };
+    if positions.is_empty() {
+        eprintln!("No positions found with exactly {} empties.", args.empties);
+        return;
+    }
+
+    eprintln!(
+        "Checking eval accuracy: {} positions, {} empties each (exact solve, can be slow)",
+        positions.len(),
+        args.empties,
+    );
+
+    // One warm solver: exact scores are path-independent, so the shared TT only
+    // speeds later boards — it never changes a result.
+    let mut solver = Solver::new();
+    let n = positions.len();
+    let mut sum_abs = 0.0f64; // MAE numerator
+    let mut sum_sq = 0.0f64; // RMSE numerator
+    let mut sum_signed = 0.0f64; // bias numerator (pred - exact)
+    let mut max_abs = 0.0f64;
+    let mut sign_ok = 0usize; // win/draw/loss class agrees
+    let mut within_2 = 0usize; // |error| <= 2 discs
+    let start = Instant::now();
+
+    for (i, board) in positions.iter().enumerate() {
+        let exact = solver.exact_score(&board.position) as f64;
+        let pred = eval.eval_position(&board.position) as f64;
+        let err = pred - exact;
+        let abs = err.abs();
+        sum_abs += abs;
+        sum_sq += err * err;
+        sum_signed += err;
+        max_abs = max_abs.max(abs);
+        if exact.signum() == pred.signum() {
+            sign_ok += 1;
+        }
+        if abs <= 2.0 {
+            within_2 += 1;
+        }
+        if i % 64 == 0 {
+            print_progress("checking", i, n, start);
+        }
+    }
+    print_progress("checking", n, n, start);
+    eprintln!();
+
+    let nf = n as f64;
+    eprintln!("Results ({} empties, {n} positions):", args.empties);
+    eprintln!("  MAE          : {:.2} discs", sum_abs / nf);
+    eprintln!("  RMSE         : {:.2} discs", (sum_sq / nf).sqrt());
+    eprintln!("  Bias (pred-exact): {:+.2} discs", sum_signed / nf);
+    eprintln!("  Max abs error: {max_abs:.0} discs");
+    eprintln!(
+        "  Within 2     : {:.1}% ({within_2}/{n})",
+        within_2 as f64 / nf * 100.0
+    );
+    eprintln!(
+        "  W/D/L sign   : {:.1}% ({sign_ok}/{n})",
+        sign_ok as f64 / nf * 100.0
+    );
+}
+
 fn prompt_for_move(moves: u64) -> u32 {
     loop {
         print!("Your move: ");
@@ -463,8 +1147,16 @@ fn print_usage(program: &str) {
     eprintln!("Othello ML training and playing.");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  train    Train evaluation weights from game files");
+    eprintln!("  train-exact  Train weights on exact-search labels (empties <= N). Alias: train");
+    eprintln!(
+        "  train-boot   Extend the eval to empties > N via bootstrapped shallow-search labels"
+    );
     eprintln!("  play     Play a game against the CLI");
+    eprintln!("  bench    Benchmark exact alpha-beta search speed");
+    eprintln!("  eval-check  Measure a trained eval's accuracy vs exact ground truth (discs)");
+    eprintln!("  bench-flip  Micro-benchmark the flip-computation variants");
+    eprintln!("  bench-count-flip  Micro-benchmark the count-last-flip variants");
+    eprintln!("  bench-get-moves  Micro-benchmark the mobility variants");
     eprintln!();
     eprintln!("Use \"{program} <command> --help\" for more information about a command.");
 }
@@ -505,6 +1197,80 @@ fn print_train_usage(program: &str) {
     eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
     eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
     eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
+}
+
+fn print_train_boot_usage(program: &str) {
+    eprintln!("Usage: {program} train-boot [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Extend a trained eval to positions with empties > N using bootstrapped labels:");
+    eprintln!("each position is labelled by a shallow search whose leaves use the current");
+    eprintln!("weights, expanding the well-trained frontier outward one band at a time.");
+    eprintln!();
+    eprintln!("Requires an already exact-trained weights file (run `train-exact` first).");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("      --exact-empties N Exact-trained frontier to bootstrap from (default: 16)");
+    eprintln!("  -n, --max-empties N   Train bands up to N empties (default: 24)");
+    eprintln!("      --depth N         Shallow-search depth = curriculum band width (default: 4)");
+    eprintln!("  -e, --epochs N        SGD epochs per band (default: 100)");
+    eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01)");
+    eprintln!("  -w, --weights PATH    Weights file: loaded and overwritten (default: trained_weights.bin)");
+    eprintln!("  -t, --threads N       Threads for label generation (training is single-threaded)");
+    eprintln!("  -h, --help            Show this help message");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  Same game-file paths as train-exact (.wtb/.pgn/.txt/directories).");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {program} train-boot -w ignored/trained_weights.bin training_data/");
+    eprintln!(
+        "  {program} train-boot --exact-empties 16 -n 28 --depth 4 -t 8 -w w.bin training_data/"
+    );
+}
+
+fn print_bench_usage(program: &str) {
+    eprintln!("Usage: {program} bench [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Benchmark exact alpha-beta search over positions from game files.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -n, --empties N    Only use positions with exactly N empty cells (default: 20)");
+    eprintln!("  -m, --max-boards N Cap the number of positions benchmarked (default: all)");
+    eprintln!(
+        "  -t, --threads N    Workers for root-level YBWC per position (default: 1 = sequential)"
+    );
+    eprintln!(
+        "  -w, --weights PATH Use eval-guided move ordering from a trained-weights file (Step 34;"
+    );
+    eprintln!("                     sequential only). Omit for the mobility-only baseline.");
+    eprintln!("  -h, --help         Show this help");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  One or more paths to .wtb/.pgn files or directories (same as train subcommand).");
+}
+
+fn print_eval_check_usage(program: &str) {
+    eprintln!("Usage: {program} eval-check -w <weights> [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Measure a trained eval's accuracy against exact ground truth, in discs.");
+    eprintln!("For each position at the chosen empties it compares FlatEval to the exact");
+    eprintln!("negamax score. A direct eval-quality signal, unlike `bench --weights` (which");
+    eprintln!("measures move-ordering benefit). Exact solve limits this to shallow empties.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -w, --weights PATH Trained-weights file to evaluate (required)");
+    eprintln!("  -n, --empties N    Only use positions with exactly N empty cells (default: 18)");
+    eprintln!("  -m, --max-boards N Cap positions checked, 0 = all (default: 500)");
+    eprintln!("  -h, --help         Show this help");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  One or more paths to .wtb/.pgn files or directories (same as bench).");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {program} eval-check -w ignored/trained_weights.bin -n 18 training_data/");
+    eprintln!(
+        "  {program} eval-check -w w.bin -n 14 -m 1000 training_data/   # check the exact base"
+    );
 }
 
 fn print_play_usage(program: &str) {

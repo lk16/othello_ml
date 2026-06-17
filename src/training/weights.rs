@@ -1,10 +1,23 @@
 use crate::training::features::Features;
 
+/// Number of empty-count buckets: **one weight table per empties value** `0..=60`.
+/// (Previously 30 buckets paired adjacent empties; now each empties value has its
+/// own table for finer-grained, per-ply weights.)
+pub(crate) const EMPTY_RANGE_COUNT: usize = 61;
+
+/// Weight-table bucket index for a position with `empties` empty squares: one
+/// bucket per value, clamped to `60`. Single source of truth shared by [`Weights`]
+/// and the flat solver eval (`crate::eval::pattern::FlatEval`) so the two cannot
+/// drift apart.
+pub(crate) fn empty_range_index(empties: u32) -> usize {
+    empties.min(60) as usize
+}
+
 /// Weight table for evaluating Othello positions.
 ///
 /// Stores evaluation weights indexed by:
 /// - Feature index: which of the 47 features (0-46)
-/// - Empty count range: which of the 30 disc-count tables (indices 0-29 for empties 2,4,6,...,60)
+/// - Empty count: which of the 61 per-empties tables (one per empties value 0..=60)
 /// - Pattern index: which pattern configuration within that feature (0 to 3^cells-1)
 ///
 /// Weights are stored as f32 internally for precise SGD updates.
@@ -14,7 +27,7 @@ use crate::training::features::Features;
 pub struct Weights {
     // Feature scores: [feature][empty_range][pattern] = score (f32 for SGD precision)
     feature_weights: Vec<Vec<Vec<f32>>>,
-    empty_ranges: Vec<u32>, // 2, 4, 6, 8, ... 60
+    empty_ranges: Vec<u32>, // one entry per empties value 0..=60
     features: Features,
 }
 
@@ -22,13 +35,10 @@ impl Weights {
     /// Create a new weight table with Edax features and SGD training
     pub fn new(features: Features) -> Self {
         let n_features = features.count();
-        let n_empty_ranges = 30; // empties: 2, 4, 6, ..., 60
+        let n_empty_ranges = EMPTY_RANGE_COUNT; // one per empties value 0..=60
 
-        // Initialize with empty ranges: 2, 4, 6, ..., 60
-        let mut empty_ranges = Vec::with_capacity(n_empty_ranges);
-        for i in 1..=30 {
-            empty_ranges.push(i * 2);
-        }
+        // One bucket per empties value 0..=60.
+        let empty_ranges: Vec<u32> = (0..EMPTY_RANGE_COUNT as u32).collect();
 
         // Pre-allocate weight tables
         let mut feature_weights = Vec::with_capacity(n_features);
@@ -51,14 +61,10 @@ impl Weights {
         }
     }
 
-    /// Get the appropriate empty range index for a given number of empties
-    /// Rounds down to nearest even number
+    /// Weight-table bucket index for `empties` — one bucket per empties value.
+    /// Delegates to the shared [`empty_range_index`] (kept in sync with `FlatEval`).
     fn empty_range_index(&self, empties: u32) -> usize {
-        let clamped = empties.clamp(2, 60);
-
-        // Round down to nearest even, then convert to index (0-29)
-        let even = (clamped / 2) * 2;
-        ((even / 2) - 1) as usize
+        empty_range_index(empties)
     }
 
     /// Evaluate a board position by summing contributions from all features
@@ -78,6 +84,49 @@ impl Weights {
         }
 
         score
+    }
+
+    /// Evaluate from precomputed feature-pattern indices (one per feature).
+    ///
+    /// Alloc-free hot path used by training: the caller extracts the indices
+    /// once (positions are fixed across epochs) and reuses them, so this skips
+    /// the per-call `Features::extract` `Vec` and the per-cell `get_cell` loop.
+    /// The `range_idx` is computed once instead of per feature.
+    pub fn evaluate_indices(&self, indices: &[u32], empties: u32) -> f32 {
+        let range_idx = self.empty_range_index(empties);
+        let mut score = 0.0f32;
+        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
+            let row = &self.feature_weights[feat_idx][range_idx];
+            let p = pattern_idx as usize;
+            if p < row.len() {
+                score += row[p];
+            }
+        }
+        score
+    }
+
+    /// In-place SGD step over precomputed feature-pattern indices.
+    ///
+    /// Equivalent to calling [`Weights::update_weight_sgd`] for every feature,
+    /// but computes `range_idx` once and indexes directly (no per-feature
+    /// `get`/`set` round-trip). Same `MAX_WEIGHT` clamp.
+    pub fn sgd_step_indices(
+        &mut self,
+        indices: &[u32],
+        empties: u32,
+        learning_rate: f32,
+        gradient: f32,
+    ) {
+        const MAX_WEIGHT: f32 = 100.0;
+        let range_idx = self.empty_range_index(empties);
+        let step = learning_rate * gradient;
+        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
+            let row = &mut self.feature_weights[feat_idx][range_idx];
+            let p = pattern_idx as usize;
+            if p < row.len() {
+                row[p] = (row[p] + step).clamp(-MAX_WEIGHT, MAX_WEIGHT);
+            }
+        }
     }
 
     /// Get weight for a specific feature, pattern, and empty range
@@ -137,7 +186,7 @@ impl Weights {
         self.feature_weights.len()
     }
 
-    /// Number of empty-range buckets (30: empties 2, 4, 6, …, 60).
+    /// Number of empty-count buckets (61: one per empties value 0..=60).
     pub fn empty_range_count(&self) -> usize {
         self.empty_ranges.len()
     }
@@ -221,7 +270,9 @@ impl Weights {
     // ─── Serialization ──────────────────────────────────────────────
 
     const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-    const FORMAT_VERSION: u32 = 2;
+    // v3: one weight table per empties value 0..=60 (61 buckets). v1/v2 used 30
+    // paired-empties buckets and are no longer loadable — re-train from scratch.
+    const FORMAT_VERSION: u32 = 3;
 
     /// Save weights to a file as f32 (lossless).
     pub fn save(&self, path: &str) -> Result<(), String> {
@@ -270,11 +321,8 @@ impl Weights {
         Ok(())
     }
 
-    /// Load weights from a file.
-    ///
-    /// Supports both format versions:
-    /// - Version 2: weights stored as f32 (4 bytes each)
-    /// - Version 1: weights stored as i16 (2 bytes each) — for backward compatibility
+    /// Load weights from a file (format v3: f32 weights, 61 per-empties buckets).
+    /// Older v1/v2 files use a different bucketing and are rejected — re-train.
     pub fn load(path: &str) -> Result<Weights, String> {
         use std::io::{BufReader, Read};
 
@@ -293,9 +341,12 @@ impl Weights {
         }
 
         let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        let is_v1 = version == 1;
-        if version != Self::FORMAT_VERSION && !is_v1 {
-            return Err(format!("Unsupported format version: {version}"));
+        if version != Self::FORMAT_VERSION {
+            return Err(format!(
+                "Unsupported format version: {version} (this build expects v{}; the \
+                 empties-bucketing changed — re-train from scratch)",
+                Self::FORMAT_VERSION
+            ));
         }
 
         let n_features =
@@ -360,19 +411,10 @@ impl Weights {
             for _ in 0..n_empty_ranges {
                 let mut empty_range_weights = Vec::new();
                 for _ in 0..max_pattern {
-                    if is_v1 {
-                        // Version 1: i16 (2 bytes)
-                        let mut weight_bytes = [0u8; 2];
-                        file.read_exact(&mut weight_bytes)
-                            .map_err(|e| e.to_string())?;
-                        empty_range_weights.push(i16::from_le_bytes(weight_bytes) as f32);
-                    } else {
-                        // Version 2: f32 (4 bytes)
-                        let mut weight_bytes = [0u8; 4];
-                        file.read_exact(&mut weight_bytes)
-                            .map_err(|e| e.to_string())?;
-                        empty_range_weights.push(f32::from_le_bytes(weight_bytes));
-                    }
+                    let mut weight_bytes = [0u8; 4];
+                    file.read_exact(&mut weight_bytes)
+                        .map_err(|e| e.to_string())?;
+                    empty_range_weights.push(f32::from_le_bytes(weight_bytes));
                 }
                 feature_weights.push(empty_range_weights);
             }
@@ -394,7 +436,7 @@ mod tests {
         let features = Features::edax();
         let weights = Weights::new(features);
         assert!(weights.feature_count() > 0);
-        assert_eq!(weights.empty_range_count(), 30);
+        assert_eq!(weights.empty_range_count(), 61);
     }
 
     #[test]
@@ -402,10 +444,13 @@ mod tests {
         let features = Features::edax();
         let weights = Weights::new(features);
 
-        assert_eq!(weights.empty_range_index(2), 0);
-        assert_eq!(weights.empty_range_index(3), 0); // rounds down to 2
-        assert_eq!(weights.empty_range_index(4), 1);
-        assert_eq!(weights.empty_range_index(60), 29);
+        // One bucket per empties value: index == empties (clamped to 60).
+        assert_eq!(weights.empty_range_index(0), 0);
+        assert_eq!(weights.empty_range_index(2), 2);
+        assert_eq!(weights.empty_range_index(3), 3);
+        assert_eq!(weights.empty_range_index(4), 4);
+        assert_eq!(weights.empty_range_index(60), 60);
+        assert_eq!(weights.empty_range_index(64), 60); // clamps
     }
 
     #[test]

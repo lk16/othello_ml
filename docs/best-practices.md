@@ -14,11 +14,14 @@ Each item should be descriptive enough that specific examples are unnecessary.
 - **Prefer associated functions** on structs over free functions that take the struct as their first argument.
 - **Prefer `Option` or `Result`** over including an error or sentinel variant in an enum.
 - **Avoid wrapper structs** that only delegate to another type (e.g. `WeightIO`). Put the functions directly on the owning struct.
+- **Avoid `thread_local!`** — it reads worse than passing explicit state. Reach for it only when an explicit owner threaded through the call sites would cost real performance (e.g. it forces re-allocating a large reusable buffer per call). Prefer an owned struct borrowed as `&mut self` through the recursion (which is free per node), as the exact search does with its transposition table (see `Solver`/`Search` in `eval/alphabeta.rs`).
 
 ## Commands
 
 - **Always run `pre-commit run -a`**, not `cargo check` directly. It runs check, fmt, and clippy together.
 - **Prefer commands that require little human approval.** Avoid `sed` or commands with pipes or loops unless it's by far the best solution.
+- **Bound long-running commands with a timeout.** Anything whose runtime is uncertain (benchmarks, searches, exact evaluation) should be wrapped in `timeout <secs> …` and/or given an explicit tool-level timeout, so a bad estimate or a hang can't run unbounded. Estimate the cost first (a small calibration run) before launching the full job.
+- **The `bench` subcommand reloads all input files on every invocation.** Loading is outside the timed loop but still counts against wall-clock; pass the fewest files that supply enough boards, and prefer one larger file over many small ones when sweeping multiple `--empties` values.
 
 ## Threading
 
@@ -29,6 +32,8 @@ Each item should be descriptive enough that specific examples are unnecessary.
 - **Add tests when adding or modifying functions.** Correctness is critical — every new `pub fn` or behavior change should have at least a basic test.
 - Use **Table-driven tests** where appropriate: a function has many input/output pairs.
 - **Self-contained tests** — don't rely on files outside the repo. Add small sample files to `test_data/` when needed.
+- **No randomness in tests.** Don't drive tests with a PRNG (even a seeded one) — failures become noise that depends on the seed and the iteration count. For broad coverage, enumerate a deterministic, fixed set of inputs instead: cross every interesting position parameter (e.g. each empty-square index) with a small table of hand-chosen bit patterns. This is reproducible and the failing case is always the same.
+- **Cross-check fast paths against a simple reference.** When optimizing a function (e.g. the `solve_1`/`solve_2` endgame leaf solvers), keep an obviously-correct, unoptimized implementation in the test module (e.g. `naive_exact`) and assert the two agree over the enumerated inputs.
 
 ## Documentation
 
