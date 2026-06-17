@@ -525,7 +525,10 @@ fn run_train(args: TrainArgs) {
         epochs: args.epochs,
         epoch_offset: args.resume_epoch,
         interrupt: Some(interrupted),
-        threads: args.threads,
+        // Training is ALWAYS sequential online SGD: the parallel clone/merge path
+        // converges materially worse (model-averaging), so `--threads` only
+        // parallelizes the missing-label exact solves in `build_examples` above.
+        threads: 1,
     };
     trainer.train_epochs(&mut weights, &examples, &train_config);
 
@@ -1182,7 +1185,10 @@ fn print_train_usage(program: &str) {
     eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
     eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)");
     eprintln!("  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)");
-    eprintln!("  -t, --threads N       Number of threads for parallel training (default: 1)");
+    eprintln!(
+        "  -t, --threads N       Threads for solving missing exact labels (default: 1).\n\
+         \x20                      Weight training is always sequential (parallel SGD converges worse)."
+    );
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
