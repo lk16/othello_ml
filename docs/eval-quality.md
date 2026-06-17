@@ -72,25 +72,35 @@ Reading:
 
 ## Leading hypotheses (where to dig next)
 
-Roughly in order of suspected impact:
+**Raw data volume is NOT the bottleneck — measured.** The `training_data/` PGN
+corpus (1.2M games, 1.8 GB; `wthor/` dwarfed) holds **~1.1M positions at empties
+14** (and similarly ~0.9–1.2M per bucket from 0–30 empties — ~90% of games reach
+the deep endgame; counted via `"N. "` move-number tokens, see git history of this
+doc). Training doesn't dedup (`build_examples`, `cache.rs:365`), so that raw count
+*is* the example count. ~1.1M exact-labelable examples is plenty for the 10-cell
+features (~18 samples/pattern), so a 6-disc MAE points elsewhere. In order of
+suspected impact:
 
-1. **Training data volume / coverage.** Edax trains on millions of self-play
-   positions; we train on a few PlayOK human-game PGNs (~13k positions/file, ~31k
-   for 10 files), now spread across **61 per-empties buckets** — likely too few
-   examples per bucket to fit ~892K patterns/feature. Try: far more games; verify
-   per-bucket example counts; consider sharing/smoothing weights across adjacent
-   empties buckets (Edax-style ply grouping) so sparse buckets borrow strength.
-2. **Ground-truth availability.** Exact labels (`train-exact`) are only cheap at
-   empties ≤ ~16, so the directly-supervised region is thin and everything above is
-   bootstrapped from it. More exact labels (deeper, via the cache `src/eval/cache`)
-   widen the trustworthy base.
-3. **Training method / objective.** Current trainer is online SGD with inverse-time
-   LR decay (`src/training/trainer.rs`), one example at a time. Edax uses batched
-   regression over a fixed corpus. Check: convergence (does MAE plateau or is it
-   undertrained?), LR schedule, regularization, and whether the squared-error loss
-   on `[-64,64]` scores is well-scaled. Run `eval-check -n 14` after each change —
-   target "within ±2" well above 50% (and MAE → low single digits) before trusting
-   the eval downstream.
+1. **Was the base actually trained on this much?** `train-exact` must exact-solve
+   every ≤16e position (~2 ms at 14e, ~10 ms at 16e), so labelling the full ~1.1M+
+   per bucket is multiple hours — the practical gate, not data availability. If the
+   base eval was trained on only a few files, it is simply **undertrained** despite
+   the large corpus. Check what `ignored/trained_weights.bin` was trained on; if a
+   subset, retrain on far more (training itself is fast post-Step-32; the one-time
+   exact labels are cached via `--eval-file`, `src/eval/cache`). **Try this first.**
+2. **Training method / objective.** If it *was* trained on ~1M examples and still
+   sits at ~6-disc MAE, the SGD setup is the culprit. Current trainer is online SGD
+   with inverse-time LR decay (`src/training/trainer.rs`), one example at a time.
+   Edax uses batched regression over a fixed corpus. Check: convergence (plateau vs
+   undertrained?), LR schedule, regularization, and squared-error loss scaling on
+   `[-64,64]`. Consider sharing/smoothing weights across adjacent empties buckets
+   (Edax-style ply grouping) so rarer patterns borrow strength.
+3. **Ground-truth depth.** Exact labels are only cheap at empties ≤ ~16, so the
+   directly-supervised region is shallow and everything above is bootstrapped from
+   it. Pushing exact labels deeper (via the cache) widens the trustworthy base.
+
+Run `eval-check -n 14` after each change — target "within ±2" well above 50% (and
+MAE → low single digits) before trusting the eval downstream.
 
 See [speedup-plan.md](speedup-plan.md) Steps 32–34 for the eval-related solver work
 (training speedup, `FlatEval`, eval-guided ordering) and the full Edax-gap analysis.
