@@ -13,6 +13,7 @@ enum Command {
     TrainBoot(TrainBootArgs),
     Play(PlayArgs),
     Bench(BenchArgs),
+    EvalCheck(EvalCheckArgs),
     BenchFlip,
     BenchCountFlip,
     BenchGetMoves,
@@ -73,6 +74,16 @@ struct BenchArgs {
     paths: Vec<String>,
 }
 
+/// Args for `eval-check`: measure a trained eval's accuracy against exact ground
+/// truth (see `run_eval_check`). The exact score is the negamax solve, so this is
+/// only feasible at empties shallow enough to solve cheaply (~<= 22).
+struct EvalCheckArgs {
+    empties: u32,
+    max_boards: Option<usize>,
+    weights_file: String,
+    paths: Vec<String>,
+}
+
 enum PlayerColor {
     Black,
     White,
@@ -92,6 +103,7 @@ fn parse_args() -> Option<Command> {
         "train-boot" => parse_train_boot_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
         "bench" => parse_bench_args(&args[0], &args[2..]),
+        "eval-check" => parse_eval_check_args(&args[0], &args[2..]),
         "bench-flip" => Some(Command::BenchFlip),
         "bench-count-flip" => Some(Command::BenchCountFlip),
         "bench-get-moves" => Some(Command::BenchGetMoves),
@@ -351,6 +363,58 @@ fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     }))
 }
 
+fn parse_eval_check_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut empties: u32 = 18;
+    let mut max_boards: Option<usize> = Some(500);
+    let mut weights_file: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--empties" | "-n" => {
+                i += 1;
+                if i < args.len() {
+                    empties = args[i].parse().unwrap_or(18);
+                }
+            }
+            "--max-boards" | "-m" => {
+                i += 1;
+                if i < args.len() {
+                    // "0" / unparseable means "all".
+                    max_boards = args[i].parse().ok().filter(|&n| n > 0);
+                }
+            }
+            "--weights" | "-w" => {
+                i += 1;
+                if i < args.len() {
+                    weights_file = Some(args[i].clone());
+                }
+            }
+            "--help" | "-h" => {
+                print_eval_check_usage(program);
+                return None;
+            }
+            _ => paths.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let Some(weights_file) = weights_file else {
+        eprintln!("Error: --weights/-w is required for eval-check.\n");
+        print_eval_check_usage(program);
+        return None;
+    };
+    if paths.is_empty() {
+        print_eval_check_usage(program);
+        return None;
+    }
+    Some(Command::EvalCheck(EvalCheckArgs {
+        empties,
+        max_boards,
+        weights_file,
+        paths,
+    }))
+}
+
 fn parse_player_color(s: &str) -> Option<PlayerColor> {
     match s.to_lowercase().as_str() {
         "b" | "black" => Some(PlayerColor::Black),
@@ -371,6 +435,7 @@ fn main() {
         Command::TrainBoot(args) => run_train_boot(args),
         Command::Play(args) => run_play(args),
         Command::Bench(args) => run_bench(args),
+        Command::EvalCheck(args) => run_eval_check(args),
         Command::BenchFlip => othello_eval::bench_flip_variants(),
         Command::BenchCountFlip => othello_eval::bench_count_flip_variants(),
         Command::BenchGetMoves => othello_eval::bench_get_moves_variants(),
@@ -906,6 +971,99 @@ fn run_bench(args: BenchArgs) {
     );
 }
 
+/// Measure a trained eval's accuracy against exact ground truth: for each position
+/// at the requested empties, compare `FlatEval::eval_position` to the exact negamax
+/// score (both side-to-move). Reports error in discs — a direct, eval-quality signal
+/// that doesn't conflate accuracy with move-ordering depth the way `bench --weights`
+/// does. Exact search bounds this to shallow empties (~<= 22); a `--max-boards` cap
+/// keeps it quick.
+fn run_eval_check(args: EvalCheckArgs) {
+    let weights = match Weights::load(&args.weights_file) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error loading weights from {}: {e}", args.weights_file);
+            return;
+        }
+    };
+    let eval = FlatEval::from_weights(&weights);
+
+    let games = match load_games(&args.paths) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error loading games: {e}");
+            return;
+        }
+    };
+    let iter = games
+        .iter()
+        .flat_map(|g| g.positions.iter())
+        .filter(|b| b.empties() == args.empties);
+    let positions: Vec<Board> = if let Some(limit) = args.max_boards {
+        iter.take(limit).cloned().collect()
+    } else {
+        iter.cloned().collect()
+    };
+    if positions.is_empty() {
+        eprintln!("No positions found with exactly {} empties.", args.empties);
+        return;
+    }
+
+    eprintln!(
+        "Checking eval accuracy: {} positions, {} empties each (exact solve, can be slow)",
+        positions.len(),
+        args.empties,
+    );
+
+    // One warm solver: exact scores are path-independent, so the shared TT only
+    // speeds later boards — it never changes a result.
+    let mut solver = Solver::new();
+    let n = positions.len();
+    let mut sum_abs = 0.0f64; // MAE numerator
+    let mut sum_sq = 0.0f64; // RMSE numerator
+    let mut sum_signed = 0.0f64; // bias numerator (pred - exact)
+    let mut max_abs = 0.0f64;
+    let mut sign_ok = 0usize; // win/draw/loss class agrees
+    let mut within_2 = 0usize; // |error| <= 2 discs
+    let start = Instant::now();
+
+    for (i, board) in positions.iter().enumerate() {
+        let exact = solver.exact_score(&board.position) as f64;
+        let pred = eval.eval_position(&board.position) as f64;
+        let err = pred - exact;
+        let abs = err.abs();
+        sum_abs += abs;
+        sum_sq += err * err;
+        sum_signed += err;
+        max_abs = max_abs.max(abs);
+        if exact.signum() == pred.signum() {
+            sign_ok += 1;
+        }
+        if abs <= 2.0 {
+            within_2 += 1;
+        }
+        if i % 64 == 0 {
+            print_progress("checking", i, n, start);
+        }
+    }
+    print_progress("checking", n, n, start);
+    eprintln!();
+
+    let nf = n as f64;
+    eprintln!("Results ({} empties, {n} positions):", args.empties);
+    eprintln!("  MAE          : {:.2} discs", sum_abs / nf);
+    eprintln!("  RMSE         : {:.2} discs", (sum_sq / nf).sqrt());
+    eprintln!("  Bias (pred-exact): {:+.2} discs", sum_signed / nf);
+    eprintln!("  Max abs error: {max_abs:.0} discs");
+    eprintln!(
+        "  Within 2     : {:.1}% ({within_2}/{n})",
+        within_2 as f64 / nf * 100.0
+    );
+    eprintln!(
+        "  W/D/L sign   : {:.1}% ({sign_ok}/{n})",
+        sign_ok as f64 / nf * 100.0
+    );
+}
+
 fn prompt_for_move(moves: u64) -> u32 {
     loop {
         print!("Your move: ");
@@ -995,6 +1153,7 @@ fn print_usage(program: &str) {
     );
     eprintln!("  play     Play a game against the CLI");
     eprintln!("  bench    Benchmark exact alpha-beta search speed");
+    eprintln!("  eval-check  Measure a trained eval's accuracy vs exact ground truth (discs)");
     eprintln!("  bench-flip  Micro-benchmark the flip-computation variants");
     eprintln!("  bench-count-flip  Micro-benchmark the count-last-flip variants");
     eprintln!("  bench-get-moves  Micro-benchmark the mobility variants");
@@ -1088,6 +1247,30 @@ fn print_bench_usage(program: &str) {
     eprintln!();
     eprintln!("INPUT:");
     eprintln!("  One or more paths to .wtb/.pgn files or directories (same as train subcommand).");
+}
+
+fn print_eval_check_usage(program: &str) {
+    eprintln!("Usage: {program} eval-check -w <weights> [OPTIONS] <path>...");
+    eprintln!();
+    eprintln!("Measure a trained eval's accuracy against exact ground truth, in discs.");
+    eprintln!("For each position at the chosen empties it compares FlatEval to the exact");
+    eprintln!("negamax score. A direct eval-quality signal, unlike `bench --weights` (which");
+    eprintln!("measures move-ordering benefit). Exact solve limits this to shallow empties.");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -w, --weights PATH Trained-weights file to evaluate (required)");
+    eprintln!("  -n, --empties N    Only use positions with exactly N empty cells (default: 18)");
+    eprintln!("  -m, --max-boards N Cap positions checked, 0 = all (default: 500)");
+    eprintln!("  -h, --help         Show this help");
+    eprintln!();
+    eprintln!("INPUT:");
+    eprintln!("  One or more paths to .wtb/.pgn files or directories (same as bench).");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {program} eval-check -w ignored/trained_weights.bin -n 18 training_data/");
+    eprintln!(
+        "  {program} eval-check -w w.bin -n 14 -m 1000 training_data/   # check the exact base"
+    );
 }
 
 fn print_play_usage(program: &str) {
