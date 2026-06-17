@@ -70,46 +70,65 @@ Reading:
 - **Not search wiring.** Steps 31/34 are built and A/B-able. They are waiting on
   the eval, confirmed by the gate.
 
-## Leading hypotheses (where to dig next)
+## Ruled out by measurement
 
-**Raw data volume is NOT the bottleneck — measured.** The `training_data/` PGN
-corpus (1.2M games, 1.8 GB; `wthor/` dwarfed) holds **~1.1M positions at empties
-14** (and similarly ~0.9–1.2M per bucket from 0–30 empties — ~90% of games reach
-the deep endgame; counted via `"N. "` move-number tokens, see git history of this
-doc). Training doesn't dedup (`build_examples`, `cache.rs:365`), so that raw count
-*is* the example count. ~1.1M exact-labelable examples is plenty for the 10-cell
-features (~18 samples/pattern), so a 6-disc MAE points elsewhere.
+- **Raw data volume.** The `training_data/` PGN corpus (1.2M games, 1.8 GB; `wthor/`
+  dwarfed) holds **~1.1M positions at empties 14** (~0.9–1.2M per bucket from 0–30e
+  — ~90% of games reach the deep endgame; counted via `"N. "` move-number tokens).
+  Training doesn't dedup (`build_examples`, `cache.rs:365`), so that raw count *is*
+  the example count. Plentiful.
+- **Label correctness.** The cached label file (`ignored/edax_evals.txt`, ~8M lines,
+  Edax-generated) was validated against our exact solver via uniform random sampling
+  per bucket: **340/340 bit-exact across empties 4–20** (0 diff), including deep
+  17–20e where selective labels would diverge. True exact ground truth. Bucket sizes
+  ~460–520k each at 4–16e, ~42k tail at 17–20e.
+- **The optimizer.** A from-scratch single-thread retrain (`-t 1`, online SGD) drives
+  *in-sample* 14e MAE to **2.82** (within-2 48.5%) — it fits fine.
+- **`-t > 1` for training is broken, though.** The parallel clone/merge path (Step
+  32) converges far worse: same data/epochs, `-t 16` gave loss 92.8 / MAE 7.24 vs
+  `-t 1`'s loss 13.6 / MAE 2.82. **Always train with `-t 1`.** (`-t` also controls
+  missing-label solve parallelism, so only raise it when the slice is NOT fully
+  cached — and then accept the worse training, or solve labels in a separate pass.)
 
-**Label correctness is also ruled out — measured.** The cached label file
-(`ignored/edax_evals.txt`, ~8M lines, Edax-generated) was validated against our own
-exact solver via uniform random sampling per empties bucket: **340/340 positions
-matched bit-exact across empties 4–20** (0 disc diff), *including* the deep 17–20e
-buckets where selective (Edax level < 60) labels would have diverged. So the labels
-are true exact ground truth, not approximations. Bucket sizes: ~460–520k labels
-each at 4–16e, a thin ~42k tail at 17–20e. The base eval was therefore trained on
-*correct, exact, plentiful* ground truth — the weakness is in **training**, not data
-or labels. In order of suspected impact:
+## The real bottleneck: generalization (overfitting)
 
-1. **Was the base actually trained on this much?** `train-exact` must exact-solve
-   every ≤16e position (~2 ms at 14e, ~10 ms at 16e), so labelling the full ~1.1M+
-   per bucket is multiple hours — the practical gate, not data availability. If the
-   base eval was trained on only a few files, it is simply **undertrained** despite
-   the large corpus. Check what `ignored/trained_weights.bin` was trained on; if a
-   subset, retrain on far more (training itself is fast post-Step-32; the one-time
-   exact labels are cached via `--eval-file`, `src/eval/cache`). **Try this first.**
-2. **Training method / objective.** If it *was* trained on ~1M examples and still
-   sits at ~6-disc MAE, the SGD setup is the culprit. Current trainer is online SGD
-   with inverse-time LR decay (`src/training/trainer.rs`), one example at a time.
-   Edax uses batched regression over a fixed corpus. Check: convergence (plateau vs
-   undertrained?), LR schedule, regularization, and squared-error loss scaling on
-   `[-64,64]`. Consider sharing/smoothing weights across adjacent empties buckets
-   (Edax-style ply grouping) so rarer patterns borrow strength.
-3. **Ground-truth depth.** Exact labels are only cheap at empties ≤ ~16, so the
-   directly-supervised region is shallow and everything above is bootstrapped from
-   it. Pushing exact labels deeper (via the cache) widens the trustworthy base.
+Every retrain shows a large **in-sample vs held-out** gap. Held-out 14e MAE on a
+common 2000-position set (`760*` files, `-t 1`, 60 epochs), vs the in-sample 2.82:
 
-Run `eval-check -n 14` after each change — target "within ±2" well above 50% (and
-MAE → low single digits) before trusting the eval downstream.
+| training set | ≤16e examples | held-out MAE | within ±2 |
+|---|---|---|---|
+| 100 files | 0.36M | 11.18 | 12.0% |
+| 500 files | 2.14M | 9.10 | 14.3% |
+| base `trained_weights.bin` | (more) | **6.04** | 26.3% |
+
+More data monotonically improves held-out (11.18 → 9.10 → base 6.04), confirming
+data helps — but with diminishing returns, and the eval *memorizes* (2.82 in-sample)
+while generalizing poorly. **Primary structural cause: no symmetry exploitation.**
+`Features::edax()` defines **50 independent features** (`feature_weights:
+Vec<Vec<Vec<f32>>>`, one table per feature), so the 4 corner features
+(`corner_a1/h1/a8/h8`) — the *same* 3×3 pattern under rotation/reflection — learn
+*separate* weights, and there is **zero board-symmetry augmentation** in training.
+Each physical pattern therefore sees only ~1/4–1/8 of its occurrences, and the eval
+isn't symmetry-consistent. Edax mirror-packs weights over the 8-fold symmetry → ~8×
+the effective samples per pattern. We get 1×.
+
+## Levers (in order of expected value)
+
+1. **8-fold symmetry** (biggest, cheapest — no new labels). Either augment each
+   training example with its 8 board symmetries, or tie weights across symmetric
+   features (Edax's mirror-packing). Multiplies effective data ~8× *and* makes the
+   eval symmetry-consistent — directly attacks the overfitting.
+2. **More data.** Train `-t 1` on the full cached set (all ~570 cached files /
+   ~6.4M ≤16e), not a slice. Confirmed to help; labels load instantly from the
+   cache. Pair with (1).
+3. **Regularization** (L2 / weight decay) and weight-sharing across adjacent empties
+   buckets (Edax-style ply grouping) so rare patterns borrow strength.
+4. **Ground-truth depth.** Exact labels are cheap only at ≤ ~16e; pushing them
+   deeper (via the cache) widens the directly-supervised base for `train-boot`.
+
+Run `eval-check -n 14` on a **held-out** file after each change — target "within ±2"
+well above 50% and held-out MAE → low single digits before trusting the eval
+downstream. (In-sample numbers flatter; always measure held-out.)
 
 See [speedup-plan.md](speedup-plan.md) Steps 32–34 for the eval-related solver work
 (training speedup, `FlatEval`, eval-guided ordering) and the full Edax-gap analysis.
