@@ -88,14 +88,14 @@ Reading:
   edge/extended-edge 10-cell patterns, lines, diagonals — trinary indices), and
   weights are bucketed **per empties value** (61 buckets, one per `0..=60`;
   `EMPTY_RANGE_COUNT` in `src/training/weights.rs`). We *believed* this was
-  sufficient because "Edax achieves sub-disc accuracy from these same features" —
-  but the [CG experiment](#the-capacity-ceiling-cg-least-squares-experiment) shows
-  the **exact least-squares optimum** of this *linear* model is only ~7.7 MAE
-  in-sample at 14e. So either the linear pattern-sum model genuinely cannot do
-  better on exact-solve targets, or Edax's reputed accuracy is measured differently
-  (post-search at the leaves, on its own self-play distribution, or as RMSE) and
-  isn't a like-for-like standalone-MAE comparison. **This needs verifying before
-  trusting the "representation is sufficient" assumption.**
+  sufficient because of an assumption that "Edax achieves sub-disc accuracy from
+  these same features" — but that claim is **unsourced and false** (see
+  [Edax has no sub-disc claim](#edax-has-no-sub-disc-claim-eval_sigma)). The
+  [CG experiment](#the-capacity-ceiling-cg-least-squares-experiment) shows the
+  **exact least-squares optimum** of this *linear* model is only ~7.7 MAE in-sample
+  at 14e, and Edax's own `eval_sigma` error model puts a static pattern eval in the
+  same multi-disc range. So the **linear representation itself** is the leading
+  suspect for the ceiling.
 - **Not the bootstrap curriculum.** Evidence above: the exact base is equally weak.
   Fix the base first; `train-boot` can only be as good as the eval it boots from.
 - **Not search wiring.** Steps 31/34 are built and A/B-able. They are waiting on
@@ -211,10 +211,30 @@ Findings:
 
 **Implications:** more data won't help (already at the floor); a better optimizer
 won't help (CG is optimal). Breaking ~8 MAE needs a **richer model** (pattern
-*interactions* / non-linearity) or a reconsidered target — *or* first confirming
-whether Edax's reputed <2 MAE is a like-for-like standalone-MAE figure at all (it may
-be measured post-search or on a different distribution). CG stays as a fast,
+*interactions* / non-linearity) or a reconsidered target. CG stays as a fast,
 unbiased, hyperparameter-light default trainer regardless.
+
+## Edax has no sub-disc claim (eval_sigma)
+
+The premise that "Edax reaches sub-disc / <2 MAE from these features" was **our own
+unsourced assumption** (introduced when this doc was created), not an Edax fact:
+Edax's README states no accuracy figure and its source carries no eval MAE/RMSE
+claim. What Edax actually models is `eval_sigma(n_empty, depth, probcut_depth)`
+(`src/eval.c:948`) — an empirical **standard deviation** of search/eval error used to
+set ProbCut thresholds. It is **depth- and ply-dependent**, not a flat number. The
+call site `midgame.c:317` uses `eval_sigma(n_empty, depth, 0)` as *the static eval's*
+error vs a depth-`depth` search; with Edax's own coefficients at 14 empties that is
+**~7.6 discs vs a depth-10 search, ~12.8 vs depth-20**. So Edax's own error model
+puts its static eval in the multi-disc range — **consistent with our ~8 MAE / 10.6
+RMSE**, not with sub-disc accuracy. Edax's strength is **searching deeply on top of**
+a multi-disc leaf eval (and using these σ to prune), not a sub-2 leaf.
+
+We do **not** implement ProbCut or `eval_sigma`, and it does not make sense to: the
+exact solver (`exact_score`) must stay exact — ProbCut is forward pruning that would
+break that — and the only non-exact search we have (depth-limited `play` /
+`bootstrap_score`) is not a bottleneck and would need its own σ fit against our
+noisier eval for little gain. The value of `eval_sigma` to us is **conceptual**: it
+corroborates the capacity ceiling above.
 
 ## Remaining levers (in order of expected value)
 
@@ -223,13 +243,12 @@ unbiased, hyperparameter-light default trainer regardless.
    current model lacks: pattern **interactions** / non-linearity (e.g. a small MLP or
    GBDT over the same pattern indices), more/larger patterns, or finer phase
    conditioning. This is now the gating lever for absolute accuracy.
-2. **Verify the Edax <2-MAE premise** *before* investing in (1). All "the model is
-   sufficient" reasoning rests on Edax reaching sub-disc accuracy from the same
-   features. Confirm whether that is a standalone eval-vs-exact MAE at a fixed empties
-   (like our `eval-check`), or measured post-search / on self-play / as RMSE. If it
-   isn't like-for-like, ~8 MAE standalone may simply be the honest ceiling for a
-   static eval at 14e, and the eval should be judged only by the **move-ordering bar
-   (already met)**.
+2. **Re-scope what "good" means.** The "Edax reaches sub-disc accuracy" premise is
+   now [debunked](#edax-has-no-sub-disc-claim-eval_sigma) — Edax's own `eval_sigma`
+   model puts a static eval at several discs of error. So ~8 MAE standalone may just
+   be the honest ceiling for a static eval at 14e, and the eval should be judged by
+   the **move-ordering bar (already met)** rather than a sub-disc absolute target. If
+   a user-facing estimate is still wanted, pursue (1); otherwise this bar can close.
 3. **Ground-truth depth.** Exact labels are cheap only at ≤ ~16e; pushing them
    deeper (via the cache) widens the directly-supervised base for `train-boot`.
 
