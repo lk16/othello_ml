@@ -23,6 +23,8 @@
 
 use crate::training::weights::{empty_range_index, Weights, EMPTY_RANGE_COUNT};
 use crate::training::TrainingExample;
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Configuration for the conjugate-gradient least-squares fit.
@@ -50,7 +52,8 @@ pub struct CgConfig {
     pub freq_norm: bool,
     /// Threads for **across-bucket** parallelism (buckets are independent).
     pub threads: usize,
-    /// Print per-bucket convergence lines to stderr.
+    /// Verbose debug: print a per-bucket, per-iteration convergence log instead of
+    /// the default single-line `\r` progress bar. Off by default (CLI always off).
     pub verbose: bool,
 }
 
@@ -65,7 +68,7 @@ impl Default for CgConfig {
             min_count: 3,
             freq_norm: true,
             threads: 1,
-            verbose: true,
+            verbose: false,
         }
     }
 }
@@ -107,7 +110,9 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
         })
         .collect();
 
-    for ex in examples {
+    let n = examples.len();
+    let compile_start = Instant::now();
+    for (i, ex) in examples.iter().enumerate() {
         let empties = ex.position.empties();
         let b = empty_range_index(empties);
         let indices = features.extract(&ex.position);
@@ -117,16 +122,19 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
             bucket.slots.push(slot as u32);
         }
         bucket.targets.push(ex.target_score as f64);
+        if !config.verbose && i % 200_000 == 0 {
+            print_cg_progress("compiling examples", i, n, compile_start);
+        }
+    }
+    if !config.verbose {
+        print_cg_progress("compiling examples", n, n, compile_start);
+        eprintln!(); // finish the compile progress line
     }
 
+    let total_nonempty = buckets.iter().filter(|b| b.n_examples() > 0).count();
     eprintln!(
-        "CG least-squares: {} examples across {} buckets (stride={}, ridge={}, freq_norm={}, threads={})",
-        examples.len(),
-        buckets.iter().filter(|b| b.n_examples() > 0).count(),
-        stride,
-        config.ridge,
-        config.freq_norm,
-        config.threads,
+        "CG least-squares: {} examples across {} buckets (stride={}, ridge={}/example, freq_norm={}, threads={})",
+        n, total_nonempty, stride, config.ridge, config.freq_norm, config.threads,
     );
     let start = Instant::now();
 
@@ -135,10 +143,16 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
         .map(|b| weights.read_bucket(b))
         .collect();
 
+    // Shared completed-bucket counter for the `\r` progress line (parallel-safe).
+    let done = AtomicUsize::new(0);
     let n_threads = config.threads.max(1);
     let results: Vec<(usize, Vec<f32>)> = if n_threads <= 1 {
         (0..EMPTY_RANGE_COUNT)
-            .map(|b| (b, solve_bucket(&buckets[b], &inits[b], config, b)))
+            .map(|b| {
+                let w = solve_bucket(&buckets[b], &inits[b], config, b);
+                report_bucket(&buckets[b], &done, total_nonempty, start, config.verbose);
+                (b, w)
+            })
             .collect()
     } else {
         // Round-robin bucket indices across threads so work (uneven bucket sizes)
@@ -146,13 +160,16 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
         std::thread::scope(|s| {
             let buckets = &buckets;
             let inits = &inits;
+            let done = &done;
             let handles: Vec<_> = (0..n_threads)
                 .map(|t| {
                     s.spawn(move || {
                         let mut out = Vec::new();
                         let mut b = t;
                         while b < EMPTY_RANGE_COUNT {
-                            out.push((b, solve_bucket(&buckets[b], &inits[b], config, b)));
+                            let w = solve_bucket(&buckets[b], &inits[b], config, b);
+                            report_bucket(&buckets[b], done, total_nonempty, start, config.verbose);
+                            out.push((b, w));
                             b += n_threads;
                         }
                         out
@@ -165,6 +182,9 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
                 .collect()
         })
     };
+    if !config.verbose {
+        eprintln!(); // finish the bucket progress line
+    }
 
     for (b, w) in results {
         weights.write_bucket(b, &w);
@@ -174,6 +194,42 @@ pub fn train_least_squares(weights: &mut Weights, examples: &[TrainingExample], 
         "CG least-squares complete | time: {:.1}s",
         start.elapsed().as_secs_f64()
     );
+}
+
+/// Count a finished (non-empty) bucket and refresh the `\r` solve-progress line.
+/// No-op in `verbose` mode (the per-iteration log serves as progress there) and
+/// for empty buckets (which solve instantly and shouldn't skew the ETA).
+fn report_bucket(
+    bucket: &BucketData,
+    done: &AtomicUsize,
+    total: usize,
+    start: Instant,
+    verbose: bool,
+) {
+    if verbose || bucket.n_examples() == 0 {
+        return;
+    }
+    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+    print_cg_progress("solving buckets", d, total, start);
+}
+
+/// Single-line `\r` progress indicator with rate and ETA (matches the style of
+/// `run_eval_check`/`build_examples` in the binary).
+fn print_cg_progress(what: &str, done: usize, total: usize, start: Instant) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = done as f64 / elapsed.max(0.001);
+    let pct = if total > 0 {
+        done as f64 / total as f64 * 100.0
+    } else {
+        100.0
+    };
+    let eta = if rate > 0.0 {
+        (total.saturating_sub(done)) as f64 / rate
+    } else {
+        0.0
+    };
+    eprint!("\r  {what} {done}/{total} ({pct:.0}%) | {rate:.0}/s | ETA {eta:.0}s        ");
+    let _ = std::io::stderr().flush();
 }
 
 /// Solve a single empties bucket: conjugate gradient with exact line search.
