@@ -9,14 +9,17 @@ The eval is judged against **two distinct bars**, and they have very different s
    of nodes and is ~1.27× faster wall-clock at 18e** (speedup-plan Step 34). Ordering
    only needs the eval to *rank* sibling moves better than mobility, and it now does.
 
-2. **Absolute score accuracy — OPEN.** The eval is trained against **exact
-   end-of-game scores**, so it *is* an estimator of the final disc differential under
-   perfect play. We want to **surface that estimate to the user in the future** (e.g.
-   show it during `play`), and for that the *absolute* number matters, not just the
-   ranking. It has plateaued at **~6-disc MAE in-sample (~20% within ±2)** — poor for
-   a human-facing estimate. The training-method levers (mini-batch/L2) barely moved
-   it, so closing this gap likely needs a different model (pattern interactions /
-   non-linearity) or a broader data distribution, not more of the same.
+2. **Absolute score accuracy — OPEN, and now understood to be a model-capacity
+   ceiling.** The eval is trained against **exact end-of-game scores**, so it *is* an
+   estimator of the final disc differential under perfect play. We want to **surface
+   that estimate to the user in the future** (e.g. show it during `play`), and for
+   that the *absolute* number matters, not just the ranking. It plateaus at **~8-disc
+   MAE held-out (~16% within ±2) at empties 14** — poor for a human-facing estimate.
+   A conjugate-gradient solver that reaches the **exact least-squares optimum** does
+   *no better than SGD* (8.2 vs 8.0 MAE) and is only **7.7 MAE even in-sample**, so
+   the gap is **not** the optimizer, **not** overfitting, and **not** data quantity —
+   it is the **linear pattern model's capacity** (or the difficulty of the target).
+   See [The capacity ceiling](#the-capacity-ceiling-cg-least-squares-experiment).
 
 So the move-ordering bar no longer blocks the solver speedups, but score accuracy
 remains the eval's primary unmet goal. This doc records how we got here and what is
@@ -80,13 +83,19 @@ Reading:
 
 ## What this is and isn't
 
-- **Not model capacity.** The feature set is Edax's own 47-pattern set
-  (`Features::edax()` in `src/training/features.rs`: 3×3 corners, edge/extended-edge
-  10-cell patterns, lines, diagonals — trinary indices), and weights are bucketed
-  **per empties value** (61 buckets, one per `0..=60`; `EMPTY_RANGE_COUNT` in
-  `src/training/weights.rs`). Edax achieves sub-disc accuracy from these *same*
-  features, so the representation is sufficient. The gap is **how/what we train**,
-  not the model.
+- **Model capacity — now the leading suspect.** The feature set is Edax's own
+  46-pattern set (`Features::edax()` in `src/training/features.rs`: 3×3 corners,
+  edge/extended-edge 10-cell patterns, lines, diagonals — trinary indices), and
+  weights are bucketed **per empties value** (61 buckets, one per `0..=60`;
+  `EMPTY_RANGE_COUNT` in `src/training/weights.rs`). We *believed* this was
+  sufficient because "Edax achieves sub-disc accuracy from these same features" —
+  but the [CG experiment](#the-capacity-ceiling-cg-least-squares-experiment) shows
+  the **exact least-squares optimum** of this *linear* model is only ~7.7 MAE
+  in-sample at 14e. So either the linear pattern-sum model genuinely cannot do
+  better on exact-solve targets, or Edax's reputed accuracy is measured differently
+  (post-search at the leaves, on its own self-play distribution, or as RMSE) and
+  isn't a like-for-like standalone-MAE comparison. **This needs verifying before
+  trusting the "representation is sufficient" assumption.**
 - **Not the bootstrap curriculum.** Evidence above: the exact base is equally weak.
   Fix the base first; `train-boot` can only be as good as the eval it boots from.
 - **Not search wiring.** Steps 31/34 are built and A/B-able. They are waiting on
@@ -112,7 +121,14 @@ Reading:
   missing-label solve parallelism, so only raise it when the slice is NOT fully
   cached — and then accept the worse training, or solve labels in a separate pass.)
 
-## The real bottleneck: generalization (overfitting)
+## Generalization gap — a small-data artifact, not the ceiling
+
+> **Superseded by the [CG experiment](#the-capacity-ceiling-cg-least-squares-experiment).**
+> This section described the *small-data* regime, where the model has far more
+> weights than examples-per-bucket and **memorizes**. The large in-sample↔held-out
+> gap below is real *there*, but it **closes once data is plentiful**, revealing a
+> capacity floor (in-sample ≈ held-out ≈ 8 MAE) rather than an overfitting problem.
+> Symmetry tying (next section) was still a worthwhile fix. Kept for history.
 
 Every retrain shows a large **in-sample vs held-out** gap. Held-out 14e MAE on a
 common 2000-position set (`760*` files, `-t 1`, 60 epochs), vs the in-sample 2.82:
@@ -157,25 +173,69 @@ More data on top of tying: 1000 files (4.5M ≤16e) → held-out **7.86**, in-sa
 corpus incl. the 760* "held-out" set, so it's effectively in-sample; on equal
 in-sample footing tied ≈ base.)
 
-**The remaining ceiling: ~6-disc MAE even IN-SAMPLE** (21% within ±2). Symmetry fixed
-the *generalization gap* and the feature bugs, but not the absolute accuracy. Edax
-reaches <2 MAE from the *same* features, so the gap is now the **training method**,
-not symmetry or data quantity.
+**The remaining ceiling: ~8-disc MAE even IN-SAMPLE** (with plentiful data). Symmetry
+fixed the *generalization gap* and the feature bugs, but not the absolute accuracy.
+We *hypothesized* the gap was now the **training method** — but the CG experiment
+below **refutes that**: switching to the exact least-squares optimum does not help.
+See [The capacity ceiling](#the-capacity-ceiling-cg-least-squares-experiment).
+
+## The capacity ceiling (CG least-squares experiment)
+
+To test whether the optimizer was the bottleneck, we replaced SGD with a per-bucket
+**conjugate-gradient least-squares solver** (`src/training/cg.rs`, `train -o cg`),
+which reaches the *exact global optimum* of the convex per-bucket objective — Edax's
+own `eval_builder` method. Ridge is regularization, specified **per example** so a
+single value is scale-invariant across data sizes (the data term is an implicit sum
+over N examples, so internally `ridge·N` is used; default `0.001`). All runs at
+empties 14, exact labels from `ignored/edax_evals.txt`.
+
+| run | train set | MAE | within ±2 | bias | notes |
+|---|---|---|---|---|---|
+| SGD (60 ep) | 75* (3.9M ex) | **7.99** | 17.1% | +1.09 | held-out `760*` (same-dist, unseen) |
+| CG (ridge 1e-3) | 75* (3.9M ex) | 8.19 | 16.0% | **+0.08** | held-out `760*`; **3 s** train vs SGD's 113 s |
+| CG (ridge 1e-3) | 75* (3.9M ex) | **7.67** | 16.7% | — | **in-sample** (`7500*`) |
+
+Findings:
+
+- **CG ≈ SGD on held-out** (8.2 vs 8.0 MAE). The exact least-squares optimum is *not*
+  better than SGD's early-stopped solution. CG is unbiased by construction (+0.08 vs
+  SGD's +1.09) and ~37× faster to fit, but no more accurate.
+- **In-sample ≈ held-out for CG** (7.67 vs 8.19). The ~0.5-disc gap means **no
+  overfitting** at this data scale, and the global optimum *itself* is only 7.7 MAE.
+- Therefore the ceiling is **model capacity / target difficulty**, not the optimizer,
+  not overfitting, not data quantity. At empties 14 the exact disc-differential under
+  perfect play carries tactical variance a static linear pattern-sum cannot capture.
+- The old "2.82 in-sample" was the **small-data overfit regime** (100 files: ~115k
+  weights/bucket ≫ examples → memorization, held-out 11.18). With full data the model
+  can't memorize and in-sample rises to the true floor.
+
+**Implications:** more data won't help (already at the floor); a better optimizer
+won't help (CG is optimal). Breaking ~8 MAE needs a **richer model** (pattern
+*interactions* / non-linearity) or a reconsidered target — *or* first confirming
+whether Edax's reputed <2 MAE is a like-for-like standalone-MAE figure at all (it may
+be measured post-search or on a different distribution). CG stays as a fast,
+unbiased, hyperparameter-light default trainer regardless.
 
 ## Remaining levers (in order of expected value)
 
-1. **Training method / objective** (the ceiling). Our trainer is per-example online
-   SGD with inverse-time LR decay and a fixed `gradient = 2·error/n_features` step
-   (`trainer.rs`). Edax fits by **batched least-squares regression** over the whole
-   corpus. Try: true mini-batch / full-batch gradient accumulation, proper LR tuning,
-   more epochs to convergence, L2 regularization, and weight-sharing across adjacent
-   empties buckets (Edax-style ply grouping) so rare patterns borrow strength. This
-   is now the gating lever for breaking the ~6-MAE ceiling.
-2. **More data**, cheap now that tying is 1× cost and `-t N` solves uncached labels:
-   train on the full corpus (extend the cache once with `-t 16`). Helps the gap but
-   has diminishing returns against the ceiling above.
+1. **Richer model — the capacity lever.** The CG experiment shows the *linear*
+   pattern-sum is at its floor (~8 MAE). Breaking it needs representational power the
+   current model lacks: pattern **interactions** / non-linearity (e.g. a small MLP or
+   GBDT over the same pattern indices), more/larger patterns, or finer phase
+   conditioning. This is now the gating lever for absolute accuracy.
+2. **Verify the Edax <2-MAE premise** *before* investing in (1). All "the model is
+   sufficient" reasoning rests on Edax reaching sub-disc accuracy from the same
+   features. Confirm whether that is a standalone eval-vs-exact MAE at a fixed empties
+   (like our `eval-check`), or measured post-search / on self-play / as RMSE. If it
+   isn't like-for-like, ~8 MAE standalone may simply be the honest ceiling for a
+   static eval at 14e, and the eval should be judged only by the **move-ordering bar
+   (already met)**.
 3. **Ground-truth depth.** Exact labels are cheap only at ≤ ~16e; pushing them
    deeper (via the cache) widens the directly-supervised base for `train-boot`.
+
+**Ruled out (CG experiment):** the **training method / optimizer** is *not* a lever —
+the exact least-squares optimum (CG) matches SGD. Likewise **more data** and
+**overfitting** are not the issue at full-corpus scale.
 
 Run `eval-check -n 14` on a **held-out** file after each change — target "within ±2"
 well above 50% and held-out MAE → low single digits before trusting the eval

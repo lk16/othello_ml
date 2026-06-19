@@ -267,6 +267,55 @@ impl Weights {
         &self.shape_weights
     }
 
+    // ─── Bucket-flat view (for the conjugate-gradient solver) ───────────
+    //
+    // The least-squares solver (`crate::training::cg`) optimizes **one empties
+    // bucket at a time** as a single flat weight vector: the per-shape pattern
+    // tables of that bucket, concatenated in shape order. These helpers convert
+    // between the canonical `shape_weights[shape][bucket][pattern]` storage and
+    // that flat layout. `slot(shape, pattern) = shape_offsets()[shape] + pattern`
+    // maps a feature's (tied) shape + pattern index to its position in the flat
+    // vector.
+
+    /// Per-shape start offsets in the bucket-flat layout (length = shape count).
+    /// Pattern counts are identical across buckets, so this is bucket-independent.
+    pub fn shape_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.shape_weights.len());
+        let mut acc = 0usize;
+        for shape in &self.shape_weights {
+            offsets.push(acc);
+            acc += shape[0].len(); // pattern count of this shape
+        }
+        offsets
+    }
+
+    /// Total number of weights in one empties bucket (sum of shape pattern counts).
+    pub fn bucket_len(&self) -> usize {
+        self.shape_weights.iter().map(|s| s[0].len()).sum()
+    }
+
+    /// Copy bucket `range_idx`'s weights into a flat vector (shape-concatenated,
+    /// matching [`Weights::shape_offsets`]).
+    pub fn read_bucket(&self, range_idx: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.bucket_len());
+        for shape in &self.shape_weights {
+            out.extend_from_slice(&shape[range_idx]);
+        }
+        out
+    }
+
+    /// Write a flat bucket vector (as produced by [`Weights::read_bucket`]) back
+    /// into storage. `flat.len()` must equal [`Weights::bucket_len`].
+    pub fn write_bucket(&mut self, range_idx: usize, flat: &[f32]) {
+        let mut k = 0;
+        for shape in &mut self.shape_weights {
+            let row = &mut shape[range_idx];
+            let n = row.len();
+            row.copy_from_slice(&flat[k..k + n]);
+            k += n;
+        }
+    }
+
     /// Merge weight deltas from parallel workers.
     ///
     /// Each worker cloned the weights before training, so

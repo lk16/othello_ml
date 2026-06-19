@@ -1,6 +1,7 @@
 use othello_eval::{
-    best_move, bootstrap_score, build_examples, load_games, Board, Features, FlatEval,
-    ParallelSolver, Position, Solver, Trainer, TrainingConfig, TrainingExample, Weights,
+    best_move, bootstrap_score, build_examples, load_games, train_least_squares, Board, CgConfig,
+    Features, FlatEval, ParallelSolver, Position, Solver, Trainer, TrainingConfig, TrainingExample,
+    Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -19,6 +20,16 @@ enum Command {
     BenchGetMoves,
 }
 
+/// Weight-fitting algorithm for `train`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Optimizer {
+    /// Online/mini-batch SGD (the original path; uses epochs/lr/batch/l2).
+    Sgd,
+    /// Per-bucket conjugate-gradient least-squares (Edax `eval_builder` method;
+    /// uses cg-iters/ridge/min-count; ignores the SGD knobs). See `training::cg`.
+    Cg,
+}
+
 struct TrainArgs {
     max_empties: u32,
     epochs: usize,
@@ -30,6 +41,11 @@ struct TrainArgs {
     weights_file: String,
     threads: usize,
     paths: Vec<String>,
+    // Optimizer selection and CG-specific knobs (ignored when `optimizer == Sgd`).
+    optimizer: Optimizer,
+    cg_iters: usize,
+    ridge: f64,
+    min_count: u32,
 }
 
 /// Args for `train-boot`: bootstrapped training of empties > N against shallow-search
@@ -132,9 +148,40 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
     let mut weights_file: String = String::from("trained_weights.bin");
     let mut threads: usize = 1;
     let mut paths: Vec<String> = Vec::new();
+    let mut optimizer = Optimizer::Sgd;
+    let mut cg_iters: usize = 200;
+    let mut ridge: f64 = 1e-3;
+    let mut min_count: u32 = 3;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--max-empties" || args[i] == "-n" {
+        if args[i] == "--optimizer" || args[i] == "-o" {
+            i += 1;
+            if i < args.len() {
+                match args[i].as_str() {
+                    "sgd" => optimizer = Optimizer::Sgd,
+                    "cg" => optimizer = Optimizer::Cg,
+                    other => {
+                        eprintln!("Invalid optimizer: {other}. Use 'sgd' or 'cg'.");
+                        return None;
+                    }
+                }
+            }
+        } else if args[i] == "--cg-iters" {
+            i += 1;
+            if i < args.len() {
+                cg_iters = args[i].parse::<usize>().unwrap_or(200).max(1);
+            }
+        } else if args[i] == "--ridge" {
+            i += 1;
+            if i < args.len() {
+                ridge = args[i].parse::<f64>().unwrap_or(1e-3).max(0.0);
+            }
+        } else if args[i] == "--min-count" {
+            i += 1;
+            if i < args.len() {
+                min_count = args[i].parse::<u32>().unwrap_or(3);
+            }
+        } else if args[i] == "--max-empties" || args[i] == "-n" {
             i += 1;
             if i < args.len() {
                 max_empties = args[i].parse::<u32>().unwrap_or(60);
@@ -199,6 +246,10 @@ fn parse_train_args(program: &str, args: &[String]) -> Option<Command> {
         weights_file,
         threads,
         paths,
+        optimizer,
+        cg_iters,
+        ridge,
+        min_count,
     }))
 }
 
@@ -534,19 +585,35 @@ fn run_train(args: TrainArgs) {
     // augmentation needed (see docs/eval-quality.md).
 
     eprintln!("\n--- Training ---");
-    eprintln!("(press Ctrl+C to stop early and save weights)");
 
-    let trainer = Trainer::with_l2(0.1, args.batch_size, args.lr_decay, args.l2);
-    let train_config = TrainingConfig {
-        epochs: args.epochs,
-        epoch_offset: args.resume_epoch,
-        interrupt: Some(interrupted),
-        // Training is ALWAYS sequential online SGD: the parallel clone/merge path
-        // converges materially worse (model-averaging), so `--threads` only
-        // parallelizes the missing-label exact solves in `build_examples` above.
-        threads: 1,
-    };
-    trainer.train_epochs(&mut weights, &examples, &train_config);
+    match args.optimizer {
+        Optimizer::Cg => {
+            // Per-bucket conjugate-gradient least-squares (Edax method). No learning
+            // rate; buckets are independent so `--threads` parallelizes across them.
+            let cg_config = CgConfig {
+                max_iter: args.cg_iters,
+                ridge: args.ridge,
+                min_count: args.min_count,
+                threads: args.threads,
+                ..CgConfig::default()
+            };
+            train_least_squares(&mut weights, &examples, &cg_config);
+        }
+        Optimizer::Sgd => {
+            eprintln!("(press Ctrl+C to stop early and save weights)");
+            let trainer = Trainer::with_l2(0.1, args.batch_size, args.lr_decay, args.l2);
+            let train_config = TrainingConfig {
+                epochs: args.epochs,
+                epoch_offset: args.resume_epoch,
+                interrupt: Some(interrupted),
+                // Training is ALWAYS sequential online SGD: the parallel clone/merge
+                // path converges materially worse (model-averaging), so `--threads`
+                // only parallelizes the missing-label exact solves in `build_examples`.
+                threads: 1,
+            };
+            trainer.train_epochs(&mut weights, &examples, &train_config);
+        }
+    }
 
     weights.print_sample(&features, 10);
 
@@ -1194,21 +1261,38 @@ fn print_train_usage(program: &str) {
     eprintln!(
         "  -n, --max-empties N   Only train on positions with <= N empty cells (default: 60)"
     );
+    eprintln!(
+        "  -o, --optimizer ALGO  Weight fitting: 'sgd' (default) or 'cg' (conjugate-gradient\n\
+         \x20                      least-squares, Edax method; no learning rate)."
+    );
+    eprintln!(
+        "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
+    );
+    eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
+    eprintln!(
+        "  -t, --threads N       Threads for solving missing exact labels (default: 1).\n\
+         \x20                      With --optimizer cg, also parallelizes across empties\n\
+         \x20                      buckets. SGD weight training is always sequential."
+    );
+    eprintln!();
+    eprintln!("  SGD options (--optimizer sgd):");
     eprintln!("  -e, --epochs N        Number of training epochs (default: 10)");
     eprintln!(
         "  -b, --batch-size N    Mini-batch size, gradients summed at frozen weights (default: 32)"
     );
     eprintln!("      --l2 F            L2 weight-decay coefficient (default: 0 = off)");
-    eprintln!(
-        "  -f, --eval-file PATH  Eval cache (load if exists, compute+append missing, create if not)"
-    );
-    eprintln!("  -w, --weights PATH    Weights output file (default: trained_weights.bin)");
     eprintln!("  -d, --lr-decay F      Inverse-time LR decay factor (default: 0.01, 0 = no decay)");
     eprintln!("  -r, --resume-epoch N  Resume LR schedule from this epoch (default: 0)");
+    eprintln!();
+    eprintln!("  CG options (--optimizer cg):");
     eprintln!(
-        "  -t, --threads N       Threads for solving missing exact labels (default: 1).\n\
-         \x20                      Weight training is always sequential (parallel SGD converges worse)."
+        "      --cg-iters N      Max conjugate-gradient iterations per bucket (default: 200)"
     );
+    eprintln!(
+        "      --ridge F         Ridge (L2) coeff, per-example/scale-invariant (default: 0.001)"
+    );
+    eprintln!("      --min-count N     Freeze weights whose config appears < N times (default: 3)");
+    eprintln!();
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EVAL FILE FORMAT:");
@@ -1226,6 +1310,7 @@ fn print_train_usage(program: &str) {
     eprintln!("  {program} train --max-empties 20 --epochs 50 training_data/");
     eprintln!("  {program} train --eval-file ignored/evals.txt --epochs 30 training_data/");
     eprintln!("  {program} train -e 1000 -d 0.001 -f evals.txt training_data/");
+    eprintln!("  {program} train -o cg -n 16 -t 16 -f ignored/edax_evals.txt training_data/");
 }
 
 fn print_train_boot_usage(program: &str) {

@@ -29,6 +29,7 @@ pub fn bench_get_moves_variants() {
 pub use othello::board::Board;
 pub use othello::game::{load_games, Game, GameResult};
 pub use othello::position::Position;
+pub use training::cg::{train_least_squares, CgConfig};
 pub use training::features::Features;
 pub use training::trainer::{Trainer, TrainingConfig, TrainingExample};
 pub use training::weights::Weights;
