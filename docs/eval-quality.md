@@ -1,13 +1,26 @@
-# Eval Quality — the gating problem (RESOLVED enough to help the search)
+# Eval Quality — two bars: move-ordering (met) and score accuracy (open)
 
-**Status: the gate flipped.** The trained eval started *too inaccurate to help the
-search* (eval-guided move ordering cost +0.7–1.8% nodes). After the fixes below
-(corrected 46-feature transcription, symmetry **weight tying**, mini-batch + L2,
-exact labels extended to ≤18e → `ignored/weights_v4.bin`), eval-guided ordering now
-**cuts ~34% of nodes and is ~1.27× faster wall-clock at 18e** (see speedup-plan
-Step 34). Absolute accuracy plateaued at ~6-disc MAE in-sample, but that is enough
-to *rank* moves better than mobility — which is all Step 34 needs. This doc records
-how we got here; the remaining work is search-side (speedup-plan Steps 34/31).
+The eval is judged against **two distinct bars**, and they have very different status:
+
+1. **Move ordering — MET.** The eval started *too inaccurate to help the search*
+   (eval-guided ordering cost +0.7–1.8% nodes). After the fixes below (corrected
+   46-feature transcription, symmetry **weight tying**, mini-batch + L2, exact labels
+   extended to ≤18e → `ignored/weights_v4.bin`), eval-guided ordering now **cuts ~34%
+   of nodes and is ~1.27× faster wall-clock at 18e** (speedup-plan Step 34). Ordering
+   only needs the eval to *rank* sibling moves better than mobility, and it now does.
+
+2. **Absolute score accuracy — OPEN.** The eval is trained against **exact
+   end-of-game scores**, so it *is* an estimator of the final disc differential under
+   perfect play. We want to **surface that estimate to the user in the future** (e.g.
+   show it during `play`), and for that the *absolute* number matters, not just the
+   ranking. It has plateaued at **~6-disc MAE in-sample (~20% within ±2)** — poor for
+   a human-facing estimate. The training-method levers (mini-batch/L2) barely moved
+   it, so closing this gap likely needs a different model (pattern interactions /
+   non-linearity) or a broader data distribution, not more of the same.
+
+So the move-ordering bar no longer blocks the solver speedups, but score accuracy
+remains the eval's primary unmet goal. This doc records how we got here and what is
+still open.
 
 ## Why it matters
 
@@ -20,8 +33,13 @@ and the two levers that close that gap both need a strong eval:
 
 Both are *built and wired* but **net-negative or neutral with the current weights**
 (eval-guided ordering costs +0.7–2.4% nodes instead of saving). The mechanisms are
-correct; they are starved of a good eval. Nothing else in the roadmap matters as
-much until this is fixed.
+correct; they are starved of a good eval. (As of `weights_v4.bin` the move-ordering
+lever now pays off — see the status section above.)
+
+Beyond the solver, the eval has a **second, standalone purpose**: it predicts the
+perfect-play end score, which we want to **show to the user** (e.g. during `play`) as
+a position assessment. That use needs *absolute* accuracy — the open bar above — not
+just move ranking.
 
 ## How to measure it: `eval-check`
 
