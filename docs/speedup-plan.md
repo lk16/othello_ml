@@ -207,14 +207,23 @@ EVAL_ORDER_MIN_EMPTIES = 12`. A/B with the existing `trained_weights.bin`:
 growing with depth. This is the signature of a *weak* ordering signal displacing
 the good mobility order (same shape as reverted Steps 22/27), **not** an inverted
 sign (which would ~double nodes). Mechanism correct, gate confirmed: **the eval
-is not yet strong enough.** Kept opt-in (off by default, zero-cost) — re-run
-`bench --weights` after training a stronger eval (now fast post-Step-32).
+is not yet strong enough.**
 
-**Still open** (deferred until a stronger eval flips the A/B positive): the
-shallow-search bonus (`sort_depth` 1–6, needs incremental `eval_update`),
-iterative deepening + hash-move ordering, `inc_sort_depth`, eval-seeded MTD-f.
-Parallel workers still run `None`. **The gating next move is training a stronger
-eval, not more search wiring.**
+**UPDATE — the gate flipped (the eval effort paid off).** After fixing the eval
+(see [eval-quality.md](eval-quality.md): corrected 46-feature transcription,
+symmetry **weight tying**, mini-batch + L2, exact labels extended to ≤18e), the
+*same* `sort_depth = 0` term now **cuts ~34 % of nodes** and is **~1.27× faster
+wall-clock** at 18e: 1,964,515 → 1,295,312 nodes/pos, 54.5 → 42.9 ms/pos
+(`weights_v4.bin`, 211 boards). `nodes/s` drops 36→30 M (the ~17 % per-node eval
+cost) but the node cut dominates. So the static-eval ordering term is now a **win**,
+not a regression — eval-guided ordering (the ~3.7× lever) is delivering.
+
+**Still open** (now worth doing — the eval is strong enough): re-tune `W_EVAL` /
+`EVAL_ORDER_MIN_EMPTIES` for the stronger eval; the shallow-search bonus
+(`sort_depth` 1–6, needs incremental `eval_update` so the per-node cost is `score`
+not a full `set`); iterative deepening + hash-move ordering; `inc_sort_depth`;
+eval-seeded MTD-f (Step 31); and wiring the eval into the parallel workers (still
+`None`). Verify the win across depths (14/16/20e) and re-bench after each.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip

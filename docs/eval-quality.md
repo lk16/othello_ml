@@ -1,9 +1,13 @@
-# Eval Quality — the gating problem
+# Eval Quality — the gating problem (RESOLVED enough to help the search)
 
-The trained position evaluator is **too inaccurate to be useful in the search**.
-This is the single blocker on the two biggest remaining solver speedups, so it is
-the project's critical path. This doc states the problem, the evidence, how to
-measure it, and the leading hypotheses — enough to resume work cold.
+**Status: the gate flipped.** The trained eval started *too inaccurate to help the
+search* (eval-guided move ordering cost +0.7–1.8% nodes). After the fixes below
+(corrected 46-feature transcription, symmetry **weight tying**, mini-batch + L2,
+exact labels extended to ≤18e → `ignored/weights_v4.bin`), eval-guided ordering now
+**cuts ~34% of nodes and is ~1.27× faster wall-clock at 18e** (see speedup-plan
+Step 34). Absolute accuracy plateaued at ~6-disc MAE in-sample, but that is enough
+to *rank* moves better than mobility — which is all Step 34 needs. This doc records
+how we got here; the remaining work is search-side (speedup-plan Steps 34/31).
 
 ## Why it matters
 
