@@ -121,8 +121,10 @@ const W_EVAL: i32 = 1 << 13;
 /// Minimum empties at which the eval-guided ordering term is added. The eval is the
 /// expensive ordering signal (a from-scratch `FlatEval::set` per child), so it is
 /// confined to the upper plies where ordering quality matters most and such nodes
-/// are few — the analogue of Edax's `min_depth_table` gate (`move.c:370`). Tunable.
-const EVAL_ORDER_MIN_EMPTIES: u32 = 12;
+/// are few — the analogue of Edax's `min_depth_table` gate (`move.c:370`). Swept at
+/// 18e/20e (see speedup-plan Step 34): a clean wall-clock minimum at 14 — lower
+/// cuts more nodes but the per-node eval cost dominates; higher loses ordering.
+const EVAL_ORDER_MIN_EMPTIES: u32 = 14;
 
 /// Quick corner-anchored stability count for `p`: held corners plus their edge
 /// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap

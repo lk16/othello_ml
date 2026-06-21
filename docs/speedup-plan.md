@@ -224,8 +224,44 @@ wall-clock** at 18e: 1,964,515 → 1,295,312 nodes/pos, 54.5 → 42.9 ms/pos
 cost) but the node cut dominates. So the static-eval ordering term is now a **win**,
 not a regression — eval-guided ordering (the ~3.7× lever) is delivering.
 
-**Still open** (now worth doing — the eval is strong enough): re-tune `W_EVAL` /
-`EVAL_ORDER_MIN_EMPTIES` for the stronger eval; the shallow-search bonus
+**Confirmed across depths (fresh ≤18e CG retrain, 10 `7500?000` files).** The win
+**grows monotonically with depth** — the healthy signature (a weak signal would
+regress *worse* with depth, like Steps 22/27). Baseline = mobility-only; eval =
+same weights via `bench --weights`:
+
+| empties | boards | baseline nodes/pos | eval nodes/pos | node cut | wall-clock |
+|---|---|---|---|---|---|
+| 14 | 2000 | 79,106 | 71,560 | −9.5% | ~1.04× |
+| 18 | 250 | 1,919,923 | 1,489,299 | −22.4% | ~1.11× |
+| 20 | 50 | 9,714,119 | 7,087,778 | −27.0% | ~1.12× |
+
+`nodes/s` drops ~14–16% (the per-node eval cost) but the node cut dominates at
+every depth, and even 14e — previously where the eval was too weak — is now a net
+win. (This retrain is ≤18e exact base; slightly below the doc's earlier
+`weights_v4` ~34%/1.27× at 18e, attributable to corpus/sample differences, not a
+mechanism change.)
+
+**`W_EVAL` swept (18e, 250 boards, ≤18e weights) — `1<<13` confirmed optimal.**
+A sharp minimum: `1<<11` 1,727K, `1<<12` 1,572K, **`1<<13` 1,489K**, `12288`
+1,553K, `1<<14` 1,564K nodes/pos. Every neighbour on both sides is worse, so
+Edax's `w_eval >> 2` value transfers cleanly to our eval — no retune needed.
+
+**`EVAL_ORDER_MIN_EMPTIES` swept 12 → 14 (a real win).** The gate trades node
+cut against per-node eval cost. Lowering it cuts *more* nodes but the
+from-scratch `FlatEval::set` on the many shallow nodes dominates (at 8: 1,417K
+nodes but 115.7 ms — nodes/s 30→12 M); raising it past the elbow loses ordering.
+18e ms/pos by threshold: 8→115.7, 10→65.2, 12→48.3, 13→45.7, **14→44.6**,
+15→45.2, 16→46.6 — a clean wall-clock minimum at **14**, confirmed deeper at 20e
+(225.3 ms vs 12's 250.2) and neutral at 14e. Adopting 14 lifts the eval-ordering
+win to **~1.20× at 18e and ~1.24× at 20e** (was 1.11×/1.12× at 12):
+
+| depth | baseline ms | thr=12 ms | thr=14 ms (adopted) | thr-14 vs baseline |
+|---|---|---|---|---|
+| 14 | 2.04 | 1.97 | 1.97 | ~1.04× |
+| 18 | 53.4 | 48.3 | 44.6 | ~1.20× |
+| 20 | 278.9 | 250.2 | 225.3 | ~1.24× |
+
+**Still open** (now worth doing — the eval is strong enough): the shallow-search bonus
 (`sort_depth` 1–6, needs incremental `eval_update` so the per-node cost is `score`
 not a full `set`); iterative deepening + hash-move ordering; `inc_sort_depth`;
 eval-seeded MTD-f (Step 31); and wiring the eval into the parallel workers (still
