@@ -126,13 +126,6 @@ const W_EVAL: i32 = 1 << 13;
 /// cuts more nodes but the per-node eval cost dominates; higher loses ordering.
 const EVAL_ORDER_MIN_EMPTIES: u32 = 14;
 
-/// Iterative-deepening seeding (Step 34): when a trained eval is attached, run a
-/// few shallow heuristic passes before the exact solve so the TT is pre-filled with
-/// near-perfect best-move hints for the upper plies (Edax's iterative deepening,
-/// `root.c`). Off = the single cold full-window PVS. Toggle for the A/B; the
-/// production default is set once the lever is confirmed a win.
-const USE_ID: bool = true;
-
 /// Edax `ITERATIVE_MIN_EMPTIES` (`settings.h`): the iterative-deepening midgame
 /// passes stop `ITERATIVE_MIN_EMPTIES - 2` plies short of the empty count (`end =
 /// empties − ITERATIVE_MIN_EMPTIES + 2`), then the exact endgame pass takes over.
@@ -143,6 +136,19 @@ const USE_ID: bool = true;
 /// little and the 14e/16e node cut collapses), and is fastest at 14e/16e where bulk
 /// label-solving runs.
 const ITERATIVE_MIN_EMPTIES: u32 = 10;
+
+/// Minimum *remaining depth* at which an iterative-deepening null-window node
+/// ([`Search::id_pass_nws`]) splits its younger siblings across workers. The
+/// heuristic split-gate analogue of [`SPLIT_MIN_EMPTIES`]: a seeding subtree's size
+/// is bounded by its remaining `depth`, not `empties`, so it gates on depth. Only
+/// the seeding subtrees big enough to amortize the split clear it. Swept at 16
+/// threads, 20e/22e (see speedup-plan Step 34): a clear minimum at **5** — 3
+/// over-splits tiny subtrees (coordination overhead explodes: 22e 528 ms), 7–9
+/// leave too much of the seeding serial (22e 400–465 ms), 5 hits the knee (388 ms).
+/// Lower than [`SPLIT_MIN_EMPTIES`] because a heuristic node fans out far less than
+/// an exact one of the same size, so splitting pays sooner. Parallel-path only —
+/// the sequential `id_pass_nws` never splits (`self.par.is_none()`).
+const ID_SPLIT_MIN_DEPTH: u32 = 5;
 
 /// Quick corner-anchored stability count for `p`: held corners plus their edge
 /// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap
@@ -251,6 +257,11 @@ struct SplitCtx<'a> {
     parent_parity: u8,
     beta: i32,
     empties: u32,
+    /// `Some(depth)` routes workers through the heuristic ID null-window search
+    /// ([`Search::id_pass_nws`]) at remaining `depth`; `None` is the exact
+    /// null-window search. Lets one split implementation serve both the exact pass
+    /// and the iterative-deepening seeding passes (which Edax also parallelizes).
+    depth: Option<u32>,
 }
 
 /// Worker loop for a null-window split point. Each participating thread pulls the
@@ -268,7 +279,10 @@ fn worker_loop_nws(w: &mut Search, ctx: &SplitCtx) {
         }
         let (_, cell, ref child) = ctx.move_list[i];
         w.parity = ctx.parent_parity ^ QUADRANT_ID[cell as usize];
-        let score = -w.search_exact_nws(child, -ctx.beta, ctx.empties - 1);
+        let score = match ctx.depth {
+            Some(d) => -w.id_pass_nws(child, -ctx.beta, d - 1),
+            None => -w.search_exact_nws(child, -ctx.beta, ctx.empties - 1),
+        };
         if ctx.cancel.cancelled() {
             return; // aborted mid-search: discard this (meaningless) result
         }
@@ -331,8 +345,16 @@ impl Search {
 
     /// A worker search for parallel YBWC (Step 21): shares the sharded table and
     /// the thread budget, and carries a cancellation handle. Per-worker state
-    /// (nodes, parity) is fresh.
-    pub(super) fn worker(tt: Arc<SharedTt>, par: Arc<ParCtx>, cancel: Arc<CancelNode>) -> Self {
+    /// (nodes, parity) is fresh. `eval` is the (shared) trained pattern eval for
+    /// eval-guided move ordering — `Some` propagates it to every worker so the
+    /// parallel search orders moves like the sequential one (Step 34); `None` is the
+    /// mobility-only baseline.
+    pub(super) fn worker(
+        tt: Arc<SharedTt>,
+        par: Arc<ParCtx>,
+        cancel: Arc<CancelNode>,
+        eval: Option<Arc<FlatEval>>,
+    ) -> Self {
         Search {
             nodes: 0,
             tt: TtBackend::Shared(tt),
@@ -340,7 +362,7 @@ impl Search {
             parity: 0,
             par: Some(par),
             cancel: Some(cancel),
-            eval: None,
+            eval,
         }
     }
 
@@ -403,13 +425,17 @@ impl Search {
         lo
     }
 
-    /// Root dispatch for one exact solve. With a trained eval attached and
-    /// [`USE_ID`] on, seed the TT with iterative-deepening move hints first
-    /// ([`Search::solve_id`]); otherwise do the single cold full-window PVS. The
-    /// exact result is identical either way — ID only changes move ordering, hence
-    /// node count.
+    /// Root dispatch for one exact solve. With a trained eval attached, seed the TT
+    /// with iterative-deepening move hints ([`Search::solve_id`]) before the exact
+    /// solve; without one, the single cold full-window PVS. The exact result is
+    /// identical either way — ID only changes move ordering, hence node count. ID
+    /// always pays once an eval is present (A/B-confirmed at every depth, sequential
+    /// and parallel), so there is no toggle. The seeding runs through the same YBWC
+    /// machinery as the exact pass (Edax parallelizes its iterative deepening too,
+    /// `PVS_root`/`node_split`): the heuristic null-window nodes split via
+    /// [`Search::id_pass_nws`], so it is not a serial bottleneck.
     pub(super) fn solve_root(&mut self, pos: &Position, empties: u32) -> i32 {
-        if USE_ID && self.eval.is_some() {
+        if self.eval.is_some() {
             self.solve_id(pos, empties)
         } else {
             self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
@@ -443,13 +469,15 @@ impl Search {
         self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
     }
 
-    /// One heuristic iterative-deepening pass: negamax with alpha-beta to a
-    /// remaining `depth` plies, the trained eval at the horizon, recording a
-    /// best-move hint per node into the TT (stamped `depth`). Move ordering reuses
-    /// the production [`Search::ordered_moves`] (mobility + corner + eval term), so
-    /// the hints it leaves match what the exact pass wants at the front. When the
-    /// remaining game fits the budget (`empties <= depth`) it hands off to the exact
-    /// search, whose entries (stamped `empties`) the final pass can cut on.
+    /// One heuristic iterative-deepening pass (PV node): PVS to a remaining `depth`
+    /// plies, the trained eval at the horizon, recording a best-move hint per node
+    /// into the TT (stamped `depth`). Move ordering reuses the production
+    /// [`Search::ordered_moves`] (mobility + corner + eval term), so the hints match
+    /// what the exact pass wants at the front. When the remaining game fits the
+    /// budget (`empties <= depth`) it hands off to the exact search, whose entries
+    /// (stamped `empties`) the final pass can cut on. Mirrors the exact PV/NWS split
+    /// ([`Search::alphabeta_exact`]): the PV spine is sequential and parallelism
+    /// lives in the null-window descendants ([`Search::id_pass_nws`]).
     fn id_pass(&mut self, pos: &Position, mut alpha: i32, beta: i32, depth: u32) -> i32 {
         let empties = pos.empties();
         if empties <= depth {
@@ -471,6 +499,122 @@ impl Search {
             return -self.id_pass(&passed, -beta, -alpha, depth - 1);
         }
 
+        let move_list = self.id_ordered_moves(pos, moves, empties, hash_move);
+
+        // PVS: full-window the best-ordered move, null-window probe each sibling
+        // (through the splittable NWS path) and re-search only on a fail-high.
+        let mut best_cell = NO_MOVE;
+        let mut first = true;
+        for &(_, cell, ref child) in move_list.as_slice() {
+            self.parity ^= QUADRANT_ID[cell as usize];
+            let score = if first {
+                -self.id_pass(child, -beta, -alpha, depth - 1)
+            } else {
+                let probe = -self.id_pass_nws(child, -alpha - 1, depth - 1);
+                if probe > alpha && probe < beta {
+                    -self.id_pass(child, -beta, -alpha, depth - 1)
+                } else {
+                    probe
+                }
+            };
+            self.parity ^= QUADRANT_ID[cell as usize];
+            first = false;
+            if score > alpha {
+                alpha = score;
+                best_cell = cell as u8;
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+
+        self.id_store_hint(pos, best_cell, depth);
+        alpha
+    }
+
+    /// Null-window counterpart of [`Search::id_pass`] (window `[alpha, alpha + 1]`),
+    /// the heuristic analogue of [`Search::alphabeta_exact_nws`]: the bulk of a
+    /// seeding pass and the only place it splits. YBW — search the eldest child
+    /// sequentially, and on a fail-low fan the younger siblings across workers
+    /// (through [`Search::split_nws`] with `Some(depth)`) when a parallel context is
+    /// present and the remaining depth clears [`ID_SPLIT_MIN_DEPTH`].
+    fn id_pass_nws(&mut self, pos: &Position, alpha: i32, depth: u32) -> i32 {
+        let empties = pos.empties();
+        if empties <= depth {
+            return self.search_exact_nws(pos, alpha, empties);
+        }
+        self.nodes += 1;
+        if self.is_cancelled() {
+            return alpha;
+        }
+        let beta = alpha + 1;
+        if depth == 0 {
+            return self.eval_clamped(pos);
+        }
+
+        let hash_move = self.tt_probe(pos).map_or(NO_MOVE, |e| e.best_move);
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.id_pass_nws(&passed, -beta, depth - 1);
+        }
+
+        let move_list = self.id_ordered_moves(pos, moves, empties, hash_move);
+
+        let mut best = alpha;
+        let mut best_cell = NO_MOVE;
+
+        let (_, c0, ref ch0) = move_list.as_slice()[0];
+        self.parity ^= QUADRANT_ID[c0 as usize];
+        let s0 = -self.id_pass_nws(ch0, -beta, depth - 1);
+        self.parity ^= QUADRANT_ID[c0 as usize];
+        if self.is_cancelled() {
+            return best;
+        }
+        if s0 > best {
+            best = s0;
+            best_cell = c0 as u8;
+        }
+
+        if best <= alpha && move_list.len() > 1 {
+            if self.par.is_some() && depth >= ID_SPLIT_MIN_DEPTH {
+                let (pb, pc) = self.split_nws(move_list.as_slice(), beta, empties, Some(depth));
+                if self.is_cancelled() {
+                    return best;
+                }
+                if pb > best {
+                    best = pb;
+                    best_cell = pc;
+                }
+            } else {
+                for &(_, cell, ref child) in &move_list.as_slice()[1..] {
+                    self.parity ^= QUADRANT_ID[cell as usize];
+                    let score = -self.id_pass_nws(child, -beta, depth - 1);
+                    self.parity ^= QUADRANT_ID[cell as usize];
+                    if self.is_cancelled() {
+                        return best;
+                    }
+                    if score > best {
+                        best = score;
+                        best_cell = cell as u8;
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.id_store_hint(pos, best_cell, depth);
+        best
+    }
+
+    /// Build and sort the ID move list, promoting the hash move to the front.
+    /// Shared by the PV and NWS seeding nodes (mirrors the exact ordering).
+    #[inline]
+    fn id_ordered_moves(&self, pos: &Position, moves: u64, empties: u32, hash_move: u8) -> MoveBuf {
         let mut move_list = self.ordered_moves(pos, moves, empties);
         move_list
             .as_mut_slice()
@@ -484,28 +628,15 @@ impl Search {
                 move_list.as_mut_slice()[..=i].rotate_right(1);
             }
         }
+        move_list
+    }
 
-        let mut best = SCORE_MIN;
-        let mut best_cell = NO_MOVE;
-        for &(_, cell, ref child) in move_list.as_slice() {
-            self.parity ^= QUADRANT_ID[cell as usize];
-            let score = -self.id_pass(child, -beta, -alpha, depth - 1);
-            self.parity ^= QUADRANT_ID[cell as usize];
-            if score > best {
-                best = score;
-                best_cell = cell as u8;
-                if score > alpha {
-                    alpha = score;
-                    if alpha >= beta {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Store the best-move hint only (uninformative bounds): a heuristic bound
-        // must never be read as an exact cutoff, and the stamp `depth < empties`
-        // already guarantees that. The hint is what the exact pass consumes.
+    /// Record the seeding best-move hint for `pos`, stamped with its (shallow) pass
+    /// `depth`. Bounds are left uninformative (`[SCORE_MIN, SCORE_MAX]`): a heuristic
+    /// bound must never be read as an exact cutoff, and `depth < empties` already
+    /// guarantees that. The hint is what the exact pass consumes for ordering.
+    #[inline]
+    fn id_store_hint(&mut self, pos: &Position, best_cell: u8, depth: u32) {
         self.tt_store(
             pos,
             SCORE_MIN as i8,
@@ -513,7 +644,6 @@ impl Search {
             best_cell,
             depth as u8,
         );
-        best
     }
 
     /// The trained eval for `pos` (mover's perspective), clamped to a non-terminal
@@ -847,7 +977,7 @@ impl Search {
 
         if best <= alpha && move_list.len() > 1 {
             if self.par.is_some() && empties >= SPLIT_MIN_EMPTIES {
-                let (pb, pc) = self.split_nws(move_list.as_slice(), beta, empties);
+                let (pb, pc) = self.split_nws(move_list.as_slice(), beta, empties, None);
                 if self.is_cancelled() {
                     return best;
                 }
@@ -893,11 +1023,14 @@ impl Search {
     /// Acquires up to the remaining thread budget and participates on this thread
     /// too, so it always finishes the siblings even with no budget. Restores
     /// `self`'s parity and cancel handle before returning.
+    /// `depth` is `None` for the exact pass and `Some(remaining)` for an ID seeding
+    /// pass (routing workers through [`Search::id_pass_nws`]).
     fn split_nws(
         &mut self,
         move_list: &[(i32, u32, Position)],
         beta: i32,
         empties: u32,
+        depth: Option<u32>,
     ) -> (i32, u8) {
         let alpha = beta - 1;
         let par = match &self.par {
@@ -920,6 +1053,7 @@ impl Search {
             parent_parity,
             beta,
             empties,
+            depth,
         };
 
         // Acquire helper slots; this thread participates too, so at most one fewer
@@ -934,10 +1068,11 @@ impl Search {
                 let tt = tt.clone();
                 let par = par.clone();
                 let cancel = child_cancel.clone();
+                let eval = self.eval.clone();
                 let ctx = &ctx;
                 let helper_nodes = &helper_nodes;
                 scope.spawn(move || {
-                    let mut w = Search::worker(tt, par.clone(), cancel);
+                    let mut w = Search::worker(tt, par.clone(), cancel, eval);
                     worker_loop_nws(&mut w, ctx);
                     par.release();
                     helper_nodes.fetch_add(w.nodes, Ordering::Relaxed);

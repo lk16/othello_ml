@@ -20,7 +20,7 @@
 
 use super::search::{board_parity, Search};
 use super::tt::SharedTt;
-use super::{SCORE_MAX, SCORE_MIN};
+use crate::eval::pattern::FlatEval;
 use crate::othello::position::Position;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -110,6 +110,11 @@ impl CancelNode {
 pub struct ParallelSolver {
     tt: Arc<SharedTt>,
     threads: usize,
+    /// Optional trained pattern eval, propagated to every worker for eval-guided
+    /// move ordering (Step 34). `None` = the mobility-only baseline ordering.
+    /// Iterative-deepening seeding is *not* used on the parallel path (its
+    /// sequential passes would be a serial bottleneck — see `Search::solve_root`).
+    eval: Option<Arc<FlatEval>>,
 }
 
 impl ParallelSolver {
@@ -118,6 +123,19 @@ impl ParallelSolver {
         ParallelSolver {
             tt: Arc::new(SharedTt::new()),
             threads: threads.max(1),
+            eval: None,
+        }
+    }
+
+    /// A parallel solver whose every worker uses a trained pattern eval for
+    /// eval-guided move ordering (Step 34). The eval is shared (`Arc`); each worker
+    /// clones the handle. (Iterative deepening is sequential-only — see
+    /// `Search::solve_root` — so the parallel win is ordering, not seeding.)
+    pub fn with_eval(threads: usize, eval: Arc<FlatEval>) -> Self {
+        ParallelSolver {
+            tt: Arc::new(SharedTt::new()),
+            threads: threads.max(1),
+            eval: Some(eval),
         }
     }
 
@@ -126,10 +144,19 @@ impl ParallelSolver {
     /// shared-table contents); the score is always exact.
     pub fn exact_score_with_nodes(&self, pos: &Position) -> (i32, u64) {
         let par = Arc::new(ParCtx::new(self.threads));
-        let mut root = Search::worker(Arc::clone(&self.tt), par, CancelNode::root());
+        let mut root = Search::worker(
+            Arc::clone(&self.tt),
+            par,
+            CancelNode::root(),
+            self.eval.clone(),
+        );
         root.parity = board_parity(pos);
-        // The root is a PV node; its null-window descendants split internally.
-        let score = root.search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties());
+        // The root is a PV node whose null-window descendants split across workers;
+        // with an eval attached, every worker carries it for eval-guided ordering.
+        // `solve_root` skips the (sequential) iterative-deepening seeding on the
+        // parallel path — it would be an unparallelized serial bottleneck — so the
+        // parallel win here is eval ordering, not ID. See `Search::solve_root`.
+        let score = root.solve_root(pos, pos.empties());
         (score, root.nodes)
     }
 
@@ -196,5 +223,63 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no positions exercised the parallel path");
+    }
+
+    /// The parallel solver with eval-guided ordering must return the same exact
+    /// scores as the plain sequential solver — the eval only reorders moves, so it
+    /// cannot change an exact result, on any number of workers. (ID seeding is not
+    /// used on the parallel path; see `Search::solve_root`.) Same positions as
+    /// `parallel_matches_sequential`.
+    #[test]
+    fn parallel_with_eval_matches_sequential() {
+        use crate::eval::pattern::FlatEval;
+        use crate::training::{Features, Weights};
+
+        let weights = Weights::new(Features::edax());
+        let flat = Arc::new(FlatEval::from_weights(&weights));
+        let par = ParallelSolver::with_eval(16, flat);
+        let mut seq = Solver::new();
+
+        let mut rng: u64 = 0xABCD_1234_5678_9F01;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut checked = 0;
+        for _ in 0..12 {
+            let mut pos = Position::initial();
+            while pos.empties() > 16 {
+                let moves = pos.get_moves();
+                if moves == 0 {
+                    let passed = pos.pass_move();
+                    if passed.get_moves() == 0 {
+                        break;
+                    }
+                    pos = passed;
+                    continue;
+                }
+                let pick = next() % moves.count_ones() as u64;
+                let mut m = moves;
+                for _ in 0..pick {
+                    m &= m - 1;
+                }
+                pos = pos.do_move(m.trailing_zeros());
+            }
+            if pos.get_moves() == 0 {
+                continue;
+            }
+            assert_eq!(
+                par.exact_score(&pos),
+                seq.exact_score(&pos),
+                "parallel-eval/sequential mismatch at player={:#x} opponent={:#x}",
+                pos.player,
+                pos.opponent
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no positions exercised the parallel eval path");
     }
 }

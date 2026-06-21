@@ -283,8 +283,8 @@ heuristic passes first (`iterative_deepening`, `root.c`); the deep pass reads
   solve. Exact result unchanged (guarded by an ID-vs-plain equality test over the
   reference positions, parity asserts live).
 
-A/B (10 `7500?000` files, `USE_ID` toggle, eval = `trained_weights.bin`), **on top
-of the eval-ordering win above**:
+A/B (10 `7500?000` files, ID seeding on vs off, eval = `trained_weights.bin`), **on
+top of the eval-ordering win above**:
 
 | depth | eval no-ID | eval+ID | node cut | no-ID ms | ID ms | speedup |
 |---|---|---|---|---|---|---|
@@ -302,12 +302,41 @@ bulk ≤16e label-solving runs). `id_pass` stores move hints only (uninformative
 bounds), so the depth-stamp's bound-gating is correct-but-dormant — ready for
 heuristic-bound storage if it later pays.
 
-**Still open** (now worth doing — the eval is strong enough): the shallow-search bonus
-(`sort_depth` 1–6, needs incremental `eval_update` so the per-node cost is `score`
-not a full `set`); `inc_sort_depth`; eval-seeded MTD-f (Step 31) — the ID estimate
-is now the first guess; storing heuristic bounds in the ID passes (the depth stamp
-already supports it); and wiring the eval + ID into the parallel workers (still
-`None`). Verify the win across depths (14/16/20e) and re-bench after each.
+**Parallel: eval ordering + parallelized ID (DONE).** `ParallelSolver` carries an
+optional `Arc<FlatEval>` (`with_eval`) propagated to every YBWC worker via
+`Search::worker`, so the parallel search orders moves like the sequential one, and
+the root runs the same `solve_root` (ID seeding + exact pass). **The ID seeding
+passes are themselves parallelized** — Edax does this too (`iterative_deepening` →
+`PVS_root`/`node_split` run every midgame iteration through YBWC, not just the exact
+pass). `id_pass`/`id_pass_nws` mirror the exact PV/NWS split: the heuristic
+null-window nodes fan younger siblings across workers through the *same*
+`split_nws` (generalized with `Some(depth)`), gated on `ID_SPLIT_MIN_DEPTH`.
+
+A first cut that left seeding **sequential** confirmed why Edax parallelizes it: it
+was a serial Amdahl tax that *grew* with depth and went net-negative (16t, eval+ID
+vs eval-only: 22e 554 vs 414 ms — even losing to the no-eval baseline). Parallelizing
+the seeding flips it. A/B at 16 threads (`ID_SPLIT_MIN_DEPTH = 5`, swept — see the
+const; 3 over-splits, 7–9 leave too much serial):
+
+| depth | baseline | eval-only | eval+ID | ID vs eval-only | ID vs baseline |
+|---|---|---|---|---|---|
+| 20 (100b) | 142.3 ms / 15.4M | 121.7 ms / 12.1M | **106.3 ms / 7.58M** | ~1.14× | ~1.34× |
+| 22 (16b) | 467.4 ms / 77.4M | 416.6 ms / 58.9M | **377.4 ms / 40.2M** | ~1.10× | ~1.24× |
+
+So the full sequential stack (eval ordering + ID) now carries over to parallel:
+~1.10–1.14× over eval-only and ~1.24–1.34× over the mobility baseline at 16 threads.
+Correctness guarded by `parallel_with_eval_matches_sequential` (16 workers vs
+sequential plain; the ID split path validated in debug at a lowered threshold so it
+fires at 16e). The split machinery is shared with the exact pass, so the tested
+exact split covers its synchronization.
+
+**Still open** (now worth doing — the eval is strong enough): the shallow-search
+bonus (`sort_depth` 1–6, needs incremental `eval_update` so the per-node cost is
+`score` not a full `set`); `inc_sort_depth`; eval-seeded MTD-f (Step 31) — the ID
+estimate is now the first guess; storing heuristic bounds in the ID passes (the
+depth stamp already supports it); and re-sweeping `ID_SPLIT_MIN_DEPTH`/`SPLIT_MIN_
+EMPTIES` jointly at other thread counts. Verify the win across depths and re-bench
+after each.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip

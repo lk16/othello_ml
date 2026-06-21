@@ -906,9 +906,6 @@ fn run_bench(args: BenchArgs) {
         },
         None => None,
     };
-    if eval.is_some() && args.threads > 1 {
-        eprintln!("Note: eval-guided ordering is sequential-only; ignored with --threads > 1.");
-    }
     let make_solver = || match &eval {
         Some(e) => Solver::with_eval(Arc::clone(e)),
         None => Solver::new(),
@@ -954,7 +951,10 @@ fn run_bench(args: BenchArgs) {
     let start = Instant::now();
 
     if args.threads > 1 {
-        let solver = ParallelSolver::new(args.threads);
+        let solver = match &eval {
+            Some(e) => ParallelSolver::with_eval(args.threads, Arc::clone(e)),
+            None => ParallelSolver::new(args.threads),
+        };
         for board in &positions {
             let (_, nodes) = solver.exact_score_with_nodes(&board.position);
             total_nodes += nodes;
