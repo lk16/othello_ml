@@ -1214,7 +1214,7 @@ fn print_train_usage(program: &str) {
     eprintln!("EXAMPLES:");
     eprintln!("  {program} train training_data/");
     eprintln!("  {program} train --max-empties 20 -f ignored/evals.txt training_data/");
-    eprintln!("  {program} train -n 16 -t 8 -f ignored/edax_evals.txt training_data/");
+    eprintln!("  {program} train -n 16 -t 8 -f ignored/cached_exact_scores.txt training_data/");
 }
 
 fn print_train_boot_usage(program: &str) {

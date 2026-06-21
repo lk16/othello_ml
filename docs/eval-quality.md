@@ -108,7 +108,7 @@ Reading:
   — ~90% of games reach the deep endgame; counted via `"N. "` move-number tokens).
   Training doesn't dedup (`build_examples`, `cache.rs:365`), so that raw count *is*
   the example count. Plentiful.
-- **Label correctness.** The cached label file (`ignored/edax_evals.txt`, ~8M lines,
+- **Label correctness.** The cached label file (`ignored/cached_exact_scores.txt`, ~8M lines,
   Edax-generated) was validated against our exact solver via uniform random sampling
   per bucket: **340/340 bit-exact across empties 4–20** (0 diff), including deep
   17–20e where selective labels would diverge. True exact ground truth. Bucket sizes
@@ -186,7 +186,7 @@ To test whether the optimizer was the bottleneck, we replaced SGD with a per-buc
 own `eval_builder` method. Ridge is regularization, specified **per example** so a
 single value is scale-invariant across data sizes (the data term is an implicit sum
 over N examples, so internally `ridge·N` is used; default `0.001`). All runs at
-empties 14, exact labels from `ignored/edax_evals.txt`.
+empties 14, exact labels from `ignored/cached_exact_scores.txt`.
 
 | run | train set | MAE | within ±2 | bias | notes |
 |---|---|---|---|---|---|
