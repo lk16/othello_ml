@@ -41,8 +41,19 @@ pub(super) const ETC_MIN_EMPTIES: u32 = 7;
 pub(super) const NO_MOVE: u8 = 64;
 
 /// One table slot: the full position (for exact collision detection — a partial
-/// key risks a wrong score), a `[lower, upper]` score bound, and the best move
-/// for ordering. A slot is empty iff `player | opponent == 0`.
+/// key risks a wrong score), a `[lower, upper]` score bound, the best move for
+/// ordering, and the search `depth` that produced the bound (Edax `HashData.depth`).
+/// A slot is empty iff `player | opponent == 0`.
+///
+/// `depth` is the number of plies searched below this node before the bound was
+/// established: for the exact search (always to game end) that is the node's
+/// `empties`, so an exact entry is stamped `depth == empties`. The
+/// iterative-deepening heuristic passes (Step 34) stamp the shallower pass depth.
+/// A stored bound is only valid for a *cutoff* when `depth >= empties` (i.e. the
+/// subtree was fully resolved — see [`Search::tt_probe`] callers); shallower
+/// entries still supply the `best_move` hint, which is always usable for ordering.
+/// This is the mechanism that lets heuristic and exact entries share one table
+/// without a heuristic bound corrupting an exact cutoff (Edax `search_TC_NWS`).
 #[derive(Clone, Copy)]
 pub(super) struct TtEntry {
     pub(super) player: u64,
@@ -50,6 +61,7 @@ pub(super) struct TtEntry {
     pub(super) lower: i8,
     pub(super) upper: i8,
     pub(super) best_move: u8,
+    pub(super) depth: u8,
 }
 
 impl Default for TtEntry {
@@ -60,6 +72,7 @@ impl Default for TtEntry {
             lower: 0,
             upper: 0,
             best_move: NO_MOVE,
+            depth: 0,
         }
     }
 }
@@ -98,10 +111,13 @@ impl Slot {
     }
 }
 
-/// Pack the payload (score bounds + best move) into one word.
+/// Pack the payload (score bounds + best move + depth stamp) into one word.
 #[inline]
-fn pack_data(lower: i8, upper: i8, best_move: u8) -> u64 {
-    (lower as u8 as u64) | ((upper as u8 as u64) << 8) | ((best_move as u64) << 16)
+fn pack_data(lower: i8, upper: i8, best_move: u8, depth: u8) -> u64 {
+    (lower as u8 as u64)
+        | ((upper as u8 as u64) << 8)
+        | ((best_move as u64) << 16)
+        | ((depth as u64) << 24)
 }
 
 /// Lock-free concurrent transposition table for parallel search: a flat array of
@@ -133,63 +149,92 @@ impl SharedTt {
                 lower: data as u8 as i8,
                 upper: (data >> 8) as u8 as i8,
                 best_move: (data >> 16) as u8,
+                depth: (data >> 24) as u8,
             })
         } else {
             None
         }
     }
 
-    /// Record a `[lower, upper]` bound (and best move) for `pos`. Best-effort
-    /// merge: if the slot still holds this position the bounds are intersected and
-    /// a real best move kept (same policy as the owned table), else replace. The
+    /// Record a `[lower, upper]` bound (best move + depth) for `pos`. Best-effort
+    /// depth-preferred merge (same policy as the owned table, [`merge_payload`]): if
+    /// the slot still holds this position, combine by depth, else replace. The
     /// read-modify-write is not atomic, but a lost race only drops a refinement —
     /// every written bound is independently valid — so the table stays exact, the
     /// same trade-off Edax makes for its lockless table.
     #[inline]
-    fn store(&self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+    fn store(&self, pos: &Position, lower: i8, upper: i8, best_move: u8, depth: u8) {
         let slot = &self.slots[tt_index(pos.player, pos.opponent)];
-        let (mut lo, mut hi, mut bm) = (lower, upper, best_move);
         let cur_data = slot.w2.load(Ordering::Relaxed);
         let cur_player = slot.w0.load(Ordering::Relaxed) ^ cur_data;
         let cur_opponent = slot.w1.load(Ordering::Relaxed) ^ cur_data;
-        if cur_player == pos.player
+        let (lo, hi, bm, d) = if cur_player == pos.player
             && cur_opponent == pos.opponent
             && (cur_player | cur_opponent) != 0
         {
-            let cur_lo = cur_data as u8 as i8;
-            let cur_hi = (cur_data >> 8) as u8 as i8;
-            if cur_lo > lo {
-                lo = cur_lo;
-            }
-            if cur_hi < hi {
-                hi = cur_hi;
-            }
-            if bm == NO_MOVE {
-                bm = (cur_data >> 16) as u8;
-            }
-        }
-        let data = pack_data(lo, hi, bm);
+            let cur = (
+                cur_data as u8 as i8,
+                (cur_data >> 8) as u8 as i8,
+                (cur_data >> 16) as u8,
+                (cur_data >> 24) as u8,
+            );
+            merge_payload(cur, (lower, upper, best_move, depth))
+        } else {
+            (lower, upper, best_move, depth)
+        };
+        let data = pack_data(lo, hi, bm, d);
         slot.w0.store(pos.player ^ data, Ordering::Relaxed);
         slot.w1.store(pos.opponent ^ data, Ordering::Relaxed);
         slot.w2.store(data, Ordering::Relaxed);
     }
 }
 
-/// Update slot `e` with a bound for `pos`: intersect bounds and keep a real best
-/// move when the slot already holds `pos`, else always-replace. Shared by both
-/// table backings.
+/// Combine an incoming bound with whatever the slot currently holds for the **same**
+/// position, by depth — Edax's depth-preferred replacement. A deeper result
+/// supersedes (its bound targets a different, more-resolved value, so it must not
+/// be intersected with a shallower one); equal depth intersects the bounds (both
+/// valid for that depth's minimax value) and keeps a real best move; a shallower
+/// result is ignored, never degrading a deeper/exact bound. The best move falls
+/// back to the existing one only when the incoming entry carries none. Returns the
+/// `(lower, upper, best_move, depth)` payload to write.
 #[inline]
-fn merge_entry(e: &mut TtEntry, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+fn merge_payload(cur: (i8, i8, u8, u8), new: (i8, i8, u8, u8)) -> (i8, i8, u8, u8) {
+    let (clo, chi, cbm, cd) = cur;
+    let (mut lo, mut hi, mut bm, d) = new;
+    if d > cd {
+        if bm == NO_MOVE {
+            bm = cbm;
+        }
+        (lo, hi, bm, d)
+    } else if d == cd {
+        if clo > lo {
+            lo = clo;
+        }
+        if chi < hi {
+            hi = chi;
+        }
+        if bm == NO_MOVE {
+            bm = cbm;
+        }
+        (lo, hi, bm, d)
+    } else {
+        (clo, chi, cbm, cd)
+    }
+}
+
+/// Update slot `e` with a bound for `pos`: depth-preferred merge ([`merge_payload`])
+/// when the slot already holds `pos`, else always-replace.
+#[inline]
+fn merge_entry(e: &mut TtEntry, pos: &Position, lower: i8, upper: i8, best_move: u8, depth: u8) {
     if e.player == pos.player && e.opponent == pos.opponent && (e.player | e.opponent) != 0 {
-        if lower > e.lower {
-            e.lower = lower;
-        }
-        if upper < e.upper {
-            e.upper = upper;
-        }
-        if best_move != NO_MOVE {
-            e.best_move = best_move;
-        }
+        let (lo, hi, bm, d) = merge_payload(
+            (e.lower, e.upper, e.best_move, e.depth),
+            (lower, upper, best_move, depth),
+        );
+        e.lower = lo;
+        e.upper = hi;
+        e.best_move = bm;
+        e.depth = d;
     } else {
         *e = TtEntry {
             player: pos.player,
@@ -197,6 +242,7 @@ fn merge_entry(e: &mut TtEntry, pos: &Position, lower: i8, upper: i8, best_move:
             lower,
             upper,
             best_move,
+            depth,
         };
     }
 }
@@ -232,17 +278,26 @@ impl Search {
         }
     }
 
-    /// Record a `[lower, upper]` bound (and best move) for `pos`. On a slot that
-    /// already holds this position the bounds are intersected (both are valid for
-    /// the intrinsic score) and a real best move kept; otherwise always-replace.
+    /// Record a `[lower, upper]` bound (best move + `depth` stamp) for `pos`. On a
+    /// slot that already holds this position the payload is merged by depth
+    /// ([`merge_payload`]); otherwise always-replace. `depth` is the plies searched
+    /// below `pos` — `empties` for an exact (to-game-end) store, the pass depth for
+    /// an iterative-deepening heuristic store.
     #[inline]
-    pub(super) fn tt_store(&mut self, pos: &Position, lower: i8, upper: i8, best_move: u8) {
+    pub(super) fn tt_store(
+        &mut self,
+        pos: &Position,
+        lower: i8,
+        upper: i8,
+        best_move: u8,
+        depth: u8,
+    ) {
         match &mut self.tt {
             TtBackend::Owned(v) => {
                 let e = &mut v[tt_index(pos.player, pos.opponent)];
-                merge_entry(e, pos, lower, upper, best_move);
+                merge_entry(e, pos, lower, upper, best_move, depth);
             }
-            TtBackend::Shared(s) => s.store(pos, lower, upper, best_move),
+            TtBackend::Shared(s) => s.store(pos, lower, upper, best_move, depth),
         }
     }
 }

@@ -93,8 +93,7 @@ impl Solver {
         if USE_MTD {
             self.search.solve_mtd(pos, pos.empties())
         } else {
-            self.search
-                .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+            self.search.solve_root(pos, pos.empties())
         }
     }
 
@@ -105,8 +104,7 @@ impl Solver {
         let score = if USE_MTD {
             self.search.solve_mtd(pos, pos.empties())
         } else {
-            self.search
-                .search_exact(pos, SCORE_MIN, SCORE_MAX, pos.empties())
+            self.search.solve_root(pos, pos.empties())
         };
         (score, self.search.nodes)
     }
@@ -255,6 +253,38 @@ mod tests {
                 expected,
                 "Line {}: FEN={fen} expected={expected} actual={actual}",
                 line_no + 1,
+            );
+        }
+    }
+
+    /// Iterative-deepening seeding must not change any exact score. Move ordering
+    /// never alters an exact-window result, and ID's heuristic TT entries are
+    /// stamped `depth < empties` (and carry uninformative bounds), so they can only
+    /// reorder moves, never trigger a wrong cutoff. Solve the reference positions
+    /// with an eval-backed solver (ID path) and require equality with the plain
+    /// solver. Run in debug for the parity asserts in the seeded final pass.
+    #[test]
+    fn id_path_matches_plain_exact() {
+        use crate::eval::pattern::FlatEval;
+        use crate::training::{Features, Weights};
+
+        let weights = Weights::new(Features::edax());
+        let flat = Arc::new(FlatEval::from_weights(&weights));
+        let content = fs::read_to_string("test_data/exact_scores.txt").expect("read reference");
+
+        let mut plain = Solver::new();
+        let mut ided = Solver::with_eval(flat);
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let pos = parse_fen(&line[..66]);
+            assert_eq!(
+                ided.exact_score(&pos),
+                plain.exact_score(&pos),
+                "ID vs plain mismatch: FEN={}",
+                &line[..66],
             );
         }
     }

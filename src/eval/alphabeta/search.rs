@@ -126,6 +126,24 @@ const W_EVAL: i32 = 1 << 13;
 /// cuts more nodes but the per-node eval cost dominates; higher loses ordering.
 const EVAL_ORDER_MIN_EMPTIES: u32 = 14;
 
+/// Iterative-deepening seeding (Step 34): when a trained eval is attached, run a
+/// few shallow heuristic passes before the exact solve so the TT is pre-filled with
+/// near-perfect best-move hints for the upper plies (Edax's iterative deepening,
+/// `root.c`). Off = the single cold full-window PVS. Toggle for the A/B; the
+/// production default is set once the lever is confirmed a win.
+const USE_ID: bool = true;
+
+/// Edax `ITERATIVE_MIN_EMPTIES` (`settings.h`): the iterative-deepening midgame
+/// passes stop `ITERATIVE_MIN_EMPTIES - 2` plies short of the empty count (`end =
+/// empties − ITERATIVE_MIN_EMPTIES + 2`), then the exact endgame pass takes over.
+/// So the heuristic seeding only covers the top of the tree, where ordering matters
+/// most and the passes are cheap. Swept 8..14 at 18e (see speedup-plan Step 34): a
+/// flat basin, kept at Edax's 10 — it has the fewest nodes at every depth (8 seeds
+/// more but its deeper passes cost more wall-clock than they save; 12+ seed too
+/// little and the 14e/16e node cut collapses), and is fastest at 14e/16e where bulk
+/// label-solving runs.
+const ITERATIVE_MIN_EMPTIES: u32 = 10;
+
 /// Quick corner-anchored stability count for `p`: held corners plus their edge
 /// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap
 /// lower bound used only for move ordering.
@@ -385,6 +403,131 @@ impl Search {
         lo
     }
 
+    /// Root dispatch for one exact solve. With a trained eval attached and
+    /// [`USE_ID`] on, seed the TT with iterative-deepening move hints first
+    /// ([`Search::solve_id`]); otherwise do the single cold full-window PVS. The
+    /// exact result is identical either way — ID only changes move ordering, hence
+    /// node count.
+    pub(super) fn solve_root(&mut self, pos: &Position, empties: u32) -> i32 {
+        if USE_ID && self.eval.is_some() {
+            self.solve_id(pos, empties)
+        } else {
+            self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
+        }
+    }
+
+    /// Iterative deepening (Edax `iterative_deepening`, `root.c`): run shallow
+    /// heuristic passes that pre-fill the TT with best-move hints, then the exact
+    /// solve. The passes cover depths `start, start+2, … < end` where `end =
+    /// empties − ITERATIVE_MIN_EMPTIES + 2`, so seeding stops short of the leaves
+    /// and only sharpens ordering near the root. Each hint is stamped with its pass
+    /// depth (`< empties`), so it can never trigger an exact cutoff in the final
+    /// pass — it only informs ordering (see [`super::tt::TtEntry`]).
+    fn solve_id(&mut self, pos: &Position, empties: u32) -> i32 {
+        let end = empties.saturating_sub(ITERATIVE_MIN_EMPTIES - 2); // empties − 8
+        if end >= 2 {
+            // Edax's start schedule (root.c): begin near depth 6, same parity as end.
+            let mut start = 6 - (end & 1);
+            if start > end - 2 {
+                start = end - 2;
+            }
+            if start == 0 {
+                start = 2 - (end & 1);
+            }
+            let mut d = start;
+            while d < end {
+                self.id_pass(pos, SCORE_MIN, SCORE_MAX, d);
+                d += 2;
+            }
+        }
+        self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
+    }
+
+    /// One heuristic iterative-deepening pass: negamax with alpha-beta to a
+    /// remaining `depth` plies, the trained eval at the horizon, recording a
+    /// best-move hint per node into the TT (stamped `depth`). Move ordering reuses
+    /// the production [`Search::ordered_moves`] (mobility + corner + eval term), so
+    /// the hints it leaves match what the exact pass wants at the front. When the
+    /// remaining game fits the budget (`empties <= depth`) it hands off to the exact
+    /// search, whose entries (stamped `empties`) the final pass can cut on.
+    fn id_pass(&mut self, pos: &Position, mut alpha: i32, beta: i32, depth: u32) -> i32 {
+        let empties = pos.empties();
+        if empties <= depth {
+            return self.search_exact(pos, alpha, beta, empties);
+        }
+        self.nodes += 1;
+        if depth == 0 {
+            return self.eval_clamped(pos);
+        }
+
+        let hash_move = self.tt_probe(pos).map_or(NO_MOVE, |e| e.best_move);
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            return -self.id_pass(&passed, -beta, -alpha, depth - 1);
+        }
+
+        let mut move_list = self.ordered_moves(pos, moves, empties);
+        move_list
+            .as_mut_slice()
+            .sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
+        if hash_move != NO_MOVE {
+            if let Some(i) = move_list
+                .as_slice()
+                .iter()
+                .position(|&(_, c, _)| c as u8 == hash_move)
+            {
+                move_list.as_mut_slice()[..=i].rotate_right(1);
+            }
+        }
+
+        let mut best = SCORE_MIN;
+        let mut best_cell = NO_MOVE;
+        for &(_, cell, ref child) in move_list.as_slice() {
+            self.parity ^= QUADRANT_ID[cell as usize];
+            let score = -self.id_pass(child, -beta, -alpha, depth - 1);
+            self.parity ^= QUADRANT_ID[cell as usize];
+            if score > best {
+                best = score;
+                best_cell = cell as u8;
+                if score > alpha {
+                    alpha = score;
+                    if alpha >= beta {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Store the best-move hint only (uninformative bounds): a heuristic bound
+        // must never be read as an exact cutoff, and the stamp `depth < empties`
+        // already guarantees that. The hint is what the exact pass consumes.
+        self.tt_store(
+            pos,
+            SCORE_MIN as i8,
+            SCORE_MAX as i8,
+            best_cell,
+            depth as u8,
+        );
+        best
+    }
+
+    /// The trained eval for `pos` (mover's perspective), clamped to a non-terminal
+    /// score range. Used at the iterative-deepening horizon; `0` if no eval (only
+    /// reached when one is attached, so the fallback is inert).
+    #[inline]
+    fn eval_clamped(&self, pos: &Position) -> i32 {
+        self.eval.as_deref().map_or(0, |ev| {
+            ev.eval_position(pos)
+                .round()
+                .clamp((SCORE_MIN + 1) as f32, (SCORE_MAX - 1) as f32) as i32
+        })
+    }
+
     /// Null-window dispatch: the window is implicitly `[alpha, alpha + 1]`, so
     /// `beta` is not passed. Used for every non-PV node. The leaf solvers are
     /// window-agnostic, so the leaf case reuses them with an explicit `alpha + 1`.
@@ -452,23 +595,30 @@ impl Search {
         let mut hash_move = NO_MOVE;
         if use_tt {
             if let Some(e) = self.tt_probe(pos) {
-                let (lo, hi) = (e.lower as i32, e.upper as i32);
-                if lo >= beta {
-                    return lo;
-                }
-                if hi <= alpha {
-                    return hi;
-                }
-                if lo == hi {
-                    return lo;
-                }
-                if lo > alpha {
-                    alpha = lo;
-                }
-                if hi < beta {
-                    beta = hi;
-                }
+                // The best move is an ordering hint usable at any stored depth.
                 hash_move = e.best_move;
+                // A stored bound is valid for a cutoff only when the entry resolved
+                // this node's subtree — an exact entry has `depth == empties` (Edax
+                // `search_TC`). Heuristic ID entries (`depth < empties`) give only
+                // the hint above, never a cutoff.
+                if e.depth as u32 >= empties {
+                    let (lo, hi) = (e.lower as i32, e.upper as i32);
+                    if lo >= beta {
+                        return lo;
+                    }
+                    if hi <= alpha {
+                        return hi;
+                    }
+                    if lo == hi {
+                        return lo;
+                    }
+                    if lo > alpha {
+                        alpha = lo;
+                    }
+                    if hi < beta {
+                        beta = hi;
+                    }
+                }
             }
         }
         // Window actually searched (after TT narrowing); used to classify the
@@ -505,10 +655,20 @@ impl Search {
         if empties >= ETC_MIN_EMPTIES {
             for &(_, cell, ref child) in move_list.as_slice() {
                 if let Some(e) = self.tt_probe(child) {
-                    let value = -(e.upper as i32);
-                    if value >= beta {
-                        self.tt_store(pos, value as i8, SCORE_MAX as i8, cell as u8);
-                        return value;
+                    // The child's upper bound is only an exact cutoff source when its
+                    // entry resolved the child subtree (`depth >= child empties`).
+                    if e.depth as u32 >= empties - 1 {
+                        let value = -(e.upper as i32);
+                        if value >= beta {
+                            self.tt_store(
+                                pos,
+                                value as i8,
+                                SCORE_MAX as i8,
+                                cell as u8,
+                                empties as u8,
+                            );
+                            return value;
+                        }
                     }
                 }
             }
@@ -567,7 +727,8 @@ impl Search {
             } else {
                 (alpha as i8, alpha as i8)
             };
-            self.tt_store(pos, lower, upper, best_cell);
+            // Exact (to game end): stamp `depth = empties`.
+            self.tt_store(pos, lower, upper, best_cell, empties as u8);
         }
 
         alpha
@@ -593,19 +754,23 @@ impl Search {
         let mut hash_move = NO_MOVE;
         if use_tt {
             if let Some(e) = self.tt_probe(pos) {
-                let (lo, hi) = (e.lower as i32, e.upper as i32);
-                if lo >= beta {
-                    return lo;
-                }
-                if hi <= alpha {
-                    return hi;
-                }
-                if lo == hi {
-                    return lo;
-                }
-                // A width-1 window that survives the checks above is already as
-                // narrow as the stored bounds permit — no narrowing.
+                // Ordering hint usable at any depth; bound cutoff only for an entry
+                // that resolved this subtree (`depth >= empties`, i.e. exact).
                 hash_move = e.best_move;
+                if e.depth as u32 >= empties {
+                    let (lo, hi) = (e.lower as i32, e.upper as i32);
+                    if lo >= beta {
+                        return lo;
+                    }
+                    if hi <= alpha {
+                        return hi;
+                    }
+                    if lo == hi {
+                        return lo;
+                    }
+                    // A width-1 window that survives the checks above is already as
+                    // narrow as the stored bounds permit — no narrowing.
+                }
             }
         }
 
@@ -631,10 +796,18 @@ impl Search {
         if empties >= ETC_MIN_EMPTIES {
             for &(_, cell, ref child) in move_list.as_slice() {
                 if let Some(e) = self.tt_probe(child) {
-                    let value = -(e.upper as i32);
-                    if value >= beta {
-                        self.tt_store(pos, value as i8, SCORE_MAX as i8, cell as u8);
-                        return value;
+                    if e.depth as u32 >= empties - 1 {
+                        let value = -(e.upper as i32);
+                        if value >= beta {
+                            self.tt_store(
+                                pos,
+                                value as i8,
+                                SCORE_MAX as i8,
+                                cell as u8,
+                                empties as u8,
+                            );
+                            return value;
+                        }
                     }
                 }
             }
@@ -707,7 +880,8 @@ impl Search {
             } else {
                 (SCORE_MIN as i8, best as i8)
             };
-            self.tt_store(pos, lower, upper, best_cell);
+            // Exact (to game end): stamp `depth = empties`.
+            self.tt_store(pos, lower, upper, best_cell, empties as u8);
         }
 
         best

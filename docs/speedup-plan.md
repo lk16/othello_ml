@@ -261,10 +261,52 @@ win to **~1.20× at 18e and ~1.24× at 20e** (was 1.11×/1.12× at 12):
 | 18 | 53.4 | 48.3 | 44.6 | ~1.20× |
 | 20 | 278.9 | 250.2 | 225.3 | ~1.24× |
 
+**Iterative deepening — DONE, the largest ordering win so far.** Edax seeds its
+exact endgame pass with a near-perfect hash move at every node by running shallow
+heuristic passes first (`iterative_deepening`, `root.c`); the deep pass reads
+`hash_data.move[0]` for ordering. Two structural pieces were needed (both Edax):
+
+- **Depth-stamped TT** (prerequisite). Our never-cleared TT was *exact-only* — it
+  cut on stored bounds with no depth check, valid only because every entry was
+  searched to game end. To let heuristic and exact entries share one table,
+  `TtEntry` gained a `depth` stamp (Edax `HashData.depth`); the bound cutoffs now
+  require `depth >= empties` (exact-resolved, Edax `search_TC_NWS`) while the
+  **move hint is read unconditionally** (Edax `search_guess`). `merge_payload`
+  replaces the unconditional bound-intersection with a depth-preferred merge.
+  Behavior-neutral on its own (every existing entry is exact, `depth == empties`):
+  node counts bit-identical, all tests pass.
+- **ID driver** (`Search::solve_id`/`id_pass`). When a trained eval is attached,
+  run heuristic passes (`FlatEval` at the horizon, the production `ordered_moves`
+  for sort) at depths `start..end step 2`, `end = empties − ITERATIVE_MIN_EMPTIES
+  + 2`, each storing a best-move hint stamped with its (shallow) pass depth — so it
+  can only reorder the exact pass, never trigger a wrong cutoff. Then the exact
+  solve. Exact result unchanged (guarded by an ID-vs-plain equality test over the
+  reference positions, parity asserts live).
+
+A/B (10 `7500?000` files, `USE_ID` toggle, eval = `trained_weights.bin`), **on top
+of the eval-ordering win above**:
+
+| depth | eval no-ID | eval+ID | node cut | no-ID ms | ID ms | speedup |
+|---|---|---|---|---|---|---|
+| 14 | 76,157 | 62,758 | −17.6% | 1.9 | 1.7 | ~1.12× |
+| 16 | 354,318 | 282,582 | −20.2% | 9.5 | 8.1 | ~1.17× |
+| 18 | 1,564,721 | 1,144,108 | −26.9% | 45.5 | 38.0 | ~1.20× |
+| 20 | 7,425,308 | 5,236,744 | −29.5% | 223.3 | 205.0 | ~1.09× |
+
+**Cumulative vs the mobility-only baseline** (eval ordering + ID): 18e 1,919,923 →
+1,144,108 (**−40% nodes, ~1.41×**), 20e 9,714,119 → 5,236,744 (**−46% nodes,
+~1.36×**). `ITERATIVE_MIN_EMPTIES` swept 8..14 at 18e — a flat basin, kept at
+Edax's **10** (fewest nodes at every depth; 8 over-seeds at wall-clock cost, 12+
+under-seed and the shallow node cut collapses; 10 is also fastest at 14e/16e where
+bulk ≤16e label-solving runs). `id_pass` stores move hints only (uninformative
+bounds), so the depth-stamp's bound-gating is correct-but-dormant — ready for
+heuristic-bound storage if it later pays.
+
 **Still open** (now worth doing — the eval is strong enough): the shallow-search bonus
 (`sort_depth` 1–6, needs incremental `eval_update` so the per-node cost is `score`
-not a full `set`); iterative deepening + hash-move ordering; `inc_sort_depth`;
-eval-seeded MTD-f (Step 31); and wiring the eval into the parallel workers (still
+not a full `set`); `inc_sort_depth`; eval-seeded MTD-f (Step 31) — the ID estimate
+is now the first guess; storing heuristic bounds in the ID passes (the depth stamp
+already supports it); and wiring the eval + ID into the parallel workers (still
 `None`). Verify the win across depths (14/16/20e) and re-bench after each.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
