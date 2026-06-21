@@ -304,20 +304,24 @@ fn evaluate_positions_parallel(
     let mut scores = vec![0i32; n];
     let mut completed = Vec::with_capacity(n);
     let eval_start = std::time::Instant::now();
-    let spin = b"|/-\\";
+    // Refresh the progress line at most ~5x/sec. Printing + flushing on every
+    // received result floods the terminal and throttles throughput on large
+    // batches (this loop runs once per evaluated board).
+    let mut last_print = std::time::Instant::now();
 
     while let Ok((idx, score)) = rx.recv() {
         scores[idx] = score;
         completed.push(idx);
         let done = completed.len();
+        if last_print.elapsed() < std::time::Duration::from_millis(200) && done < n {
+            continue;
+        }
+        last_print = std::time::Instant::now();
         let elapsed = eval_start.elapsed().as_secs_f64();
         let remaining = n - done;
         let rate = done as f64 / elapsed.max(0.001);
         let eta = remaining as f64 / rate;
-        eprint!(
-            "\r  {} {done}/{n} evaluated, {remaining} remaining, ETA: {eta:.0}s          ",
-            spin[done % spin.len()] as char,
-        );
+        eprint!("\r  {done}/{n} evaluated, {remaining} remaining, ETA: {eta:.0}s          ");
         let _ = std::io::stderr().flush();
     }
 

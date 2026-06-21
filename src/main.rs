@@ -696,6 +696,7 @@ fn bootstrap_label(
     let start = Instant::now();
 
     let out: Vec<TrainingExample> = if threads <= 1 {
+        let mut last_print = start;
         band.iter()
             .enumerate()
             .map(|(i, b)| {
@@ -703,7 +704,8 @@ fn bootstrap_label(
                     position: b.position,
                     target_score: bootstrap_score(&b.position, flat, depth),
                 };
-                if i % 512 == 0 {
+                if last_print.elapsed() >= Duration::from_millis(200) {
+                    last_print = Instant::now();
                     print_progress("labelling", i, total, start);
                 }
                 ex
@@ -720,7 +722,7 @@ fn bootstrap_label(
                 if d >= total {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(200));
             });
             // Workers: each labels its chunk, bumping the shared counter.
             let handles: Vec<_> = band
@@ -1035,6 +1037,7 @@ fn run_eval_check(args: EvalCheckArgs) {
     let mut sign_ok = 0usize; // win/draw/loss class agrees
     let mut within_2 = 0usize; // |error| <= 2 discs
     let start = Instant::now();
+    let mut last_print = start;
 
     for (i, board) in positions.iter().enumerate() {
         let exact = solver.exact_score(&board.position) as f64;
@@ -1051,7 +1054,8 @@ fn run_eval_check(args: EvalCheckArgs) {
         if abs <= 2.0 {
             within_2 += 1;
         }
-        if i % 64 == 0 {
+        if last_print.elapsed() >= Duration::from_millis(200) {
+            last_print = Instant::now();
             print_progress("checking", i, n, start);
         }
     }
