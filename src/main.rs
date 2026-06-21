@@ -1,6 +1,7 @@
 use othello_eval::{
-    best_move, bootstrap_score, build_examples, load_games, train_least_squares, Board, CgConfig,
-    Features, FlatEval, ParallelSolver, Position, Solver, TrainingExample, Weights,
+    best_move, bootstrap_score, build_examples, load_games, run_gui, train_least_squares, Board,
+    CgConfig, Features, FlatEval, GuiArgs, GuiMode, ParallelSolver, Position, Solver,
+    TrainingExample, Weights,
 };
 use std::env;
 use std::io::{self, Write};
@@ -12,6 +13,7 @@ enum Command {
     Train(TrainArgs),
     TrainBoot(TrainBootArgs),
     Play(PlayArgs),
+    Gui(GuiArgs),
     Bench(BenchArgs),
     EvalCheck(EvalCheckArgs),
     BenchFlip,
@@ -106,6 +108,7 @@ fn parse_args() -> Option<Command> {
         "train" | "train-exact" => parse_train_args(&args[0], &args[2..]),
         "train-boot" => parse_train_boot_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
+        "gui" => parse_gui_args(&args[0], &args[2..]),
         "bench" => parse_bench_args(&args[0], &args[2..]),
         "eval-check" => parse_eval_check_args(&args[0], &args[2..]),
         "bench-flip" => Some(Command::BenchFlip),
@@ -315,6 +318,88 @@ fn parse_play_args(program: &str, args: &[String]) -> Option<Command> {
     }))
 }
 
+fn parse_gui_args(program: &str, args: &[String]) -> Option<Command> {
+    // No mode (or a bare `--help`) → just list the modes.
+    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        print_gui_modes(program);
+        return None;
+    }
+
+    let Some(mode) = GuiMode::parse(&args[0]) else {
+        eprintln!("Unknown gui mode: {}\n", args[0]);
+        print_gui_modes(program);
+        return None;
+    };
+
+    // Only flags each mode actually uses are accepted; the rest fall through to
+    // the "unknown option" arm.
+    let pgn_allowed = matches!(mode, GuiMode::Pgn);
+    let weights_allowed = matches!(mode, GuiMode::Evaluate | GuiMode::Pgn);
+
+    let mut weights_file: Option<String> = None;
+    let mut pgn_file: Option<String> = None;
+    let mut depth: u32 = 6;
+    let mut exact_empties: u32 = 12;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print_gui_mode_usage(program, mode);
+                return None;
+            }
+            "-w" | "--weights" if weights_allowed => {
+                i += 1;
+                weights_file = args.get(i).cloned();
+            }
+            "-p" | "--pgn" if pgn_allowed => {
+                i += 1;
+                pgn_file = args.get(i).cloned();
+            }
+            "-d" | "--depth" if weights_allowed => {
+                i += 1;
+                depth = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(depth);
+            }
+            "-e" | "--exact-empties" if weights_allowed => {
+                i += 1;
+                exact_empties = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(exact_empties);
+            }
+            other => {
+                eprintln!("Unknown option for `gui {}`: {other}\n", args[0]);
+                print_gui_mode_usage(program, mode);
+                return None;
+            }
+        }
+        i += 1;
+    }
+
+    // evaluate defaults the weights file like `train`; pgn requires it.
+    if matches!(mode, GuiMode::Evaluate) && weights_file.is_none() {
+        weights_file = Some(String::from("trained_weights.bin"));
+    }
+    if matches!(mode, GuiMode::Pgn) && weights_file.is_none() {
+        eprintln!("Error: --weights/-w is required for `gui pgn`.\n");
+        print_gui_mode_usage(program, mode);
+        return None;
+    }
+    if pgn_allowed && pgn_file.is_none() {
+        eprintln!("Error: --pgn/-p is required for `gui pgn`.\n");
+        print_gui_mode_usage(program, mode);
+        return None;
+    }
+
+    Some(Command::Gui(GuiArgs {
+        mode,
+        weights_file,
+        pgn_file,
+        depth,
+        exact_empties,
+    }))
+}
+
 fn parse_bench_args(program: &str, args: &[String]) -> Option<Command> {
     let mut empties: u32 = 20;
     let mut max_boards: Option<usize> = None;
@@ -445,6 +530,7 @@ fn main() {
         Command::Train(args) => run_train(args),
         Command::TrainBoot(args) => run_train_boot(args),
         Command::Play(args) => run_play(args),
+        Command::Gui(args) => run_gui(args),
         Command::Bench(args) => run_bench(args),
         Command::EvalCheck(args) => run_eval_check(args),
         Command::BenchFlip => othello_eval::bench_flip_variants(),
@@ -1166,6 +1252,7 @@ fn print_usage(program: &str) {
         "  train-boot   Extend the eval to empties > N via bootstrapped shallow-search labels"
     );
     eprintln!("  play     Play a game against the CLI");
+    eprintln!("  gui      Graphical board: game / evaluate / pgn modes");
     eprintln!("  bench    Benchmark exact alpha-beta search speed");
     eprintln!("  eval-check  Measure a trained eval's accuracy vs exact ground truth (discs)");
     eprintln!("  bench-flip  Micro-benchmark the flip-computation variants");
@@ -1296,6 +1383,66 @@ fn print_eval_check_usage(program: &str) {
     eprintln!(
         "  {program} eval-check -w w.bin -n 14 -m 1000 training_data/   # check the exact base"
     );
+}
+
+fn print_gui_modes(program: &str) {
+    eprintln!("Usage: {program} gui <MODE> [OPTIONS]");
+    eprintln!();
+    eprintln!("Minimal graphical board (macroquad). Per-move scores come from this");
+    eprintln!("project's own search — there is no Edax / opening-book backend (see docs/gui.md).");
+    eprintln!();
+    eprintln!("MODES:");
+    eprintln!("  game      Play both sides locally");
+    eprintln!("  evaluate  Like game, plus a score on every legal move (best move ringed)");
+    eprintln!("  pgn       Step through a game file with a bottom score graph");
+    eprintln!();
+    eprintln!("Use \"{program} gui <mode> --help\" for the options of a specific mode.");
+}
+
+fn print_gui_mode_usage(program: &str, mode: GuiMode) {
+    match mode {
+        GuiMode::Game => {
+            eprintln!("Usage: {program} gui game");
+            eprintln!();
+            eprintln!("Play both sides locally on a graphical board.");
+            eprintln!("  Left-click  = play the move");
+            eprintln!("  Right-click = undo the last move");
+            eprintln!("  Click after game over = restart");
+            eprintln!();
+            eprintln!("OPTIONS:");
+            eprintln!("  -h, --help            Show this help message");
+        }
+        GuiMode::Evaluate => {
+            eprintln!("Usage: {program} gui evaluate [OPTIONS]");
+            eprintln!();
+            eprintln!("Like `game`, plus a score on every legal move (best move ringed).");
+            eprintln!("Controls are the same as `game` (left-click / right-click / restart).");
+            eprintln!();
+            eprintln!("OPTIONS:");
+            eprintln!("  -w, --weights PATH    Trained weights (default: trained_weights.bin)");
+            eprintln!("  -d, --depth N         Heuristic search depth for scores (default: 6)");
+            eprintln!("  -e, --exact-empties N Use exact search at <= N empties (default: 12)");
+            eprintln!("  -h, --help            Show this help message");
+        }
+        GuiMode::Pgn => {
+            eprintln!("Usage: {program} gui pgn -p <pgn> -w <weights> [OPTIONS]");
+            eprintln!();
+            eprintln!("Step through a loaded game with a bottom score graph (black's POV).");
+            eprintln!("  Left / Right (or right-click) = navigate");
+            eprintln!("  Click a square = branch into an alternative line");
+            eprintln!("  space = show all move scores   l = show depth   f = flip board");
+            eprintln!();
+            eprintln!("OPTIONS:");
+            eprintln!("  -p, --pgn PATH        Game file to review (required)");
+            eprintln!("  -w, --weights PATH    Trained weights (required)");
+            eprintln!("  -d, --depth N         Heuristic search depth for scores (default: 6)");
+            eprintln!("  -e, --exact-empties N Use exact search at <= N empties (default: 12)");
+            eprintln!("  -h, --help            Show this help message");
+            eprintln!();
+            eprintln!("EXAMPLE:");
+            eprintln!("  {program} gui pgn -w weights.bin -p game.pgn");
+        }
+    }
 }
 
 fn print_play_usage(program: &str) {

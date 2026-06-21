@@ -1,6 +1,9 @@
 pub mod eval;
+pub mod gui;
 pub mod othello;
 pub mod training;
+
+pub use gui::{run as run_gui, GuiArgs, GuiMode};
 
 pub use eval::alphabeta::{
     batch_evaluate, best_move, bootstrap_score, depth_limited_score, exact_score,

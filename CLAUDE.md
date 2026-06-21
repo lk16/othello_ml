@@ -15,12 +15,14 @@ Always use `pre-commit run -a` — not `cargo check` directly. It runs check, fm
 - `src/othello/` — game logic: `Position` (bitboards), `Board` (position + side), `Game` (WTHOR/PGN)
 - `src/eval/` — exact evaluation: `alphabeta` (negamax), `cache` (FEN→score persistence)
 - `src/training/` — training: `Features`, `Weights`, `cg` (CG least-squares trainer)
+- `src/gui/` — minimal macroquad GUI (`gui game|evaluate|pgn`)
 - `test_data/` — sample files for self-contained tests
 
 See [docs/reference.md](docs/reference.md) for detailed architecture and file formats.
 See [docs/best-practices.md](docs/best-practices.md) for project conventions.
 See [docs/speedup-plan.md](docs/speedup-plan.md) for the exact-search optimization roadmap.
 See [docs/eval-quality.md](docs/eval-quality.md) for the eval-accuracy problem — the current critical path blocking the biggest remaining solver speedups.
+See [docs/gui.md](docs/gui.md) for the graphical board (`gui` subcommand) and how it differs from flippy.
 
 ## Guidelines
 
