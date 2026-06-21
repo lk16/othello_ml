@@ -6,7 +6,7 @@
 use crate::eval::alphabeta;
 use crate::othello::board::Board;
 use crate::othello::position::Position;
-use crate::training::trainer::TrainingExample;
+use crate::training::TrainingExample;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;

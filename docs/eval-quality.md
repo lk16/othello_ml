@@ -113,13 +113,12 @@ Reading:
   per bucket: **340/340 bit-exact across empties 4–20** (0 diff), including deep
   17–20e where selective labels would diverge. True exact ground truth. Bucket sizes
   ~460–520k each at 4–16e, ~42k tail at 17–20e.
-- **The optimizer.** A from-scratch single-thread retrain (`-t 1`, online SGD) drives
-  *in-sample* 14e MAE to **2.82** (within-2 48.5%) — it fits fine.
-- **`-t > 1` for training is broken, though.** The parallel clone/merge path (Step
-  32) converges far worse: same data/epochs, `-t 16` gave loss 92.8 / MAE 7.24 vs
-  `-t 1`'s loss 13.6 / MAE 2.82. **Always train with `-t 1`.** (`-t` also controls
-  missing-label solve parallelism, so only raise it when the slice is NOT fully
-  cached — and then accept the worse training, or solve labels in a separate pass.)
+- **The optimizer.** A from-scratch retrain drives *in-sample* 14e MAE to **2.82**
+  (within-2 48.5%) — it fits fine. (Historical: this was the original online-SGD
+  trainer, since [replaced by CG](#the-capacity-ceiling-cg-least-squares-experiment),
+  which reaches the same in-sample floor. The old parallel-SGD clone/merge path
+  converged far worse, forcing single-thread training; CG removed that limitation —
+  `-t` now safely parallelizes the bucket solves.)
 
 ## Generalization gap — a small-data artifact, not the ceiling
 
@@ -182,8 +181,8 @@ See [The capacity ceiling](#the-capacity-ceiling-cg-least-squares-experiment).
 ## The capacity ceiling (CG least-squares experiment)
 
 To test whether the optimizer was the bottleneck, we replaced SGD with a per-bucket
-**conjugate-gradient least-squares solver** (`src/training/cg.rs`, `train -o cg`),
-which reaches the *exact global optimum* of the convex per-bucket objective — Edax's
+**conjugate-gradient least-squares solver** (`src/training/cg.rs`), which reaches the
+*exact global optimum* of the convex per-bucket objective — Edax's
 own `eval_builder` method. Ridge is regularization, specified **per example** so a
 single value is scale-invariant across data sizes (the data term is an implicit sum
 over N examples, so internally `ridge·N` is used; default `0.001`). All runs at
@@ -213,6 +212,29 @@ Findings:
 won't help (CG is optimal). Breaking ~8 MAE needs a **richer model** (pattern
 *interactions* / non-linearity) or a reconsidered target. CG stays as a fast,
 unbiased, hyperparameter-light default trainer regardless.
+
+### CG also matches SGD in the bootstrap loop (`train-boot`)
+
+The `train` comparison above is a one-shot convex fit on exact labels. `train-boot`
+is different: each band's labels come from a shallow search whose leaves use the
+*current* weights, so the objective shifts every band — a regime CG had never been
+tested in. We wired CG into `train-boot` (per-band; each band solves only its own
+empties buckets) and re-ran the A/B from a **shared CG base** (≤16e, 100 `750*`
+files), bootstrapping 16→20 (depth 4), measured at **18e on 2000 held-out `760*`
+positions**:
+
+| per-band optimizer | MAE | RMSE | bias | within ±2 | W/D/L sign | train/band |
+|---|---|---|---|---|---|---|
+| SGD (60 ep) | **8.24** | 10.64 | −0.91 | 16.3% | 87.0% | 2.2 s |
+| CG (ridge 1e-3) | 8.33 | 10.85 | **−0.72** | **17.1%** | **87.5%** | **0.2 s** |
+
+Same verdict as `train`: **CG ≈ SGD** (within ~0.1 MAE; CG marginally worse on MAE,
+marginally better on within-±2/bias/sign) and ~11× faster per band. The iterative,
+weight-dependent labels did not break CG. Having confirmed CG matches SGD in **both**
+training paths (neither dominates on accuracy; CG wins on speed and bias), **SGD was
+removed** — CG least-squares is now the *only* trainer for both `train` and
+`train-boot`. The SGD comparisons in this doc are kept as the historical record that
+justified the switch.
 
 ## Edax has no sub-disc claim (eval_sigma)
 

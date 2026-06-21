@@ -159,6 +159,12 @@ parallel path. At ~4M ex/s single-threaded the parallel path is
 counter-productive (the clone/merge dwarfs per-example compute; epoch-level
 model-averaging converges worse), so `threads = 1` is the right default.
 
+**Superseded:** the SGD trainer described here has since been **removed** in favour
+of a per-bucket conjugate-gradient least-squares solver (`src/training/cg.rs`), which
+reaches the same accuracy floor at the exact optimum, is faster, and parallelizes
+cleanly across buckets with `-t`. See [eval-quality.md](eval-quality.md), "The
+capacity ceiling".
+
 ### Step 33 — alloc-free flat pattern eval in the solver — core done
 `Weights::evaluate` allocates per call and triple-chases `Vec<Vec<Vec<f32>>>` —
 unusable in the hot path. Edax's eval (`eval.c`/`eval.h`/`midgame.c`) is the

@@ -89,62 +89,6 @@ impl Weights {
         score
     }
 
-    /// Evaluate from precomputed feature-pattern indices (one per feature).
-    ///
-    /// Alloc-free hot path used by training: the caller extracts the indices
-    /// once (positions are fixed across epochs) and reuses them, so this skips
-    /// the per-call `Features::extract` `Vec` and the per-cell `get_cell` loop.
-    /// The `range_idx` is computed once instead of per feature.
-    pub fn evaluate_indices(&self, indices: &[u32], empties: u32) -> f32 {
-        let range_idx = self.empty_range_index(empties);
-        let mut score = 0.0f32;
-        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
-            let row = &self.shape_weights[self.feature_to_shape[feat_idx]][range_idx];
-            let p = pattern_idx as usize;
-            if p < row.len() {
-                score += row[p];
-            }
-        }
-        score
-    }
-
-    /// In-place SGD step over precomputed feature-pattern indices.
-    ///
-    /// Equivalent to calling [`Weights::update_weight_sgd`] for every feature,
-    /// but computes `range_idx` once and indexes directly (no per-feature
-    /// `get`/`set` round-trip). Same `MAX_WEIGHT` clamp.
-    pub fn sgd_step_indices(
-        &mut self,
-        indices: &[u32],
-        empties: u32,
-        learning_rate: f32,
-        gradient: f32,
-    ) {
-        const MAX_WEIGHT: f32 = 100.0;
-        let range_idx = self.empty_range_index(empties);
-        let step = learning_rate * gradient;
-        for (feat_idx, &pattern_idx) in indices.iter().enumerate() {
-            let row = &mut self.shape_weights[self.feature_to_shape[feat_idx]][range_idx];
-            let p = pattern_idx as usize;
-            if p < row.len() {
-                row[p] = (row[p] + step).clamp(-MAX_WEIGHT, MAX_WEIGHT);
-            }
-        }
-    }
-
-    /// Multiply every weight by `retain` — decoupled L2 weight decay. Applied once
-    /// per epoch with `retain = 1 - effective_lr * l2`, shrinking all weights toward
-    /// zero (AdamW-style decoupled decay; cheap and frequency-independent).
-    pub fn decay_all(&mut self, retain: f32) {
-        for shape in &mut self.shape_weights {
-            for range in shape {
-                for w in range {
-                    *w *= retain;
-                }
-            }
-        }
-    }
-
     /// Get weight for a specific feature, pattern, and empty range.
     /// Reads the feature's tied shape table.
     pub fn get_weight(&self, feature_idx: usize, pattern_idx: u32, empties: u32) -> f32 {
@@ -173,23 +117,6 @@ impl Weights {
         if pattern_idx < row.len() {
             row[pattern_idx] = weight;
         }
-    }
-
-    /// Update weight using SGD
-    /// weight += learning_rate * gradient
-    /// Weights are clipped to [-MAX_WEIGHT, MAX_WEIGHT] to prevent explosion.
-    pub fn update_weight_sgd(
-        &mut self,
-        feature_idx: usize,
-        pattern_idx: u32,
-        empties: u32,
-        learning_rate: f32,
-        gradient: f32,
-    ) {
-        const MAX_WEIGHT: f32 = 100.0;
-        let current = self.get_weight(feature_idx, pattern_idx, empties);
-        let new_weight = (current + learning_rate * gradient).clamp(-MAX_WEIGHT, MAX_WEIGHT);
-        self.set_weight(feature_idx, pattern_idx, empties, new_weight);
     }
 
     /// The feature set used by this weight table.
@@ -313,27 +240,6 @@ impl Weights {
             let n = row.len();
             row.copy_from_slice(&flat[k..k + n]);
             k += n;
-        }
-    }
-
-    /// Merge weight deltas from parallel workers.
-    ///
-    /// Each worker cloned the weights before training, so
-    /// `workers[i] - self` is the delta from worker i.  We apply the
-    /// average delta: `self += sum(workers[i] - self) / n_workers`.
-    pub fn merge_from_workers(&mut self, workers: &[Weights]) {
-        let n = workers.len() as f32;
-        for s in 0..self.shape_weights.len() {
-            for e in 0..self.shape_weights[s].len() {
-                for p in 0..self.shape_weights[s][e].len() {
-                    let original = self.shape_weights[s][e][p];
-                    let delta: f32 = workers
-                        .iter()
-                        .map(|w| w.shape_weights[s][e][p] - original)
-                        .sum();
-                    self.shape_weights[s][e][p] = original + delta / n;
-                }
-            }
         }
     }
 
@@ -536,18 +442,6 @@ mod tests {
 
         weights.set_weight(0, 0, 30, 42.0);
         assert!((weights.get_weight(0, 0, 30) - 42.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_sgd_update() {
-        let features = Features::edax();
-        let mut weights = Weights::new(features);
-
-        weights.set_weight(0, 0, 30, 0.0);
-        weights.update_weight_sgd(0, 0, 30, 0.01, 100.0);
-        let w = weights.get_weight(0, 0, 30);
-        assert!(w > 0.0); // weight should increase
-        assert!((w - 1.0).abs() < 0.001); // 0.01 * 100 = 1.0
     }
 
     #[test]

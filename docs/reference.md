@@ -12,18 +12,18 @@ othello_eval
 │   ├── alphabeta      - exact endgame search + depth-limited heuristic search & best_move
 │   └── cache          - persistent FEN→score cache for eval files
 ├── training/
-│   ├── Features       - 47 position features (46 Edax patterns + edge_parity)
+│   ├── Features       - 46 Edax position-pattern features (eval.c EVAL_F2X)
 │   ├── Weights        - weight storage, lookup, save/load
-│   └── Trainer        - SGD optimization with inverse-time LR decay
+│   └── cg             - per-bucket conjugate-gradient least-squares trainer
 ```
 
 ## Key Features
 
 - **Minimal dependencies** — only `ctrlc` for graceful SIGINT handling
-- **47 position features** — 46 Edax patterns from eval.c plus one corner-parity feature
+- **46 position features** — Edax patterns transcribed from eval.c `EVAL_F2X`, tied by symmetry shape
 - **Alpha-beta evaluation** — exact endgame search for training; depth-limited heuristic search for gameplay
 - **Compact storage** — single binary file for all weights
-- **Full SGD training** — configurable learning rate, batch size, epochs, LR decay
+- **CG least-squares training** — per-empties-bucket conjugate-gradient fit to the exact global optimum (no learning rate; ridge-regularized)
 - **Eval file caching** — `--eval-file` loads cached evaluations or computes & saves
 - **Interactive gameplay** — play against the bot via `play` subcommand
 - **Search benchmarking** — measure nodes/position and time via `bench` subcommand
@@ -33,10 +33,10 @@ othello_eval
 ```
 [Magic: 0xDEADBEEF (4 bytes)]
 [Version: 3 (4 bytes)]          ← f32 weights; older v1/v2 are rejected (re-train)
-[N Features: 47 (4 bytes)]
+[N Features: 46 (4 bytes)]
 [Feature 0: name_len + name + cells_count + cells...]
 ...
-[Feature 46: name_len + name + cells_count + cells...]
+[Feature 45: name_len + name + cells_count + cells...]
 [Weight data: all f32 weights in row-major order]
 ```
 
@@ -101,17 +101,18 @@ frontier N, it trains one **band of width `d`** at a time — `(N, N+d]`, then
 `(N+d, N+2d]`, … up to `--max-empties`. Because a depth-`d` search from empties
 ≤ frontier+d bottoms out at empties ≤ frontier (already trained), every label is
 anchored to the band below it. Weights are per-empty-range buckets, so each band
-updates disjoint buckets (no forgetting). Band labels are generated in parallel
-(`-t`); the SGD itself is single-threaded online (best convergence — see
-[speedup-plan.md](speedup-plan.md) Step 32).
+updates disjoint buckets (no forgetting). Each band is fit by the same per-bucket CG
+least-squares solver as `train`; `-t` parallelizes both the band's label generation
+and its bucket solves.
 
 ```bash
 # Requires an exact-trained weights file first (train-exact, e.g. -n 16).
 cargo run --release -- train-boot \
   --exact-empties 16 --max-empties 28 --depth 4 \
-  -e 100 -t 8 -w trained_weights.bin training_data/
+  -t 8 -w trained_weights.bin training_data/
 ```
 
 Key flags: `--exact-empties N` (trusted frontier), `--max-empties M` (train up to),
-`--depth d` (shallow-search depth = band width), `-e` (epochs per band), `-w`
-(weights file, loaded and overwritten per band).
+`--depth d` (shallow-search depth = band width), `-w` (weights file, loaded and
+overwritten per band). CG knobs (`--cg-iters`, `--ridge`, `--min-count`) apply per
+band, as in `train`.

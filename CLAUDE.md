@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Othello ML — a Rust feature-based Othello position evaluator trained via SGD against exact ground truth.
+Othello ML — a Rust feature-based Othello position evaluator trained via conjugate-gradient least-squares against exact ground truth.
 
 ## Build & test
 
@@ -14,7 +14,7 @@ Always use `pre-commit run -a` — not `cargo check` directly. It runs check, fm
 
 - `src/othello/` — game logic: `Position` (bitboards), `Board` (position + side), `Game` (WTHOR/PGN)
 - `src/eval/` — exact evaluation: `alphabeta` (negamax), `cache` (FEN→score persistence)
-- `src/training/` — training: `Features`, `Weights`, `Trainer`
+- `src/training/` — training: `Features`, `Weights`, `cg` (CG least-squares trainer)
 - `test_data/` — sample files for self-contained tests
 
 See [docs/reference.md](docs/reference.md) for detailed architecture and file formats.
