@@ -32,18 +32,21 @@ othello_eval
 
 ```
 [Magic: 0xDEADBEEF (4 bytes)]
-[Version: 3 (4 bytes)]          ← f32 weights; older v1/v2 are rejected (re-train)
+[Version: 4 (4 bytes)]          ← f32 weights; older v1/v2/v3 are rejected (re-train)
 [N Features: 46 (4 bytes)]
 [Feature 0: name_len + name + cells_count + cells...]
 ...
 [Feature 45: name_len + name + cells_count + cells...]
-[Weight data: all f32 weights in row-major order]
+[Weight data: f32, per symmetry shape: [shape][empties-bucket][pattern]]
 ```
 
-Weights are indexed `[feature][empties-bucket][pattern]`, with **one bucket per
-empties value** (61 buckets, empties `0..=60`) — so each ply has its own per-feature
-table. (v1/v2 paired adjacent empties into 30 buckets; v3 is incompatible, hence the
-re-train.) The table is ~218 MB of f32 (`61 × ~892K patterns`).
+Weights are **tied by symmetry shape** (12 shapes for the 46 Edax features —
+symmetric features share one table, Edax mirror-packing) and stored as
+`[shape][empties-bucket][pattern]`, with **one bucket per empties value** (61
+buckets, empties `0..=60`) — so each ply has its own per-shape table. The shape
+structure is re-derived from the features on load, so it isn't stored. (v1/v2 paired
+adjacent empties into 30 buckets; v3 stored untied per-feature tables; all are
+incompatible, hence the re-train.) The table is ~55 MB of f32.
 
 ## Eval File Format
 

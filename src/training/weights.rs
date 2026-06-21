@@ -300,8 +300,8 @@ impl Weights {
         Ok(())
     }
 
-    /// Load weights from a file (format v3: f32 weights, 61 per-empties buckets).
-    /// Older v1/v2 files use a different bucketing and are rejected — re-train.
+    /// Load weights from a file (format v4: f32 weights tied per symmetry shape,
+    /// 61 per-empties buckets). Older v1/v2/v3 files are rejected — re-train.
     pub fn load(path: &str) -> Result<Weights, String> {
         use std::io::{BufReader, Read};
 
