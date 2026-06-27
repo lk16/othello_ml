@@ -85,7 +85,10 @@ pub fn best_move(
     }
 
     let mut alpha = SCORE_MIN;
-    let mut best_cell = 0u32;
+    // Default to the first legal move: if every move scores <= the initial alpha
+    // (e.g. a clamped boundary eval), best_cell must still be a *legal* cell, never
+    // a stale 0 — a `do_move` on an illegal cell is a no-op and would loop callers.
+    let mut best_cell = moves.trailing_zeros();
     let mut remaining = moves;
     while remaining != 0 {
         let cell = remaining.trailing_zeros();
@@ -103,6 +106,13 @@ pub fn best_move(
             alpha = score;
             best_cell = cell;
         }
+        // A proven maximal win can't be beaten — stop. This also keeps the next
+        // child's window `(-SCORE_MAX, -alpha)` non-degenerate: at alpha == SCORE_MAX
+        // it would collapse to `alpha == beta`, which the exact leaf solvers
+        // (`solve_2..solve_4`) mishandle as an infinite pass loop.
+        if alpha >= SCORE_MAX {
+            break;
+        }
     }
 
     Some(best_cell)
@@ -116,7 +126,9 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
     }
 
     let mut alpha = SCORE_MIN;
-    let mut best_cell = 0u32;
+    // First legal move as the default (see `best_move`): guarantees a legal return
+    // even when no child improves on the initial alpha.
+    let mut best_cell = moves.trailing_zeros();
     let empties = pos.empties();
     let mut searcher = Search::new();
 
@@ -130,6 +142,12 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
         if score > alpha {
             alpha = score;
             best_cell = cell;
+        }
+        // Stop at a proven maximal win, and keep the next child's window
+        // `(-SCORE_MAX, -alpha)` non-degenerate (see `best_move`): a collapsed
+        // `alpha == beta` window drives `solve_2..solve_4` into an infinite pass loop.
+        if alpha >= SCORE_MAX {
+            break;
         }
     }
 
