@@ -97,6 +97,19 @@ impl Solver {
         }
     }
 
+    /// Heuristic depth-limited score for `pos` (side-to-move perspective, `[-64,
+    /// 64]`): an eval-seeded ordered PVS to `depth` plies, the trained eval at the
+    /// horizon, reusing this solver's transposition table. Much faster than the bare
+    /// [`depth_limited_score`](crate::depth_limited_score) negamax (move ordering +
+    /// TT hints) and equal to it in the clean midgame; near the end it can differ
+    /// slightly (see [`Search::heuristic_search`]). **Requires the solver to carry an
+    /// eval** ([`Solver::with_eval`]; without one every leaf evaluates to `0`).
+    pub fn heuristic_score(&mut self, pos: &Position, depth: u32) -> i32 {
+        self.search.nodes = 0;
+        self.search.parity = board_parity(pos);
+        self.search.heuristic_search(pos, depth)
+    }
+
     /// Exact score plus the number of search nodes visited for this position.
     pub fn exact_score_with_nodes(&mut self, pos: &Position) -> (i32, u64) {
         self.search.nodes = 0;

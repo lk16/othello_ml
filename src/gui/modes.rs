@@ -9,8 +9,8 @@ use super::score::{graph_scores, score_moves, AsyncJob, GraphPoint};
 use super::{start_board, Eval, Mode, UiDetails};
 use crate::othello::board::Board;
 use crate::othello::position::Position;
-use crate::training::features::Features;
 use crate::training::weights::Weights;
+use crate::{FlatEval, Solver};
 
 type MoveJob = (u64, Position);
 type MoveOut = (u64, Vec<(u32, i32)>);
@@ -93,12 +93,9 @@ pub struct EvaluateMode {
 
 impl EvaluateMode {
     pub fn new(weights: Arc<Weights>, depth: u32, exact_empties: u32) -> Self {
-        let features = Features::edax();
+        let mut solver = Solver::with_eval(Arc::new(FlatEval::from_weights(&weights)));
         let engine = AsyncJob::new(move |(gen, pos): MoveJob| {
-            (
-                gen,
-                score_moves(&pos, depth, exact_empties, &weights, &features),
-            )
+            (gen, score_moves(&pos, depth, exact_empties, &mut solver))
         });
         EvaluateMode {
             game: GameMode::new(),
@@ -183,19 +180,20 @@ pub struct PgnMode {
 
 impl PgnMode {
     pub fn new(game: crate::Game, weights: Arc<Weights>, depth: u32, exact_empties: u32) -> Self {
-        let move_weights = Arc::clone(&weights);
-        let move_features = Features::edax();
+        // One shared flat eval; each engine thread owns its own solver (and TT).
+        let eval = Arc::new(FlatEval::from_weights(&weights));
+        let mut move_solver = Solver::with_eval(Arc::clone(&eval));
         let move_engine = AsyncJob::new(move |(gen, pos): MoveJob| {
             (
                 gen,
-                score_moves(&pos, depth, exact_empties, &move_weights, &move_features),
+                score_moves(&pos, depth, exact_empties, &mut move_solver),
             )
         });
-        let graph_features = Features::edax();
+        let mut graph_solver = Solver::with_eval(eval);
         let graph_engine = AsyncJob::new(move |(gen, boards): GraphJob| {
             (
                 gen,
-                graph_scores(&boards, depth, exact_empties, &weights, &graph_features),
+                graph_scores(&boards, depth, exact_empties, &mut graph_solver),
             )
         });
 

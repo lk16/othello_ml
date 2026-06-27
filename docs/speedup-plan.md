@@ -338,6 +338,54 @@ depth stamp already supports it); and re-sweeping `ID_SPLIT_MIN_DEPTH`/`SPLIT_MI
 EMPTIES` jointly at other thread counts. Verify the win across depths and re-bench
 after each.
 
+### Step 35 — midgame heuristic search (GUI / self-play): ordering + TT + incremental eval
+
+The *heuristic* depth-limited search (`depth_limited_score`, `alphabeta/depth.rs`)
+— used by `gui evaluate`/`pgn` and self-play move selection, distinct from the exact
+endgame search — was plain full-width negamax with **no move ordering, no TT, and a
+from-scratch leaf eval through the allocating `Weights::evaluate`**. So the GUI felt
+slow in the midgame (default depth 6).
+
+Diagnosis (30-empty midgame, trained weights, dev box):
+
+| | |
+|---|---|
+| depth 6 search | ~0.22 s (and `score_moves` runs one per root move) |
+| depth 7 search | ~3 s |
+| `Weights::evaluate` (GUI leaf, allocates a `Vec`) | 1.7 M/s |
+| `FlatEval::eval_position` (alloc-free) | 2.3 M/s |
+| `features.extract` (from-scratch, the bottleneck) | 2.3 M/s |
+| `Position::canonical` (the symmetry-fix normalize) | 54.7 M/s (≈3% — not the cost) |
+
+Two independent levers, mirroring the exact-search story: **node count** (ordering +
+TT) dominates, **per-eval cost** (alloc + from-scratch features) is second.
+
+**Fix 1 — DONE.** Route the heuristic search through the *same* eval-seeded ordered
+PVS the exact solver already uses for ID seeding (`Search::id_pass`): `order_score`
+move ordering (mobility + corner + the eval term ≥ `EVAL_ORDER_MIN_EMPTIES`), TT
+best-move hints (iterative-deepening passes), `FlatEval` at the horizon (alloc-free,
+canonicalized so scores stay symmetry-invariant), and the exact handoff when
+`empties ≤ depth`. Exposed as `Solver::heuristic_score`; the GUI builds one
+`Solver::with_eval` and reuses its TT across all root moves (still solving root
+children exactly below `exact_empties`). Equal to the old negamax value in the clean
+midgame (PVS only reorders); near the end it differs slightly — a pass counts as a
+ply, the horizon clamps to `[-63,63]`, and `empties ≤ depth` hands off to the *exact*
+score (strictly more accurate). Measured ~1.4× at depth 6, ~4.2× at depth 8 (the
+ordering win grows with depth). No retrain.
+
+**Fix 2 — PLANNED (incremental eval, Edax `eval_update`).** The leaf still recomputes
+all 46 features from scratch (`FlatEval::set`); Edax keeps the feature indices in the
+`Eval` struct and updates only the ~7 features containing the moved square on
+make/unmake (`eval_update`/`eval_restore` via `EVAL_X2F[x]`), then dot-products
+(`eval.c:782`). This is also prerequisite (a) of the Step-34 shallow-search ordering
+bonus. **Tension to resolve first:** incremental eval is incompatible with the
+per-leaf [`Position::canonical`] normalization that gives symmetry-invariant scores
+(the canonical orientation changes per node, scrambling the maintained indices).
+Edax doesn't canonicalize — its feature encoding is symmetric by construction. So
+Fix 2 needs either (i) a genuinely-symmetric feature encoding + retrain (the proper
+Edax-equivalent), or (ii) restricting canonicalization to the displayed root scores
+while interior leaves run raw. Decide before building.
+
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip
 ~31%** (already maximal — Steps 11/15), **`get_moves` ~17%** (per-node move-gen +

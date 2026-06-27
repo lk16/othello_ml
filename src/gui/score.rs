@@ -11,18 +11,19 @@ use std::thread;
 
 use crate::othello::board::Board;
 use crate::othello::position::Position;
-use crate::training::features::Features;
-use crate::training::weights::Weights;
-use crate::{depth_limited_score, Solver};
+use crate::Solver;
 
 /// Score every legal move of `pos`, from the side-to-move's perspective
 /// (positive = good for the player to move), matching how flippy displays it.
+///
+/// `solver` must carry an eval ([`Solver::with_eval`]): non-endgame children are
+/// scored by the fast eval-seeded ordered search ([`Solver::heuristic_score`]), and
+/// reusing one solver across the root moves warms its shared transposition table.
 pub fn score_moves(
     pos: &Position,
     depth: u32,
     exact_empties: u32,
-    weights: &Weights,
-    features: &Features,
+    solver: &mut Solver,
 ) -> Vec<(u32, i32)> {
     let mut out = Vec::new();
     let mut remaining = pos.get_moves();
@@ -32,9 +33,9 @@ pub fn score_moves(
         let child = pos.do_move(cell);
         // `child` is from the opponent's perspective; negate to get ours.
         let child_score = if child.empties() <= exact_empties {
-            Solver::new().exact_score(&child)
+            solver.exact_score(&child)
         } else {
-            depth_limited_score(&child, depth.saturating_sub(1), weights, features)
+            solver.heuristic_score(&child, depth.saturating_sub(1))
         };
         out.push((cell, -child_score));
     }
@@ -51,8 +52,7 @@ pub fn graph_scores(
     boards: &[Board],
     depth: u32,
     exact_empties: u32,
-    weights: &Weights,
-    features: &Features,
+    solver: &mut Solver,
 ) -> Vec<GraphPoint> {
     boards
         .iter()
@@ -60,7 +60,7 @@ pub fn graph_scores(
             if !board.position.has_moves() {
                 return None;
             }
-            let best = score_moves(&board.position, depth, exact_empties, weights, features)
+            let best = score_moves(&board.position, depth, exact_empties, solver)
                 .into_iter()
                 .map(|(_, s)| s)
                 .max()?;
@@ -80,7 +80,7 @@ pub struct AsyncJob<I, O> {
 }
 
 impl<I: Send + 'static, O: Send + 'static> AsyncJob<I, O> {
-    pub fn new<F: Fn(I) -> O + Send + 'static>(f: F) -> Self {
+    pub fn new<F: FnMut(I) -> O + Send + 'static>(mut f: F) -> Self {
         let (in_tx, in_rx) = mpsc::channel::<I>();
         let (out_tx, out_rx) = mpsc::channel::<O>();
         thread::spawn(move || {

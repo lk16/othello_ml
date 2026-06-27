@@ -278,6 +278,107 @@ mod tests {
         );
     }
 
+    /// The fast eval-seeded ordered search (`Solver::heuristic_score`) must return
+    /// the *same* value as the bare negamax `depth_limited_score` in the clean
+    /// midgame — PVS + TT + ordering only change node count, not the minimax value.
+    /// (Late-game divergences from pass-depth/clamp/exact-handoff are out of scope:
+    /// this line stays well clear of passes and clamp extremes with small weights.)
+    #[test]
+    fn heuristic_score_matches_negamax_midgame() {
+        use crate::{FlatEval, Solver};
+        use std::sync::Arc;
+
+        let features = Features::edax();
+        let mut weights = Weights::new(features.clone());
+        // Small weights (|leaf eval| stays well under the ±63 clamp), filled over
+        // symmetries so the eval is non-trivial and orientation-consistent.
+        let mut s = 0x51ED_0001u32;
+        let rnd = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            ((*s % 200) as f32) / 100.0 - 1.0
+        };
+        // A pass-free opening/midgame line (both sides always have moves here).
+        let mut positions = Vec::new();
+        let mut pos = Position::initial();
+        for _ in 0..14 {
+            positions.push(pos);
+            for sym in pos.symmetries() {
+                let e = sym.empties();
+                for (f, &p) in features.extract(&sym).iter().enumerate() {
+                    weights.set_weight(f, p, e, rnd(&mut s));
+                }
+            }
+            let moves = pos.get_moves();
+            if moves == 0 {
+                break;
+            }
+            pos = pos.do_move(moves.trailing_zeros());
+        }
+
+        let eval = Arc::new(FlatEval::from_weights(&weights));
+        for p in &positions {
+            for d in 1..=4u32 {
+                let mut solver = Solver::with_eval(Arc::clone(&eval));
+                assert_eq!(
+                    solver.heuristic_score(p, d),
+                    depth_limited_score(p, d, &weights, &features),
+                    "depth {d}, empties {}",
+                    p.empties()
+                );
+            }
+        }
+    }
+
+    /// `heuristic_score` must keep the symmetry-invariance fix: the four equivalent
+    /// opening moves score equally through the fast search too.
+    #[test]
+    fn heuristic_score_opening_moves_equal() {
+        use crate::{FlatEval, Solver};
+        use std::sync::Arc;
+
+        let features = Features::edax();
+        let mut weights = Weights::new(features.clone());
+        let mut s = 0x9E37_79B9u32;
+        let rnd = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            ((*s % 10_000) as f32) / 100.0 - 50.0
+        };
+        let mut pos = Position::initial();
+        for _ in 0..40 {
+            for sym in pos.symmetries() {
+                let e = sym.empties();
+                for (f, &p) in features.extract(&sym).iter().enumerate() {
+                    weights.set_weight(f, p, e, rnd(&mut s));
+                }
+            }
+            let moves = pos.get_moves();
+            if moves == 0 {
+                break;
+            }
+            pos = pos.do_move(moves.trailing_zeros());
+        }
+
+        let eval = Arc::new(FlatEval::from_weights(&weights));
+        let start = Position::initial();
+        let mut scores = Vec::new();
+        let mut remaining = start.get_moves();
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let mut solver = Solver::with_eval(Arc::clone(&eval));
+            scores.push(-solver.heuristic_score(&start.do_move(cell), 4));
+        }
+        assert_eq!(scores.len(), 4);
+        assert!(
+            scores.iter().all(|&s| s == scores[0]),
+            "opening moves diverged: {scores:?}"
+        );
+    }
+
     #[test]
     fn test_best_move_uses_exact_for_few_empties() {
         let mut player: u64 = 0;

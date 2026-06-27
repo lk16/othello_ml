@@ -469,6 +469,29 @@ impl Search {
         self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
     }
 
+    /// Heuristic depth-limited score for gameplay (GUI / self-play), the fast
+    /// counterpart of the bare negamax in `depth_limited_score`: an eval-seeded
+    /// ordered PVS to `depth` plies with the trained eval at the horizon. Reuses the
+    /// exact solver's [`Search::id_pass`] — `order_score` ordering, TT best-move
+    /// hints, alloc-free [`FlatEval`] leaves, and the exact handoff at `empties ≤
+    /// depth`. Requires an attached eval (`Solver::with_eval`); without one the
+    /// horizon eval is `0` and the result is meaningless.
+    ///
+    /// Iterative deepening seeds the TT with best-move hints from shallower passes
+    /// (sharper ordering, mirroring [`Search::solve_id`]); the final pass at `depth`
+    /// returns the value. In the clean midgame the value equals a plain depth-`depth`
+    /// negamax (PVS only reorders, it re-searches on fail-high) at far fewer nodes;
+    /// near the end it can differ slightly — a pass counts as a ply, the horizon eval
+    /// clamps to `[-63, 63]`, and `empties ≤ depth` hands off to the *exact* score.
+    pub(super) fn heuristic_search(&mut self, pos: &Position, depth: u32) -> i32 {
+        let mut d = 1;
+        while d < depth {
+            self.id_pass(pos, SCORE_MIN, SCORE_MAX, d);
+            d += 1;
+        }
+        self.id_pass(pos, SCORE_MIN, SCORE_MAX, depth)
+    }
+
     /// One heuristic iterative-deepening pass (PV node): PVS to a remaining `depth`
     /// plies, the trained eval at the horizon, recording a best-move hint per node
     /// into the TT (stamped `depth`). Move ordering reuses the production
