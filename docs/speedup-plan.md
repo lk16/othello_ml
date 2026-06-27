@@ -400,8 +400,29 @@ raw-leaf negamax (`heuristic_score_matches_raw_negamax`). Measured vs fix 1 on a
 depth 10 ~0.58 s. The from-scratch `FlatEval::set`/`eval_position` (per-leaf
 canonical) stays in place for the exact-solver ordering, bootstrap, and eval-check.
 
-Not yet done: incremental eval in the **exact** solver's ordering, and the Step-34
-shallow-search ordering bonus it unblocks.
+**Not yet done — incremental eval in the exact solver + the shallow-search ordering
+bonus.** Scoped but deliberately deferred; both are exact-solver/training
+optimizations (no GUI benefit) and must be A/B'd before keeping.
+
+- *Why no GUI benefit:* exact eval-ordering is gated to `empties ≥ EVAL_ORDER_MIN_
+  EMPTIES` (14). The GUI's exact calls are at `empties ≤ exact_empties` (12), below the
+  gate, so they never run eval-ordering. Incremental eval there only helps bulk/training
+  exact solves at `empties ≥ 14`, which run on the **parallel** solver.
+- *Item A — incremental eval in exact ordering.* Thread [`IncEval`] through
+  `search_exact`/`alphabeta_exact(_nws)` and `ordered_moves` (the eval-ordering term).
+  Lowers the *per-eval cost* at `empties ≥ 14` nodes; does **not** cut node count. Cheap
+  sequential probe = make `ordered_moves` take `Option<&IncEval>` (workers pass `None`,
+  parallel unchanged); the full win needs it through the YBWC split (`SplitCtx`,
+  `worker_loop_nws`, per-worker state) — the repo's highest-risk code. Watch that the
+  raw (non-canonical) ordering eval doesn't worsen `nodes/pos` vs the current
+  canonicalized `eval_position` ordering.
+- *Item B — shallow-search ordering bonus (Step 34 tier 2, the ~3.7× lever).* Depends on
+  Item A's incremental eval; adds the `sort_depth`/`min_depth_table` schedule +
+  `inc_sort_depth`, and **requires re-sweeping** the tuned ordering constants. The
+  largest potential exact-solve speedup, but ordering experiments here are routinely
+  built-measured-reverted — gate on the bench.
+- *Sequential baseline to beat* (eval-ordering on, `trained_weights.bin`, 3 playok
+  files): 16e 267.5k nodes/pos @ 33.4M n/s · 18e 1.17M @ 28.4M · 20e 4.35M @ 22.3M.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip
