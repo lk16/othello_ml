@@ -373,18 +373,35 @@ ply, the horizon clamps to `[-63,63]`, and `empties ≤ depth` hands off to the 
 score (strictly more accurate). Measured ~1.4× at depth 6, ~4.2× at depth 8 (the
 ordering win grows with depth). No retrain.
 
-**Fix 2 — PLANNED (incremental eval, Edax `eval_update`).** The leaf still recomputes
-all 46 features from scratch (`FlatEval::set`); Edax keeps the feature indices in the
-`Eval` struct and updates only the ~7 features containing the moved square on
-make/unmake (`eval_update`/`eval_restore` via `EVAL_X2F[x]`), then dot-products
-(`eval.c:782`). This is also prerequisite (a) of the Step-34 shallow-search ordering
-bonus. **Tension to resolve first:** incremental eval is incompatible with the
-per-leaf [`Position::canonical`] normalization that gives symmetry-invariant scores
-(the canonical orientation changes per node, scrambling the maintained indices).
-Edax doesn't canonicalize — its feature encoding is symmetric by construction. So
-Fix 2 needs either (i) a genuinely-symmetric feature encoding + retrain (the proper
-Edax-equivalent), or (ii) restricting canonicalization to the displayed root scores
-while interior leaves run raw. Decide before building.
+**Fix 2 — DONE (incremental eval, Edax `eval_update`).** [`IncEval`] keeps the 46
+feature indices and updates only the moved + flipped squares per move (`FlatEval::
+inc_child`, Edax's `EVAL_X2F` scatter), O(flips) instead of a from-scratch
+`FlatEval::set`. `Search::heuristic_search` builds the state once at the root
+(`inc_root`) and threads it down `id_pass_inc`/`id_pass_nws_inc` (the exact solver's
+`id_pass` is untouched).
+
+The tension is resolved without a retrain by combining two pieces:
+- **Fixed-perspective weights.** Edax's cheap update needs indices in a *fixed* global
+  encoding (digit 1 = the player to move at *even* empties), but our weights are
+  trained side-to-move per empties-bucket. So `FlatEval::weights_fixed` color-swaps the
+  **odd**-empties buckets once at construction (a per-shape digit permutation); the
+  fixed-encoding index then dot-products to the exact side-to-move score (proven
+  bit-exact by `inc_root_matches_raw` / `inc_chain_matches_from_scratch`). A pass keeps
+  empties parity but flips the mover, so the state is rebuilt (`inc_root`) on a pass.
+- **Root canonicalization.** Symmetry is kept not per-leaf but by canonicalizing the
+  search root (`Solver::heuristic_score`): symmetric roots share a canonical form →
+  identical tree → identical score. Leaves are evaluated raw (orientation relative to
+  the canonical root), which is what lets the incremental state flow.
+
+Value semantics therefore shift from fix 1 (per-leaf canonical → root-canonical raw
+leaves) — still symmetry-invariant, validated end-to-end against an independent
+raw-leaf negamax (`heuristic_score_matches_raw_negamax`). Measured vs fix 1 on a
+30-empty midgame: depth 6 ~0.041 → ~0.006 s (~7×), depth 8 ~0.29 → ~0.08 s (~3.5×);
+depth 10 ~0.58 s. The from-scratch `FlatEval::set`/`eval_position` (per-leaf
+canonical) stays in place for the exact-solver ordering, bootstrap, and eval-check.
+
+Not yet done: incremental eval in the **exact** solver's ordering, and the Step-34
+shallow-search ordering bonus it unblocks.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip

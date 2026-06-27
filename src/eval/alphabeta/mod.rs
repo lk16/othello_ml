@@ -105,9 +105,13 @@ impl Solver {
     /// slightly (see [`Search::heuristic_search`]). **Requires the solver to carry an
     /// eval** ([`Solver::with_eval`]; without one every leaf evaluates to `0`).
     pub fn heuristic_score(&mut self, pos: &Position, depth: u32) -> i32 {
+        // Canonicalize the root so the (per-node, non-canonical) incremental leaf
+        // evals still yield a symmetry-invariant score: symmetric roots share a
+        // canonical form, hence the same search tree and the same value.
+        let pos = pos.canonical();
         self.search.nodes = 0;
-        self.search.parity = board_parity(pos);
-        self.search.heuristic_search(pos, depth)
+        self.search.parity = board_parity(&pos);
+        self.search.heuristic_search(&pos, depth)
     }
 
     /// Exact score plus the number of search nodes visited for this position.

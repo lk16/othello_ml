@@ -8,7 +8,7 @@ use super::parallel::{CancelNode, ParCtx};
 use super::stability::{edge_stability_table, get_stability, STABILITY_THRESHOLD};
 use super::tt::{SharedTt, TtBackend, ETC_MIN_EMPTIES, NO_MOVE, TT_MIN_EMPTIES, TT_SIZE};
 use super::{SCORE_MAX, SCORE_MIN};
-use crate::eval::pattern::FlatEval;
+use crate::eval::pattern::{FlatEval, IncEval};
 use crate::othello::position::Position;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -149,6 +149,16 @@ const ITERATIVE_MIN_EMPTIES: u32 = 10;
 /// an exact one of the same size, so splitting pays sooner. Parallel-path only —
 /// the sequential `id_pass_nws` never splits (`self.par.is_none()`).
 const ID_SPLIT_MIN_DEPTH: u32 = 5;
+
+/// Round a raw pattern-eval score to an integer in the non-terminal range
+/// `[SCORE_MIN + 1, SCORE_MAX - 1]` (the horizon / ordering eval domain). Shared by
+/// the incremental heuristic search; mirrors [`Search::eval_clamped`].
+#[inline]
+fn clamp_eval(score: f32) -> i32 {
+    score
+        .round()
+        .clamp((SCORE_MIN + 1) as f32, (SCORE_MAX - 1) as f32) as i32
+}
 
 /// Quick corner-anchored stability count for `p`: held corners plus their edge
 /// neighbours anchored by a held corner. Edax `get_corner_stability` — a cheap
@@ -484,12 +494,186 @@ impl Search {
     /// near the end it can differ slightly — a pass counts as a ply, the horizon eval
     /// clamps to `[-63, 63]`, and `empties ≤ depth` hands off to the *exact* score.
     pub(super) fn heuristic_search(&mut self, pos: &Position, depth: u32) -> i32 {
+        // Incremental eval (Step 35 fix 2): maintain the feature indices down the tree
+        // (Edax `eval_update`) instead of a from-scratch scan per node. Requires the
+        // eval; the caller (`Solver::heuristic_score`) also canonicalizes `pos` so the
+        // score stays symmetry-invariant despite per-node (non-canonical) leaf evals.
+        let Some(ev) = self.eval.clone() else {
+            return 0;
+        };
+        let root = ev.inc_root(pos);
         let mut d = 1;
         while d < depth {
-            self.id_pass(pos, SCORE_MIN, SCORE_MAX, d);
+            self.id_pass_inc(&ev, pos, &root, SCORE_MIN, SCORE_MAX, d);
             d += 1;
         }
-        self.id_pass(pos, SCORE_MIN, SCORE_MAX, depth)
+        self.id_pass_inc(&ev, pos, &root, SCORE_MIN, SCORE_MAX, depth)
+    }
+
+    /// Incremental-eval PV node: [`Search::id_pass`] threading an [`IncEval`] so the
+    /// horizon eval and the ordering term come from O(flips) updates rather than a
+    /// from-scratch scan. `ev`/`inc` are the eval and the current node's state. Used
+    /// only by the sequential [`Search::heuristic_search`]; the exact solver's seeding
+    /// keeps the from-scratch [`Search::id_pass`].
+    fn id_pass_inc(
+        &mut self,
+        ev: &FlatEval,
+        pos: &Position,
+        inc: &IncEval,
+        mut alpha: i32,
+        beta: i32,
+        depth: u32,
+    ) -> i32 {
+        let empties = pos.empties();
+        if empties <= depth {
+            return self.search_exact(pos, alpha, beta, empties);
+        }
+        self.nodes += 1;
+        if depth == 0 {
+            return clamp_eval(ev.inc_score(inc));
+        }
+
+        let hash_move = self.tt_probe(pos).map_or(NO_MOVE, |e| e.best_move);
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            // A pass keeps empties (and its parity), so the fixed encoding's mover
+            // flips with no disc change: rebuild rather than `inc_child`.
+            let passed_inc = ev.inc_root(&passed);
+            return -self.id_pass_inc(ev, &passed, &passed_inc, -beta, -alpha, depth - 1);
+        }
+
+        let move_list = self.id_ordered_moves_inc(ev, pos, inc, moves, empties, hash_move);
+
+        let mut best_cell = NO_MOVE;
+        let mut first = true;
+        for &(_, cell, ref child) in move_list.as_slice() {
+            let child_inc = ev.inc_child(inc, cell, pos.flipped(cell));
+            self.parity ^= QUADRANT_ID[cell as usize];
+            let score = if first {
+                -self.id_pass_inc(ev, child, &child_inc, -beta, -alpha, depth - 1)
+            } else {
+                let probe = -self.id_pass_nws_inc(ev, child, &child_inc, -alpha - 1, depth - 1);
+                if probe > alpha && probe < beta {
+                    -self.id_pass_inc(ev, child, &child_inc, -beta, -alpha, depth - 1)
+                } else {
+                    probe
+                }
+            };
+            self.parity ^= QUADRANT_ID[cell as usize];
+            first = false;
+            if score > alpha {
+                alpha = score;
+                best_cell = cell as u8;
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+
+        self.id_store_hint(pos, best_cell, depth);
+        alpha
+    }
+
+    /// Null-window counterpart of [`Search::id_pass_inc`] (sequential only — the
+    /// heuristic search never splits). Mirrors [`Search::id_pass_nws`] without the
+    /// parallel fan-out, threading the [`IncEval`].
+    fn id_pass_nws_inc(
+        &mut self,
+        ev: &FlatEval,
+        pos: &Position,
+        inc: &IncEval,
+        alpha: i32,
+        depth: u32,
+    ) -> i32 {
+        let empties = pos.empties();
+        if empties <= depth {
+            return self.search_exact_nws(pos, alpha, empties);
+        }
+        self.nodes += 1;
+        let beta = alpha + 1;
+        if depth == 0 {
+            return clamp_eval(ev.inc_score(inc));
+        }
+
+        let hash_move = self.tt_probe(pos).map_or(NO_MOVE, |e| e.best_move);
+
+        let moves = pos.get_moves();
+        if moves == 0 {
+            let passed = pos.pass_move();
+            if passed.get_moves() == 0 {
+                return pos.final_score();
+            }
+            let passed_inc = ev.inc_root(&passed);
+            return -self.id_pass_nws_inc(ev, &passed, &passed_inc, -beta, depth - 1);
+        }
+
+        let move_list = self.id_ordered_moves_inc(ev, pos, inc, moves, empties, hash_move);
+
+        let mut best = alpha;
+        let mut best_cell = NO_MOVE;
+        for &(_, cell, ref child) in move_list.as_slice() {
+            let child_inc = ev.inc_child(inc, cell, pos.flipped(cell));
+            self.parity ^= QUADRANT_ID[cell as usize];
+            let score = -self.id_pass_nws_inc(ev, child, &child_inc, -beta, depth - 1);
+            self.parity ^= QUADRANT_ID[cell as usize];
+            if score > best {
+                best = score;
+                best_cell = cell as u8;
+                break; // null window: first improvement over alpha is a fail-high
+            }
+        }
+
+        self.id_store_hint(pos, best_cell, depth);
+        best
+    }
+
+    /// Build the incremental-eval ordered move list (hash move promoted), mirroring
+    /// [`Search::id_ordered_moves`] but scoring the eval term off the [`IncEval`].
+    #[inline]
+    fn id_ordered_moves_inc(
+        &self,
+        ev: &FlatEval,
+        pos: &Position,
+        inc: &IncEval,
+        moves: u64,
+        empties: u32,
+        hash_move: u8,
+    ) -> MoveBuf {
+        let parity = self.parity;
+        let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
+        let use_eval = empties >= EVAL_ORDER_MIN_EMPTIES;
+        let mut buf = MoveBuf::new();
+        let mut remaining = moves;
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = pos.do_move(cell);
+            let mut score = order_score(&child, cell, parity, parity_weight);
+            if use_eval {
+                // `child` is opponent-to-move: low child eval is good for us
+                // (mirrors `Search::ordered_moves`).
+                let child_inc = ev.inc_child(inc, cell, pos.flipped(cell));
+                score += (SCORE_MAX - clamp_eval(ev.inc_score(&child_inc))) * W_EVAL;
+            }
+            buf.push((score, cell, child));
+        }
+        buf.as_mut_slice()
+            .sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
+        if hash_move != NO_MOVE {
+            if let Some(i) = buf
+                .as_slice()
+                .iter()
+                .position(|&(_, c, _)| c as u8 == hash_move)
+            {
+                buf.as_mut_slice()[..=i].rotate_right(1);
+            }
+        }
+        buf
     }
 
     /// One heuristic iterative-deepening pass (PV node): PVS to a remaining `depth`
