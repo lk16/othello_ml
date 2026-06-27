@@ -1,8 +1,9 @@
 use othello_eval::{
-    best_move, bootstrap_score, build_examples, load_games, run_gui, train_least_squares, Board,
-    CgConfig, Features, FlatEval, GuiArgs, GuiMode, ParallelSolver, Position, Solver,
-    TrainingExample, Weights,
+    best_move, bootstrap_score, build_examples, generate_examples, load_games, run_gui,
+    train_least_squares, Board, CgConfig, Features, FlatEval, GuiArgs, GuiMode, ParallelSolver,
+    Position, SelfPlayConfig, Solver, TrainingExample, Weights,
 };
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 enum Command {
     Train(TrainArgs),
     TrainBoot(TrainBootArgs),
+    TrainSelfPlay(SelfPlayArgs),
     Play(PlayArgs),
     Gui(GuiArgs),
     Bench(BenchArgs),
@@ -53,6 +55,39 @@ struct TrainBootArgs {
     threads: usize,
     paths: Vec<String>,
     // CG least-squares knobs (see `CgConfig`); each band is fit with CG.
+    cg_iters: usize,
+    ridge: f64,
+    min_count: u32,
+}
+
+/// Args for `train-selfplay`: an open-ended self-play training loop. Each iteration
+/// the current eval plays `games` games against itself, TD(λ)-labels the visited
+/// positions, pushes them into a fixed-size FIFO replay buffer, refits the affected
+/// empties buckets by CG, and saves. Runs until `--iters` (if set) or Ctrl+C.
+struct SelfPlayArgs {
+    /// Exact-trained frontier N: trusted at empties ≤ N (anchor, never retrained).
+    exact_empties: u32,
+    /// Highest empties bucket to train.
+    max_empties: u32,
+    /// Heuristic search depth for self-play moves and bootstrap estimates.
+    depth: u32,
+    /// TD(λ) blend (0 = one-ply bootstrap, 1 = pure terminal outcome).
+    lambda: f64,
+    /// Opening plies played at random, to diversify games.
+    random_plies: u32,
+    /// Self-play games generated per iteration.
+    games: usize,
+    /// FIFO replay-buffer capacity, in examples (positions).
+    buffer: usize,
+    /// Save the weights every K iterations.
+    save_every: usize,
+    /// Optional cap on iterations; `None` = run until Ctrl+C.
+    iters: Option<usize>,
+    /// Weights file: must already be exact-trained; overwritten on save.
+    weights_file: String,
+    /// Threads for self-play generation and the per-bucket CG fit.
+    threads: usize,
+    // CG least-squares knobs (see `CgConfig`).
     cg_iters: usize,
     ridge: f64,
     min_count: u32,
@@ -107,6 +142,7 @@ fn parse_args() -> Option<Command> {
         // `train` is kept as an alias for `train-exact` (the original behaviour).
         "train" | "train-exact" => parse_train_args(&args[0], &args[2..]),
         "train-boot" => parse_train_boot_args(&args[0], &args[2..]),
+        "train-selfplay" => parse_selfplay_args(&args[0], &args[2..]),
         "play" => parse_play_args(&args[0], &args[2..]),
         "gui" => parse_gui_args(&args[0], &args[2..]),
         "bench" => parse_bench_args(&args[0], &args[2..]),
@@ -261,6 +297,139 @@ fn parse_train_boot_args(program: &str, args: &[String]) -> Option<Command> {
         weights_file,
         threads,
         paths,
+        cg_iters,
+        ridge,
+        min_count,
+    }))
+}
+
+fn parse_selfplay_args(program: &str, args: &[String]) -> Option<Command> {
+    let mut exact_empties: u32 = 16;
+    let mut max_empties: u32 = 60;
+    let mut depth: u32 = 4;
+    let mut lambda: f64 = 0.7;
+    let mut random_plies: u32 = 8;
+    let mut games: usize = 1000;
+    let mut buffer: usize = 2_000_000;
+    let mut save_every: usize = 1;
+    let mut iters: Option<usize> = None;
+    let mut weights_file: String = String::from("trained_weights.bin");
+    let mut threads: usize = 1;
+    let mut cg_iters: usize = 200;
+    let mut ridge: f64 = 1e-3;
+    let mut min_count: u32 = 3;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--exact-empties" => {
+                i += 1;
+                if i < args.len() {
+                    exact_empties = args[i].parse::<u32>().unwrap_or(16);
+                }
+            }
+            "--max-empties" | "-n" => {
+                i += 1;
+                if i < args.len() {
+                    max_empties = args[i].parse::<u32>().unwrap_or(60);
+                }
+            }
+            "--depth" => {
+                i += 1;
+                if i < args.len() {
+                    depth = args[i].parse::<u32>().unwrap_or(4);
+                }
+            }
+            "--lambda" => {
+                i += 1;
+                if i < args.len() {
+                    lambda = args[i].parse::<f64>().unwrap_or(0.7).clamp(0.0, 1.0);
+                }
+            }
+            "--random-plies" => {
+                i += 1;
+                if i < args.len() {
+                    random_plies = args[i].parse::<u32>().unwrap_or(8);
+                }
+            }
+            "--games" => {
+                i += 1;
+                if i < args.len() {
+                    games = args[i].parse::<usize>().unwrap_or(1000).max(1);
+                }
+            }
+            "--buffer" => {
+                i += 1;
+                if i < args.len() {
+                    buffer = args[i].parse::<usize>().unwrap_or(2_000_000).max(1);
+                }
+            }
+            "--save-every" => {
+                i += 1;
+                if i < args.len() {
+                    save_every = args[i].parse::<usize>().unwrap_or(1).max(1);
+                }
+            }
+            "--iters" => {
+                i += 1;
+                if i < args.len() {
+                    iters = args[i].parse::<usize>().ok().filter(|&n| n > 0);
+                }
+            }
+            "--weights" | "-w" => {
+                i += 1;
+                if i < args.len() {
+                    weights_file = args[i].clone();
+                }
+            }
+            "--threads" | "-t" => {
+                i += 1;
+                if i < args.len() {
+                    threads = args[i].parse::<usize>().unwrap_or(1).max(1);
+                }
+            }
+            "--cg-iters" => {
+                i += 1;
+                if i < args.len() {
+                    cg_iters = args[i].parse::<usize>().unwrap_or(200).max(1);
+                }
+            }
+            "--ridge" => {
+                i += 1;
+                if i < args.len() {
+                    ridge = args[i].parse::<f64>().unwrap_or(1e-3).max(0.0);
+                }
+            }
+            "--min-count" => {
+                i += 1;
+                if i < args.len() {
+                    min_count = args[i].parse::<u32>().unwrap_or(3);
+                }
+            }
+            "--help" | "-h" => {
+                print_selfplay_usage(program);
+                return None;
+            }
+            other => {
+                eprintln!("Unknown option for train-selfplay: {other}\n");
+                print_selfplay_usage(program);
+                return None;
+            }
+        }
+        i += 1;
+    }
+
+    Some(Command::TrainSelfPlay(SelfPlayArgs {
+        exact_empties,
+        max_empties,
+        depth,
+        lambda,
+        random_plies,
+        games,
+        buffer,
+        save_every,
+        iters,
+        weights_file,
+        threads,
         cg_iters,
         ridge,
         min_count,
@@ -529,6 +698,7 @@ fn main() {
     match cmd {
         Command::Train(args) => run_train(args),
         Command::TrainBoot(args) => run_train_boot(args),
+        Command::TrainSelfPlay(args) => run_selfplay(args),
         Command::Play(args) => run_play(args),
         Command::Gui(args) => run_gui(args),
         Command::Bench(args) => run_bench(args),
@@ -765,6 +935,173 @@ fn run_train_boot(args: TrainBootArgs) {
     }
 
     eprintln!("\nDone (trained up to empties {frontier}).");
+}
+
+/// Open-ended self-play training (`train-selfplay`). Each iteration: the current
+/// eval plays `games` games against itself, the visited positions are TD(λ)-labelled
+/// and pushed into a fixed-size FIFO replay buffer, the affected empties buckets are
+/// refit by CG, and the weights are saved. Runs until `--iters` or Ctrl+C; on
+/// interrupt it finishes the current iteration (fit + save) and exits cleanly.
+fn run_selfplay(args: SelfPlayArgs) {
+    eprintln!("=== Othello ML Self-Play Training ===");
+    eprintln!("Exact frontier N : {}", args.exact_empties);
+    eprintln!("Train up to      : {} empties", args.max_empties);
+    eprintln!("Search depth     : {}", args.depth);
+    eprintln!("TD(lambda)       : {}", args.lambda);
+    eprintln!("Random plies     : {}", args.random_plies);
+    eprintln!("Games / iter     : {}", args.games);
+    eprintln!("Replay buffer    : {} examples", args.buffer);
+    eprintln!("Threads          : {}", args.threads);
+    eprintln!("Weights file     : {}", args.weights_file);
+    match args.iters {
+        Some(n) => eprintln!("Iterations       : {n}"),
+        None => eprintln!("Iterations       : unlimited (Ctrl+C to stop)"),
+    }
+
+    if args.depth == 0 {
+        eprintln!("Error: --depth must be >= 1.");
+        return;
+    }
+    if args.exact_empties >= args.max_empties {
+        eprintln!("Error: --exact-empties must be < --max-empties.");
+        return;
+    }
+
+    // The starting eval must already be exact-trained; self-play off a zero table
+    // produces meaningless games, so require the file to load (like `train-boot`).
+    let mut weights = match Weights::load(&args.weights_file) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "Error: could not load weights from {} ({e}).\n\
+                 train-selfplay needs an exact-trained eval to start from — run `train-exact` first.",
+                args.weights_file
+            );
+            return;
+        }
+    };
+    let features = weights.features().clone();
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        if let Err(e) = ctrlc::set_handler(move || {
+            eprintln!(
+                "\nInterrupt received — finishing current iteration (fit + save), then stopping..."
+            );
+            interrupted.store(true, Ordering::Relaxed);
+        }) {
+            eprintln!("Warning: Failed to set Ctrl+C handler: {e}");
+        }
+    }
+
+    let cg_config = CgConfig {
+        max_iter: args.cg_iters,
+        ridge: args.ridge,
+        min_count: args.min_count,
+        threads: args.threads,
+        ..CgConfig::default()
+    };
+    let sp_config = SelfPlayConfig {
+        depth: args.depth,
+        exact_empties: args.exact_empties,
+        max_empties: args.max_empties,
+        lambda: args.lambda,
+        random_plies: args.random_plies,
+        threads: args.threads,
+    };
+
+    // Fixed-size FIFO replay buffer: newest examples pushed, oldest evicted.
+    let mut buffer: VecDeque<TrainingExample> = VecDeque::with_capacity(args.buffer);
+    let base_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x1234_5678);
+
+    let mut iter = 0usize;
+    loop {
+        if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(max) = args.iters {
+            if iter >= max {
+                break;
+            }
+        }
+        iter += 1;
+        eprintln!("\n--- Iteration {iter} ---");
+
+        // Generate this iteration's games, with a 1 Hz live progress line.
+        let progress = Arc::new(AtomicUsize::new(0));
+        let iter_seed = base_seed ^ (iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let t = Instant::now();
+        let produced = std::thread::scope(|s| {
+            let gen_done = Arc::new(AtomicBool::new(false));
+            {
+                let progress = Arc::clone(&progress);
+                let gen_done = Arc::clone(&gen_done);
+                let total = args.games;
+                s.spawn(move || loop {
+                    let d = progress.load(Ordering::Relaxed);
+                    print_progress("self-play games", d, total, t);
+                    if gen_done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1000));
+                });
+            }
+            let ex = generate_examples(
+                &weights,
+                &features,
+                &sp_config,
+                args.games,
+                iter_seed,
+                &progress,
+                &interrupted,
+            );
+            gen_done.store(true, Ordering::Relaxed);
+            ex
+        });
+        let games_done = progress.load(Ordering::Relaxed);
+        print_progress("self-play games", games_done, args.games, t);
+        eprintln!(); // finish the progress line
+        eprintln!(
+            "Generated {} examples from {} games in {:.1}s",
+            produced.len(),
+            games_done,
+            t.elapsed().as_secs_f64()
+        );
+
+        if produced.is_empty() {
+            eprintln!("No examples produced; stopping.");
+            break;
+        }
+
+        // Push into the FIFO buffer, evicting the oldest beyond capacity.
+        for ex in produced {
+            buffer.push_back(ex);
+        }
+        while buffer.len() > args.buffer {
+            buffer.pop_front();
+        }
+        eprintln!("Replay buffer: {} / {} examples", buffer.len(), args.buffer);
+
+        // Refit on the whole buffer (contiguous slice for the CG compiler).
+        train_least_squares(&mut weights, buffer.make_contiguous(), &cg_config);
+
+        if iter % args.save_every == 0 || interrupted.load(Ordering::Relaxed) {
+            match weights.save(&args.weights_file) {
+                Ok(()) => eprintln!("Saved weights after iteration {iter}"),
+                Err(e) => eprintln!("Error saving weights: {e}"),
+            }
+        }
+    }
+
+    // Always save the latest weights on exit (in case the last save was skipped).
+    match weights.save(&args.weights_file) {
+        Ok(()) => eprintln!("\nDone ({iter} iterations). Saved {}.", args.weights_file),
+        Err(e) => eprintln!("\nDone ({iter} iterations). Error saving weights: {e}"),
+    }
 }
 
 /// Label a band of positions by bootstrapped shallow search, parallelised across
@@ -1251,6 +1588,9 @@ fn print_usage(program: &str) {
     eprintln!(
         "  train-boot   Extend the eval to empties > N via bootstrapped shallow-search labels"
     );
+    eprintln!(
+        "  train-selfplay  Open-ended self-play training (TD(lambda) + replay buffer, Ctrl+C to stop)"
+    );
     eprintln!("  play     Play a game against the CLI");
     eprintln!("  gui      Graphical board: game / evaluate / pgn modes");
     eprintln!("  bench    Benchmark exact alpha-beta search speed");
@@ -1337,6 +1677,47 @@ fn print_train_boot_usage(program: &str) {
     eprintln!("  {program} train-boot -w ignored/trained_weights.bin training_data/");
     eprintln!(
         "  {program} train-boot --exact-empties 16 -n 28 --depth 4 -t 8 -w w.bin training_data/"
+    );
+}
+
+fn print_selfplay_usage(program: &str) {
+    eprintln!("Usage: {program} train-selfplay [OPTIONS]");
+    eprintln!();
+    eprintln!("Open-ended self-play training. Each iteration the current eval plays games");
+    eprintln!("against itself, the visited positions are TD(lambda)-labelled against the exact");
+    eprintln!("terminal score, pushed into a fixed-size FIFO replay buffer, and the affected");
+    eprintln!("empties buckets are refit by CG. Runs until --iters or Ctrl+C (which finishes");
+    eprintln!("the current iteration, saves, then exits). Needs no input files.");
+    eprintln!();
+    eprintln!("Requires an already exact-trained weights file (run `train-exact` first).");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!(
+        "      --exact-empties N Trusted frontier; <= N kept exact and not retrained (default: 16)"
+    );
+    eprintln!("  -n, --max-empties N   Highest empties bucket to train (default: 60)");
+    eprintln!("      --depth N         Heuristic search depth for moves + bootstrap (default: 4)");
+    eprintln!(
+        "      --lambda F        TD(lambda) blend, 0=one-ply .. 1=terminal outcome (default: 0.7)"
+    );
+    eprintln!("      --random-plies N  Random opening plies for game diversity (default: 8)");
+    eprintln!("      --games N         Self-play games per iteration (default: 1000)");
+    eprintln!("      --buffer N        Replay-buffer capacity in examples (default: 2000000)");
+    eprintln!("      --save-every N    Save weights every N iterations (default: 1)");
+    eprintln!("      --iters N         Stop after N iterations (default: unlimited)");
+    eprintln!("  -w, --weights PATH    Weights file: loaded and overwritten (default: trained_weights.bin)");
+    eprintln!("  -t, --threads N       Threads for self-play and the CG fit (default: 1)");
+    eprintln!("      --cg-iters N      Max CG iterations per bucket (default: 200)");
+    eprintln!(
+        "      --ridge F         CG ridge coeff, per-example/scale-invariant (default: 0.001)"
+    );
+    eprintln!("      --min-count N     CG: freeze configs seen < N times (default: 3)");
+    eprintln!("  -h, --help            Show this help message");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  {program} train-selfplay -w ignored/trained_weights.bin -t 8");
+    eprintln!(
+        "  {program} train-selfplay --exact-empties 16 -n 40 --depth 4 --lambda 0.7 -t 8 -w w.bin"
     );
 }
 
