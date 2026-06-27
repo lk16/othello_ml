@@ -75,6 +75,23 @@ impl Position {
         })
     }
 
+    /// The canonical representative of this position's 8-fold symmetry orbit: the
+    /// lexicographically smallest `(player, opponent)` image under the dihedral
+    /// group. Symmetric positions share a canonical form, so evaluating the
+    /// canonical form makes any per-position scoring symmetry-invariant.
+    ///
+    /// The learned pattern eval ([`Weights::evaluate`](crate::Weights::evaluate))
+    /// is *not* invariant on its own — the Edax feature set lists each line/diagonal
+    /// in a single cell order, so a position and its mirror produce different trinary
+    /// pattern indices (the line read backwards). Normalizing through `canonical`
+    /// restores the symmetry the weight-tying alone does not give.
+    pub fn canonical(&self) -> Position {
+        self.symmetries()
+            .into_iter()
+            .min_by_key(|p| (p.player, p.opponent))
+            .unwrap_or(*self)
+    }
+
     /// Bitboard of all opponent discs that would be flipped by playing at `mv`.
     ///
     /// Returns 0 if `mv` is occupied or would not flip any discs.

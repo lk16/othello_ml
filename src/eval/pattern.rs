@@ -104,11 +104,17 @@ impl FlatEval {
 
     /// Fill `out[0..n_features]` with this position's feature-pattern indices.
     ///
+    /// The position is normalized to its symmetry [`canonical`](Position::canonical)
+    /// form first, so the resulting score is invariant across all 8 board symmetries
+    /// — matching [`Weights::evaluate`], which does the same. (The learned eval is not
+    /// symmetry-invariant otherwise; see [`Position::canonical`].)
+    ///
     /// Alloc-free. `out` must have length `>= n_features`. The index of feature
     /// `f` is `sum_c value(cell_c) * 3^c`, with `value` = 0 empty / 1 player /
     /// 2 opponent — identical to `Feature::extract_index`.
     #[inline]
     pub fn set(&self, pos: &Position, out: &mut [u16]) {
+        let pos = &pos.canonical();
         for (f, feature_cells) in self.cells.iter().enumerate() {
             let mut idx = 0u16;
             let mut pow = 1u16;
@@ -229,6 +235,42 @@ mod tests {
                 "mismatch at empties={}: flat={got} weights={expected}",
                 pos.empties()
             );
+        }
+    }
+
+    /// Regression: `FlatEval` must score all 8 board symmetries identically, the
+    /// same way [`Weights::evaluate`] does (both normalize to the canonical form).
+    /// Mirrors `weights::tests::evaluate_is_symmetry_invariant`; guards the GUI bug
+    /// where the 4 equivalent opening moves scored 2,1,1,1.
+    #[test]
+    fn flat_eval_is_symmetry_invariant() {
+        let features = Features::edax();
+        let mut weights = Weights::new(features.clone());
+
+        // Distinct nonzero weights on every slot touched by the samples and their
+        // symmetries, so a non-normalized eval would diverge across orientations.
+        let mut state = 0x9E37_79B9u32;
+        let positions = sample_positions();
+        for pos in &positions {
+            for sym in pos.symmetries() {
+                let empties = sym.empties();
+                for (f, &p) in features.extract(&sym).iter().enumerate() {
+                    weights.set_weight(f, p, empties, rnd(&mut state));
+                }
+            }
+        }
+
+        let flat = FlatEval::from_weights(&weights);
+        for pos in &positions {
+            let base = flat.eval_position(pos);
+            for (k, sym) in pos.symmetries().iter().enumerate() {
+                assert_eq!(
+                    flat.eval_position(sym).to_bits(),
+                    base.to_bits(),
+                    "symmetry {k} differs at empties {}",
+                    pos.empties()
+                );
+            }
         }
     }
 

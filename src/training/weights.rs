@@ -69,8 +69,15 @@ impl Weights {
         empty_range_index(empties)
     }
 
-    /// Evaluate a board position by summing contributions from all features
+    /// Evaluate a board position by summing contributions from all features.
+    ///
+    /// The position is first normalized to its symmetry [`canonical`] form so that
+    /// the score is identical for all 8 board symmetries. Without this the learned
+    /// eval is *not* symmetry-invariant (the feature set lists each line in one cell
+    /// order, so mirrored positions index reversed patterns); see
+    /// [`Position::canonical`](crate::othello::position::Position::canonical).
     pub fn evaluate(&self, board: &crate::othello::position::Position, features: &Features) -> f32 {
+        let board = &board.canonical();
         let empties = board.empties();
         let range_idx = self.empty_range_index(empties);
         let feature_indices = features.extract(board);
@@ -419,6 +426,84 @@ mod tests {
         // A feature in a different shape is untouched.
         let other = (0..map.len()).find(|&f| map[f] != map[0]).unwrap();
         assert_eq!(w.get_weight(other, 7, 30), 0.0);
+    }
+
+    /// A spread of positions via random legal play from the start.
+    fn sample_positions() -> Vec<crate::othello::position::Position> {
+        use crate::othello::position::Position;
+        let mut positions = vec![Position::initial()];
+        let mut pos = Position::initial();
+        let mut s = 0x1234_5678u32;
+        for _ in 0..60 {
+            let moves = pos.get_moves();
+            if moves == 0 {
+                pos = pos.pass_move();
+                if pos.get_moves() == 0 {
+                    break;
+                }
+                continue;
+            }
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let mut pick = s % moves.count_ones();
+            let mut m = moves;
+            let cell = loop {
+                let c = m.trailing_zeros();
+                m &= m - 1;
+                if pick == 0 {
+                    break c;
+                }
+                pick -= 1;
+            };
+            pos = pos.do_move(cell);
+            positions.push(pos);
+        }
+        positions
+    }
+
+    /// Regression: the learned eval must be identical for all 8 board symmetries.
+    /// The Edax feature set is *not* symmetry-invariant on its own (each line is
+    /// listed in one cell order, so a mirror indexes the reversed pattern), so
+    /// `evaluate` normalizes to the canonical form first. If that normalization is
+    /// dropped, the random per-slot weights below make the 8 orientations diverge —
+    /// which is exactly the GUI bug where the 4 equivalent opening moves scored 2,1,1,1.
+    #[test]
+    fn evaluate_is_symmetry_invariant() {
+        let features = Features::edax();
+        let mut weights = Weights::new(features.clone());
+
+        // Fill every slot touched by the sample positions *and their symmetries*
+        // with a distinct nonzero weight, so a non-normalized eval would differ
+        // across orientations.
+        let mut s = 0x9E37_79B9u32;
+        let rnd = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            ((*s % 10_000) as f32) / 100.0 - 50.0
+        };
+        let samples = sample_positions();
+        for pos in &samples {
+            for sym in pos.symmetries() {
+                let empties = sym.empties();
+                for (f, &p) in features.extract(&sym).iter().enumerate() {
+                    weights.set_weight(f, p, empties, rnd(&mut s));
+                }
+            }
+        }
+
+        for pos in &samples {
+            let base = weights.evaluate(pos, &features);
+            for (k, sym) in pos.symmetries().iter().enumerate() {
+                assert_eq!(
+                    weights.evaluate(sym, &features).to_bits(),
+                    base.to_bits(),
+                    "symmetry {k} differs at empties {}",
+                    pos.empties()
+                );
+            }
+        }
     }
 
     #[test]

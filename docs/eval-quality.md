@@ -163,9 +163,19 @@ Two mechanisms tried, same regularization effect:
   examples, 419 s.
 - **Weight tying** (`Weights` stores one shared table per symmetry shape — 12 vs 46;
   Edax mirror-packing): 500f held-out **8.13** (≈ augmentation) at **56 s — ~7×
-  cheaper**, smaller model, exact symmetry. **This is the committed approach**
-  (augmentation removed). `--threads` now only parallelizes missing-label solving;
-  weight training is always sequential.
+  cheaper**, smaller model. **This is the committed approach** (augmentation
+  removed). `--threads` now only parallelizes missing-label solving; weight
+  training is always sequential.
+
+Tying makes the *same physical pattern* share weights across orientations (the
+training win), but it does **not** make the *eval output* symmetry-invariant: the
+Edax feature set lists each line/diagonal in a single cell order, so a position and
+its mirror produce different trinary indices (the line read backwards) and score
+differently. `evaluate`/`FlatEval` therefore normalize the position to its
+[`Position::canonical`] symmetry form first, giving exact-symmetry scores. (Bug
+caught in the GUI: the 4 equivalent opening moves scored 2,1,1,1; regression tests
+`evaluate_is_symmetry_invariant`, `flat_eval_is_symmetry_invariant`,
+`opening_moves_score_equally`.)
 
 More data on top of tying: 1000 files (4.5M ≤16e) → held-out **7.86**, in-sample
 **6.32**. (The base's "6.04" is *not* a clean baseline — it was trained on the whole

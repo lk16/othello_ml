@@ -225,6 +225,59 @@ mod tests {
         );
     }
 
+    /// Regression for the GUI `evaluate` bug: the four opening moves are board
+    /// symmetries of one another, so a depth-limited search must score them
+    /// identically. They previously showed 2,1,1,1 because the learned eval was not
+    /// symmetry-invariant (fixed by normalizing to the canonical form in `evaluate`).
+    #[test]
+    fn opening_moves_score_equally() {
+        let features = Features::edax();
+        let mut weights = Weights::new(features.clone());
+
+        // Non-trivial, position-dependent weights, filled over the symmetries of a
+        // random game so a non-normalized eval would make the four moves diverge.
+        let mut s = 0x9E37_79B9u32;
+        let rnd = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            ((*s % 10_000) as f32) / 100.0 - 50.0
+        };
+        let mut pos = Position::initial();
+        for _ in 0..50 {
+            for sym in pos.symmetries() {
+                let empties = sym.empties();
+                for (f, &p) in features.extract(&sym).iter().enumerate() {
+                    weights.set_weight(f, p, empties, rnd(&mut s));
+                }
+            }
+            let moves = pos.get_moves();
+            if moves == 0 {
+                pos = pos.pass_move();
+                if pos.get_moves() == 0 {
+                    break;
+                }
+                continue;
+            }
+            pos = pos.do_move(moves.trailing_zeros());
+        }
+
+        let start = Position::initial();
+        let mut scores = Vec::new();
+        let mut remaining = start.get_moves();
+        while remaining != 0 {
+            let cell = remaining.trailing_zeros();
+            remaining &= remaining - 1;
+            let child = start.do_move(cell);
+            scores.push(-depth_limited_score(&child, 4, &weights, &features));
+        }
+        assert_eq!(scores.len(), 4);
+        assert!(
+            scores.iter().all(|&s| s == scores[0]),
+            "opening moves scored differently: {scores:?}"
+        );
+    }
+
     #[test]
     fn test_best_move_uses_exact_for_few_empties() {
         let mut player: u64 = 0;
