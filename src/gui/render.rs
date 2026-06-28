@@ -116,6 +116,27 @@ pub fn render(board: &Board, ui: &UiDetails, font: Option<&Font>) {
     }
 
     draw_graph(ui, font);
+
+    if let Some(text) = &ui.banner {
+        draw_banner(text, font);
+    }
+}
+
+/// A centred overlay message on a translucent backdrop, drawn over the board
+/// (used for `play`'s game-over result).
+fn draw_banner(text: &str, font: Option<&Font>) {
+    let size: u16 = 34;
+    let dim = measure_text(text, font, size, 1.0);
+    let (cx, cy) = (BOARD_PX / 2.0, BOARD_PX / 2.0);
+    let pad = 18.0;
+    draw_rectangle(
+        cx - dim.width / 2.0 - pad,
+        cy - dim.height / 2.0 - pad,
+        dim.width + 2.0 * pad,
+        dim.height + 2.0 * pad,
+        Color::from_rgba(0, 0, 0, 200),
+    );
+    draw_centered(text, cx, cy, size, col_white(), font);
 }
 
 fn draw_eval(cx: f32, cy: f32, color: Color, eval: &Eval, is_best: bool, font: Option<&Font>) {

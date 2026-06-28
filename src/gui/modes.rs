@@ -170,6 +170,8 @@ pub struct PlayMode {
     pending: Option<u64>,
     /// Position last handed to the engine, so we submit once per engine turn.
     submitted: Option<Position>,
+    /// Whether the game-over result has already been printed (once per game).
+    announced: bool,
 }
 
 impl PlayMode {
@@ -185,6 +187,7 @@ impl PlayMode {
             gen: 0,
             pending: None,
             submitted: None,
+            announced: false,
         }
     }
 
@@ -196,6 +199,37 @@ impl PlayMode {
         self.history = vec![start_board()];
         self.pending = None;
         self.submitted = None;
+        self.announced = false;
+    }
+
+    /// Final-result line for the (game-over) `board`: disc counts from each side's
+    /// perspective and who won. Both sources of the result text (the on-board
+    /// banner and the one-time stderr print) go through this.
+    fn result_text(&self, board: &Board) -> String {
+        let (black, white) = if board.black_to_move {
+            (
+                board.position.player_discs(),
+                board.position.opponent_discs(),
+            )
+        } else {
+            (
+                board.position.opponent_discs(),
+                board.position.player_discs(),
+            )
+        };
+        let (you, ai) = if self.human_black {
+            (black, white)
+        } else {
+            (white, black)
+        };
+        let outcome = if you > ai {
+            "You win!"
+        } else if ai > you {
+            "AI wins"
+        } else {
+            "Draw"
+        };
+        format!("{outcome}   You {you} - {ai} AI")
     }
 }
 
@@ -232,8 +266,19 @@ impl Mode for PlayMode {
 
     fn tick(&mut self) {
         let board = self.cur();
-        if board.position.is_game_end() || board.black_to_move == self.human_black {
-            // Human's turn (or game over): nothing for the engine to do.
+        if board.position.is_game_end() {
+            // Print the final result once, the first frame the game is over.
+            if !self.announced {
+                self.announced = true;
+                eprintln!("Game over — {}", self.result_text(&board));
+            }
+            self.pending = None;
+            self.submitted = None;
+            return;
+        }
+        self.announced = false; // a new in-progress position (e.g. after undo/restart)
+        if board.black_to_move == self.human_black {
+            // Human's turn: nothing for the engine to do.
             self.pending = None;
             self.submitted = None;
             return;
@@ -261,6 +306,17 @@ impl Mode for PlayMode {
 
     fn board(&self) -> Board {
         self.cur()
+    }
+
+    fn ui(&self) -> UiDetails {
+        let board = self.cur();
+        UiDetails {
+            banner: board
+                .position
+                .is_game_end()
+                .then(|| self.result_text(&board)),
+            ..Default::default()
+        }
     }
 }
 
@@ -480,6 +536,7 @@ impl Mode for PgnMode {
             } else {
                 None
             },
+            banner: None,
         }
     }
 }

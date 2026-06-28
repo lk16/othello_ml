@@ -18,7 +18,7 @@ it actually uses:
 | `game` | Play both sides locally. Left-click = move, right-click = undo, click after game over = restart. | — |
 | `evaluate` | `game` plus a score on every legal move; the best move is ringed. | `-w/--weights` (defaults to `trained_weights.bin`) |
 | `pgn` | Step through a loaded game with a bottom score graph (black's POV). | `-p/--pgn`, `-w/--weights` |
-| `play` | Play against the AI. Left-click = your move (ignored while the AI thinks), right-click = undo back to your previous move, click after game over = restart. | `-w/--weights` (defaults to `trained_weights.bin`) |
+| `play` | Play against the AI. Left-click = your move (ignored while the AI thinks), right-click = undo back to your previous move, click after game over = restart. At game over it shows the final disc counts and who won (on the board and once on stderr). | `-w/--weights` (defaults to `trained_weights.bin`) |
 
 Shared scoring flags (`evaluate`/`pgn`/`play`): `--depth N` (heuristic search depth,
 default 6) and `--exact-empties N` (switch to exact search at ≤ N empties,

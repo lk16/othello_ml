@@ -72,6 +72,9 @@ pub struct UiDetails {
     /// Black-POV score per mainline board (pgn mode); empty otherwise.
     pub graph: Vec<GraphPoint>,
     pub graph_current: Option<usize>,
+    /// Centred overlay message drawn over the board (e.g. `play`'s game-over
+    /// result). `None` draws nothing.
+    pub banner: Option<String>,
 }
 
 /// A GUI mode: handles input and produces a board + UI overlay each frame.
