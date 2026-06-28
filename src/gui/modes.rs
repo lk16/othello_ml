@@ -152,6 +152,119 @@ impl Mode for EvaluateMode {
 }
 
 // ---------------------------------------------------------------------------
+// play (human vs the engine)
+// ---------------------------------------------------------------------------
+
+/// Human vs the engine. The human plays one colour and clicks to move; the engine
+/// replies with the best move from the same search as `evaluate`, run on a worker
+/// thread so the UI never blocks while it thinks. Right-click undoes back to the
+/// human's previous move; a click after game over restarts.
+pub struct PlayMode {
+    history: Vec<Board>,
+    /// The colour the human plays (the engine plays the other).
+    human_black: bool,
+    engine: AsyncJob<MoveJob, MoveOut>,
+    gen: u64,
+    /// Generation of the search submitted for the current engine turn, if one is
+    /// outstanding; `None` when nothing is pending (human's turn / game over).
+    pending: Option<u64>,
+    /// Position last handed to the engine, so we submit once per engine turn.
+    submitted: Option<Position>,
+}
+
+impl PlayMode {
+    pub fn new(weights: Arc<Weights>, depth: u32, exact_empties: u32, human_black: bool) -> Self {
+        let mut solver = Solver::with_eval(Arc::new(FlatEval::from_weights(&weights)));
+        let engine = AsyncJob::new(move |(gen, pos): MoveJob| {
+            (gen, score_moves(&pos, depth, exact_empties, &mut solver))
+        });
+        PlayMode {
+            history: vec![start_board()],
+            human_black,
+            engine,
+            gen: 0,
+            pending: None,
+            submitted: None,
+        }
+    }
+
+    fn cur(&self) -> Board {
+        self.history.last().cloned().unwrap_or_else(start_board)
+    }
+
+    fn reset(&mut self) {
+        self.history = vec![start_board()];
+        self.pending = None;
+        self.submitted = None;
+    }
+}
+
+impl Mode for PlayMode {
+    fn on_left_click(&mut self, cell: u32) {
+        let board = self.cur();
+        if board.position.is_game_end() {
+            self.reset();
+            return;
+        }
+        // Ignore board clicks while it is the engine's turn (it is thinking).
+        if board.black_to_move != self.human_black {
+            return;
+        }
+        if let Some(child) = play(&board, cell) {
+            self.history.push(child);
+        }
+    }
+
+    fn on_right_click(&mut self) {
+        if self.history.len() <= 1 {
+            return;
+        }
+        // Undo the last ply, then any engine plies, landing back on the human's
+        // turn (or the very start when the engine moves first).
+        self.history.pop();
+        while self.history.len() > 1 && self.cur().black_to_move != self.human_black {
+            self.history.pop();
+        }
+        // Discard any in-flight engine search for the position we left.
+        self.pending = None;
+        self.submitted = None;
+    }
+
+    fn tick(&mut self) {
+        let board = self.cur();
+        if board.position.is_game_end() || board.black_to_move == self.human_black {
+            // Human's turn (or game over): nothing for the engine to do.
+            self.pending = None;
+            self.submitted = None;
+            return;
+        }
+        // Engine's turn: submit the search once for this position.
+        if self.submitted != Some(board.position) {
+            self.submitted = Some(board.position);
+            self.gen += 1;
+            self.pending = Some(self.gen);
+            self.engine.submit((self.gen, board.position));
+        }
+        while let Some((gen, scores)) = self.engine.poll() {
+            if Some(gen) != self.pending {
+                continue; // stale result (e.g. discarded after an undo)
+            }
+            self.pending = None;
+            // Best move from the side-to-move (engine) perspective.
+            if let Some(&(cell, _)) = scores.iter().max_by_key(|&&(_, s)| s) {
+                if let Some(child) = play(&board, cell) {
+                    self.history.push(child);
+                }
+            }
+        }
+    }
+
+    fn board(&self) -> Board {
+        self.cur()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // pgn
 // ---------------------------------------------------------------------------
 

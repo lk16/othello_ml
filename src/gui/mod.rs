@@ -16,7 +16,7 @@ use crate::othello::board::Board;
 use crate::othello::position::Position;
 use crate::training::weights::Weights;
 use crate::{load_games, Game};
-use modes::{EvaluateMode, GameMode, PgnMode};
+use modes::{EvaluateMode, GameMode, PgnMode, PlayMode};
 use score::GraphPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,7 @@ pub enum GuiMode {
     Game,
     Evaluate,
     Pgn,
+    Play,
 }
 
 impl GuiMode {
@@ -32,6 +33,7 @@ impl GuiMode {
             "game" => Some(GuiMode::Game),
             "evaluate" => Some(GuiMode::Evaluate),
             "pgn" => Some(GuiMode::Pgn),
+            "play" => Some(GuiMode::Play),
             _ => None,
         }
     }
@@ -49,6 +51,8 @@ pub struct GuiArgs {
     pub depth: u32,
     /// Switch to exact search at/below this many empties.
     pub exact_empties: u32,
+    /// `play` mode: the colour the human plays (the engine plays the other).
+    pub human_black: bool,
 }
 
 /// A single move's evaluation shown on the board.
@@ -93,10 +97,10 @@ pub fn start_board() -> Board {
 /// Entry point for the `gui` subcommand. Loads weights / a game as needed,
 /// then runs the macroquad event loop.
 pub fn run(args: GuiArgs) {
-    // Evaluate and pgn need a trained eval; game does not.
+    // Evaluate, pgn and play need a trained eval; game does not.
     let eval = match args.mode {
         GuiMode::Game => None,
-        GuiMode::Evaluate | GuiMode::Pgn => {
+        GuiMode::Evaluate | GuiMode::Pgn | GuiMode::Play => {
             let Some(path) = args.weights_file.as_deref() else {
                 eprintln!(
                     "Error: --weights/-w is required for `gui {}`.",
@@ -135,6 +139,15 @@ pub fn run(args: GuiArgs) {
             };
             Box::new(PgnMode::new(game, weights, args.depth, args.exact_empties))
         }
+        GuiMode::Play => {
+            let Some(weights) = eval else { return };
+            Box::new(PlayMode::new(
+                weights,
+                args.depth,
+                args.exact_empties,
+                args.human_black,
+            ))
+        }
     };
 
     let height = if args.mode == GuiMode::Pgn {
@@ -160,6 +173,7 @@ fn mode_name(mode: GuiMode) -> &'static str {
         GuiMode::Game => "game",
         GuiMode::Evaluate => "evaluate",
         GuiMode::Pgn => "pgn",
+        GuiMode::Play => "play",
     }
 }
 

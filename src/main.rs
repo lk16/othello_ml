@@ -503,12 +503,14 @@ fn parse_gui_args(program: &str, args: &[String]) -> Option<Command> {
     // Only flags each mode actually uses are accepted; the rest fall through to
     // the "unknown option" arm.
     let pgn_allowed = matches!(mode, GuiMode::Pgn);
-    let weights_allowed = matches!(mode, GuiMode::Evaluate | GuiMode::Pgn);
+    let weights_allowed = matches!(mode, GuiMode::Evaluate | GuiMode::Pgn | GuiMode::Play);
+    let color_allowed = matches!(mode, GuiMode::Play);
 
     let mut weights_file: Option<String> = None;
     let mut pgn_file: Option<String> = None;
     let mut depth: u32 = 6;
     let mut exact_empties: u32 = 12;
+    let mut human_black = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -536,6 +538,21 @@ fn parse_gui_args(program: &str, args: &[String]) -> Option<Command> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(exact_empties);
             }
+            "-c" | "--color" if color_allowed => {
+                i += 1;
+                match args.get(i).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("black" | "b") => human_black = true,
+                    Some("white" | "w") => human_black = false,
+                    other => {
+                        eprintln!(
+                            "Invalid --color {:?}; use black|b or white|w.\n",
+                            other.unwrap_or("")
+                        );
+                        print_gui_mode_usage(program, mode);
+                        return None;
+                    }
+                }
+            }
             other => {
                 eprintln!("Unknown option for `gui {}`: {other}\n", args[0]);
                 print_gui_mode_usage(program, mode);
@@ -545,8 +562,8 @@ fn parse_gui_args(program: &str, args: &[String]) -> Option<Command> {
         i += 1;
     }
 
-    // evaluate defaults the weights file like `train`; pgn requires it.
-    if matches!(mode, GuiMode::Evaluate) && weights_file.is_none() {
+    // evaluate and play default the weights file like `train`; pgn requires it.
+    if matches!(mode, GuiMode::Evaluate | GuiMode::Play) && weights_file.is_none() {
         weights_file = Some(String::from("trained_weights.bin"));
     }
     if matches!(mode, GuiMode::Pgn) && weights_file.is_none() {
@@ -566,6 +583,7 @@ fn parse_gui_args(program: &str, args: &[String]) -> Option<Command> {
         pgn_file,
         depth,
         exact_empties,
+        human_black,
     }))
 }
 
@@ -1774,6 +1792,7 @@ fn print_gui_modes(program: &str) {
     eprintln!("  game      Play both sides locally");
     eprintln!("  evaluate  Like game, plus a score on every legal move (best move ringed)");
     eprintln!("  pgn       Step through a game file with a bottom score graph");
+    eprintln!("  play      Play against the AI (choose your colour)");
     eprintln!();
     eprintln!("Use \"{program} gui <mode> --help\" for the options of a specific mode.");
 }
@@ -1820,6 +1839,26 @@ fn print_gui_mode_usage(program: &str, mode: GuiMode) {
             eprintln!();
             eprintln!("EXAMPLE:");
             eprintln!("  {program} gui pgn -w weights.bin -p game.pgn");
+        }
+        GuiMode::Play => {
+            eprintln!("Usage: {program} gui play [OPTIONS]");
+            eprintln!();
+            eprintln!("Play against the AI on a graphical board.");
+            eprintln!("  Left-click  = play your move (ignored while the AI is thinking)");
+            eprintln!("  Right-click = undo back to your previous move");
+            eprintln!("  Click after game over = restart");
+            eprintln!();
+            eprintln!("OPTIONS:");
+            eprintln!("  -w, --weights PATH    Trained weights (default: trained_weights.bin)");
+            eprintln!("  -d, --depth N         AI heuristic search depth (default: 6)");
+            eprintln!("  -e, --exact-empties N AI uses exact search at <= N empties (default: 12)");
+            eprintln!(
+                "  -c, --color COLOR     Your colour: black|b (first) or white|w (default: black)"
+            );
+            eprintln!("  -h, --help            Show this help message");
+            eprintln!();
+            eprintln!("EXAMPLE:");
+            eprintln!("  {program} gui play -w weights.bin -c white -d 8");
         }
     }
 }
