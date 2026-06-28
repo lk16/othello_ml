@@ -119,9 +119,11 @@ const W_CORNER: i32 = 1 << 11;
 const W_EVAL: i32 = 1 << 13;
 
 /// Minimum empties at which the eval-guided ordering term is added. The eval is the
-/// expensive ordering signal (a from-scratch `FlatEval::set` per child), so it is
-/// confined to the upper plies where ordering quality matters most and such nodes
-/// are few — the analogue of Edax's `min_depth_table` gate (`move.c:370`). Swept at
+/// expensive ordering signal (an `inc_score` per child on the sequential incremental
+/// path of Step 35 Item A, or a from-scratch `FlatEval::eval_position` for parallel
+/// workers), so it is confined to the upper plies where ordering quality matters most
+/// and such nodes are few — the analogue of Edax's `min_depth_table` gate
+/// (`move.c:370`). Swept at
 /// 18e/20e (see speedup-plan Step 34): a clean wall-clock minimum at 14 — lower
 /// cuts more nodes but the per-node eval cost dominates; higher loses ordering.
 const EVAL_ORDER_MIN_EMPTIES: u32 = 14;
@@ -291,7 +293,7 @@ fn worker_loop_nws(w: &mut Search, ctx: &SplitCtx) {
         w.parity = ctx.parent_parity ^ QUADRANT_ID[cell as usize];
         let score = match ctx.depth {
             Some(d) => -w.id_pass_nws(child, -ctx.beta, d - 1),
-            None => -w.search_exact_nws(child, -ctx.beta, ctx.empties - 1),
+            None => -w.search_exact_nws(child, -ctx.beta, ctx.empties - 1, None),
         };
         if ctx.cancel.cancelled() {
             return; // aborted mid-search: discard this (meaningless) result
@@ -392,7 +394,12 @@ impl Search {
     }
 
     /// Full-window dispatch by `empties`: leaf solver (≤4), shallow tier
-    /// (`5 ..= SHALLOW_MAX_EMPTIES`), else the ordered PVS search.
+    /// (`5 ..= SHALLOW_MAX_EMPTIES`), else the ordered PVS search. `inc` is the
+    /// node's incremental-eval state (Step 35 Item A) for the eval-ordering term;
+    /// `None` below `EVAL_ORDER_MIN_EMPTIES`, with no eval, or on the parallel path
+    /// — `alphabeta_exact` rebuilds from scratch ([`FlatEval::inc_root`]) if it
+    /// needs one and gets `None`. The leaf and shallow tiers ignore it (they are
+    /// below the eval-ordering gate).
     #[inline]
     pub(super) fn search_exact(
         &mut self,
@@ -400,13 +407,14 @@ impl Search {
         alpha: i32,
         beta: i32,
         empties: u32,
+        inc: Option<&IncEval>,
     ) -> i32 {
         if empties <= 4 {
             self.solve_leaf(pos, alpha, beta, empties)
         } else if empties <= SHALLOW_MAX_EMPTIES {
             self.shallow(pos, alpha, beta, empties)
         } else {
-            self.alphabeta_exact(pos, alpha, beta, empties)
+            self.alphabeta_exact(pos, alpha, beta, empties, inc)
         }
     }
 
@@ -426,7 +434,7 @@ impl Search {
             // strictly inside `(lo, hi)`.
             let mid = (lo + hi) / 2;
             let t = if mid & 1 != 0 { mid } else { mid + 1 };
-            if self.search_exact_nws(pos, t - 1, empties) >= t {
+            if self.search_exact_nws(pos, t - 1, empties, None) >= t {
                 lo = t + 1; // score >= t (odd) => score >= t + 1 (even)
             } else {
                 hi = t - 1; // score <  t        => score <= t - 1 (even)
@@ -448,7 +456,7 @@ impl Search {
         if self.eval.is_some() {
             self.solve_id(pos, empties)
         } else {
-            self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
+            self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties, None)
         }
     }
 
@@ -476,7 +484,7 @@ impl Search {
                 d += 2;
             }
         }
-        self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties)
+        self.search_exact(pos, SCORE_MIN, SCORE_MAX, empties, None)
     }
 
     /// Heuristic depth-limited score for gameplay (GUI / self-play), the fast
@@ -526,7 +534,7 @@ impl Search {
     ) -> i32 {
         let empties = pos.empties();
         if empties <= depth {
-            return self.search_exact(pos, alpha, beta, empties);
+            return self.search_exact(pos, alpha, beta, empties, None);
         }
         self.nodes += 1;
         if depth == 0 {
@@ -592,7 +600,7 @@ impl Search {
     ) -> i32 {
         let empties = pos.empties();
         if empties <= depth {
-            return self.search_exact_nws(pos, alpha, empties);
+            return self.search_exact_nws(pos, alpha, empties, None);
         }
         self.nodes += 1;
         let beta = alpha + 1;
@@ -688,7 +696,7 @@ impl Search {
     fn id_pass(&mut self, pos: &Position, mut alpha: i32, beta: i32, depth: u32) -> i32 {
         let empties = pos.empties();
         if empties <= depth {
-            return self.search_exact(pos, alpha, beta, empties);
+            return self.search_exact(pos, alpha, beta, empties, None);
         }
         self.nodes += 1;
         if depth == 0 {
@@ -748,7 +756,7 @@ impl Search {
     fn id_pass_nws(&mut self, pos: &Position, alpha: i32, depth: u32) -> i32 {
         let empties = pos.empties();
         if empties <= depth {
-            return self.search_exact_nws(pos, alpha, empties);
+            return self.search_exact_nws(pos, alpha, empties, None);
         }
         self.nodes += 1;
         if self.is_cancelled() {
@@ -822,7 +830,7 @@ impl Search {
     /// Shared by the PV and NWS seeding nodes (mirrors the exact ordering).
     #[inline]
     fn id_ordered_moves(&self, pos: &Position, moves: u64, empties: u32, hash_move: u8) -> MoveBuf {
-        let mut move_list = self.ordered_moves(pos, moves, empties);
+        let mut move_list = self.ordered_moves(pos, moves, empties, None);
         move_list
             .as_mut_slice()
             .sort_unstable_by_key(|&(score, _, _)| core::cmp::Reverse(score));
@@ -869,20 +877,40 @@ impl Search {
     /// `beta` is not passed. Used for every non-PV node. The leaf solvers are
     /// window-agnostic, so the leaf case reuses them with an explicit `alpha + 1`.
     #[inline]
-    fn search_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+    fn search_exact_nws(
+        &mut self,
+        pos: &Position,
+        alpha: i32,
+        empties: u32,
+        inc: Option<&IncEval>,
+    ) -> i32 {
         if empties <= 4 {
             self.solve_leaf(pos, alpha, alpha + 1, empties)
         } else if empties <= SHALLOW_MAX_EMPTIES {
             self.shallow_nws(pos, alpha, empties)
         } else {
-            self.alphabeta_exact_nws(pos, alpha, empties)
+            self.alphabeta_exact_nws(pos, alpha, empties, inc)
         }
     }
 
     /// Build the move list for `pos` (legal `moves`) into a stack buffer, scoring
     /// each with [`order_score`]. Shared by the PV and null-window ordered nodes.
+    ///
+    /// `inc` is `pos`'s incremental-eval state (Step 35 Item A): when present, the
+    /// eval-ordering term scores each child via an O(flips) [`FlatEval::inc_child`] +
+    /// [`FlatEval::inc_score`] update instead of the from-scratch (canonicalizing)
+    /// [`FlatEval::eval_position`]. `None` (the parallel workers and the heuristic ID
+    /// seeding passes) keeps the from-scratch path — same ordering, just slower. The
+    /// two differ in orientation (raw vs canonical), so node counts can differ; the
+    /// exact result cannot.
     #[inline]
-    fn ordered_moves(&self, pos: &Position, moves: u64, empties: u32) -> MoveBuf {
+    fn ordered_moves(
+        &self,
+        pos: &Position,
+        moves: u64,
+        empties: u32,
+        inc: Option<&IncEval>,
+    ) -> MoveBuf {
         let parity = self.parity;
         let parity_weight = if empties < 12 { 1 << 3 } else { 1 << 2 };
         // Eval-guided ordering (Step 34): attach the pattern-eval term only when a
@@ -903,16 +931,65 @@ impl Search {
                 // `child` is opponent-to-move, so its eval is from the opponent's
                 // perspective: a low child score is good for us. Mirrors Edax's
                 // `(SCORE_MAX − search_eval_0(child)) * (w_eval >> 2)` (move.c:442).
-                let child_eval = ev
-                    .eval_position(&child)
-                    .round()
-                    .clamp((SCORE_MIN + 1) as f32, (SCORE_MAX - 1) as f32)
-                    as i32;
+                let child_eval = match inc {
+                    // Incremental (Item A): O(flips) update from the node's state (raw
+                    // orientation; the exact result is ordering-independent).
+                    Some(i) => clamp_eval(ev.inc_score(&ev.inc_child(i, cell, pos.flipped(cell)))),
+                    // From-scratch (canonicalized) fallback.
+                    None => clamp_eval(ev.eval_position(&child)),
+                };
                 score += (SCORE_MAX - child_eval) * W_EVAL;
             }
             buf.push((score, cell, child));
         }
         buf
+    }
+
+    /// The incremental-eval state for the child reached by playing `cell` at a node
+    /// of `empties` empties, or `None` when the child is below the eval-ordering gate
+    /// (so it would never use one) or no incremental state is being threaded. Used by
+    /// the exact ordered search to propagate [`IncEval`] down the tree (Step 35 Item
+    /// A) without a from-scratch rebuild per node.
+    #[inline]
+    fn derive_child_inc(
+        &self,
+        node_inc: Option<&IncEval>,
+        pos: &Position,
+        cell: u32,
+        empties: u32,
+    ) -> Option<IncEval> {
+        if empties - 1 < EVAL_ORDER_MIN_EMPTIES {
+            return None;
+        }
+        node_inc
+            .zip(self.eval.as_deref())
+            .map(|(i, ev)| ev.inc_child(i, cell, pos.flipped(cell)))
+    }
+
+    /// The node's incremental-eval state for eval-guided ordering (Step 35 Item A):
+    /// the threaded `inc` when present, otherwise a from-scratch rebuild
+    /// ([`FlatEval::inc_root`]) — but only at/above the eval-ordering gate and with an
+    /// eval attached. Returns `None` (no incremental ordering) otherwise. `bootstrap`
+    /// holds an owned rebuilt state so the returned borrow can point at it.
+    #[inline]
+    fn node_inc<'a>(
+        &self,
+        inc: Option<&'a IncEval>,
+        pos: &Position,
+        empties: u32,
+        bootstrap: &'a mut Option<IncEval>,
+    ) -> Option<&'a IncEval> {
+        if empties < EVAL_ORDER_MIN_EMPTIES {
+            return None;
+        }
+        match inc {
+            Some(i) => Some(i),
+            None => {
+                let ev = self.eval.as_deref()?;
+                *bootstrap = Some(ev.inc_root(pos));
+                bootstrap.as_ref()
+            }
+        }
     }
 
     /// Ordered negamax with PVS for `empties > SHALLOW_MAX_EMPTIES`. Consults the
@@ -924,6 +1001,7 @@ impl Search {
         mut alpha: i32,
         mut beta: i32,
         empties: u32,
+        inc: Option<&IncEval>,
     ) -> i32 {
         self.nodes += 1;
         debug_assert_eq!(self.parity, board_parity(pos), "parity desync (exact)");
@@ -980,10 +1058,17 @@ impl Search {
             if passed.get_moves() == 0 {
                 return pos.final_score();
             }
-            return -self.alphabeta_exact(&passed, -beta, -alpha, empties);
+            // A pass flips the mover without changing empties, which `inc_child`
+            // cannot represent — pass `None` so the child rebuilds from scratch.
+            return -self.alphabeta_exact(&passed, -beta, -alpha, empties, None);
         }
 
-        let mut move_list = self.ordered_moves(pos, moves, empties);
+        // Incremental-eval state for eval-guided ordering (Step 35 Item A): the
+        // threaded `inc`, or a from-scratch rebuild at the top of the >= gate band.
+        let mut bootstrap = None;
+        let node_inc = self.node_inc(inc, pos, empties, &mut bootstrap);
+
+        let mut move_list = self.ordered_moves(pos, moves, empties, node_inc);
 
         // Enhanced Transposition Cutoff: if a child has a stored upper bound, our
         // value for that move is at least `-upper`; if that meets beta the node
@@ -1032,13 +1117,15 @@ impl Search {
         let mut best_cell = NO_MOVE;
         let mut first = true;
         for &(_, cell, ref child) in move_list.as_slice() {
+            let child_inc = self.derive_child_inc(node_inc, pos, cell, empties);
             self.parity ^= QUADRANT_ID[cell as usize];
             let score = if first {
-                -self.search_exact(child, -beta, -alpha, empties - 1)
+                -self.search_exact(child, -beta, -alpha, empties - 1, child_inc.as_ref())
             } else {
-                let probe = -self.search_exact_nws(child, -alpha - 1, empties - 1);
+                let probe =
+                    -self.search_exact_nws(child, -alpha - 1, empties - 1, child_inc.as_ref());
                 if probe > alpha && probe < beta {
-                    -self.search_exact(child, -beta, -alpha, empties - 1)
+                    -self.search_exact(child, -beta, -alpha, empties - 1, child_inc.as_ref())
                 } else {
                     probe
                 }
@@ -1076,7 +1163,13 @@ impl Search {
     /// probe never narrows, ETC's `value >= beta` becomes `value > alpha`, and PVS
     /// collapses to a single null-window probe per child that cuts on the first
     /// fail-high. Node count is identical to `alphabeta_exact` with `beta = alpha + 1`.
-    fn alphabeta_exact_nws(&mut self, pos: &Position, alpha: i32, empties: u32) -> i32 {
+    fn alphabeta_exact_nws(
+        &mut self,
+        pos: &Position,
+        alpha: i32,
+        empties: u32,
+        inc: Option<&IncEval>,
+    ) -> i32 {
         self.nodes += 1;
         debug_assert_eq!(self.parity, board_parity(pos), "parity desync (nws)");
         // Aborted by a sibling's cutoff at an enclosing split: bail without storing
@@ -1125,10 +1218,15 @@ impl Search {
             if passed.get_moves() == 0 {
                 return pos.final_score();
             }
-            return -self.alphabeta_exact_nws(&passed, -beta, empties);
+            // Pass: flips the mover without changing empties — rebuild from scratch.
+            return -self.alphabeta_exact_nws(&passed, -beta, empties, None);
         }
 
-        let mut move_list = self.ordered_moves(pos, moves, empties);
+        // Incremental-eval state for eval-guided ordering (Step 35 Item A).
+        let mut bootstrap = None;
+        let node_inc = self.node_inc(inc, pos, empties, &mut bootstrap);
+
+        let mut move_list = self.ordered_moves(pos, moves, empties, node_inc);
 
         if empties >= ETC_MIN_EMPTIES {
             for &(_, cell, ref child) in move_list.as_slice() {
@@ -1171,8 +1269,9 @@ impl Search {
         let mut best_cell = NO_MOVE;
 
         let (_, c0, ref ch0) = move_list.as_slice()[0];
+        let inc0 = self.derive_child_inc(node_inc, pos, c0, empties);
         self.parity ^= QUADRANT_ID[c0 as usize];
-        let s0 = -self.search_exact_nws(ch0, -beta, empties - 1);
+        let s0 = -self.search_exact_nws(ch0, -beta, empties - 1, inc0.as_ref());
         self.parity ^= QUADRANT_ID[c0 as usize];
         if self.is_cancelled() {
             return best; // aborted by an ancestor split: discard, do not store
@@ -1184,6 +1283,8 @@ impl Search {
 
         if best <= alpha && move_list.len() > 1 {
             if self.par.is_some() && empties >= SPLIT_MIN_EMPTIES {
+                // The split path runs workers with `None` incremental state (each
+                // rebuilds from scratch), so the parallel solver is unchanged.
                 let (pb, pc) = self.split_nws(move_list.as_slice(), beta, empties, None);
                 if self.is_cancelled() {
                     return best;
@@ -1194,8 +1295,10 @@ impl Search {
                 }
             } else {
                 for &(_, cell, ref child) in &move_list.as_slice()[1..] {
+                    let child_inc = self.derive_child_inc(node_inc, pos, cell, empties);
                     self.parity ^= QUADRANT_ID[cell as usize];
-                    let score = -self.search_exact_nws(child, -beta, empties - 1);
+                    let score =
+                        -self.search_exact_nws(child, -beta, empties - 1, child_inc.as_ref());
                     self.parity ^= QUADRANT_ID[cell as usize];
                     if self.is_cancelled() {
                         return best;
@@ -1334,11 +1437,11 @@ impl Search {
                 let child = pos.do_move(cell);
                 self.parity ^= QUADRANT_ID[cell as usize];
                 let score = if first {
-                    -self.search_exact(&child, -beta, -alpha, empties - 1)
+                    -self.search_exact(&child, -beta, -alpha, empties - 1, None)
                 } else {
-                    let probe = -self.search_exact_nws(&child, -alpha - 1, empties - 1);
+                    let probe = -self.search_exact_nws(&child, -alpha - 1, empties - 1, None);
                     if probe > alpha && probe < beta {
-                        -self.search_exact(&child, -beta, -alpha, empties - 1)
+                        -self.search_exact(&child, -beta, -alpha, empties - 1, None)
                     } else {
                         probe
                     }
@@ -1393,7 +1496,7 @@ impl Search {
                 remaining &= remaining - 1;
                 let child = pos.do_move(cell);
                 self.parity ^= QUADRANT_ID[cell as usize];
-                let score = -self.search_exact_nws(&child, -beta, empties - 1);
+                let score = -self.search_exact_nws(&child, -beta, empties - 1, None);
                 self.parity ^= QUADRANT_ID[cell as usize];
                 if score > best {
                     best = score;

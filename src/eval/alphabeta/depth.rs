@@ -138,7 +138,7 @@ fn best_move_exact(pos: &Position) -> Option<u32> {
         remaining &= remaining - 1;
         let child = pos.do_move(cell);
         searcher.parity = super::search::board_parity(&child);
-        let score = -searcher.search_exact(&child, -SCORE_MAX, -alpha, empties - 1);
+        let score = -searcher.search_exact(&child, -SCORE_MAX, -alpha, empties - 1, None);
         if score > alpha {
             alpha = score;
             best_cell = cell;

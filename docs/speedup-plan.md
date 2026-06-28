@@ -400,29 +400,57 @@ raw-leaf negamax (`heuristic_score_matches_raw_negamax`). Measured vs fix 1 on a
 depth 10 ~0.58 s. The from-scratch `FlatEval::set`/`eval_position` (per-leaf
 canonical) stays in place for the exact-solver ordering, bootstrap, and eval-check.
 
-**Not yet done — incremental eval in the exact solver + the shallow-search ordering
-bonus.** Scoped but deliberately deferred; both are exact-solver/training
-optimizations (no GUI benefit) and must be A/B'd before keeping.
+**Item A — incremental eval in exact ordering — DONE (sequential probe), net-neutral
+but kept as scaffolding.** [`IncEval`] is now threaded through
+`search_exact`/`alphabeta_exact(_nws)` and `ordered_moves`: at `empties ≥ EVAL_ORDER_
+MIN_EMPTIES` (14) the eval-ordering term scores each child via an O(flips)
+`inc_child` + `inc_score` update instead of the from-scratch (canonicalizing)
+`eval_position`. The node's state is the threaded `inc`, or a from-scratch
+`inc_root` rebuild at the topmost ≥-gate node and after a pass (`node_inc`); children
+get it via `derive_child_inc`. Sequential path only — parallel workers and the
+heuristic ID seeding passes pass `None` (from-scratch fallback), so the parallel
+solver and ID seeding are **unchanged by construction**.
 
-- *Why no GUI benefit:* exact eval-ordering is gated to `empties ≥ EVAL_ORDER_MIN_
-  EMPTIES` (14). The GUI's exact calls are at `empties ≤ exact_empties` (12), below the
-  gate, so they never run eval-ordering. Incremental eval there only helps bulk/training
-  exact solves at `empties ≥ 14`, which run on the **parallel** solver.
-- *Item A — incremental eval in exact ordering.* Thread [`IncEval`] through
-  `search_exact`/`alphabeta_exact(_nws)` and `ordered_moves` (the eval-ordering term).
-  Lowers the *per-eval cost* at `empties ≥ 14` nodes; does **not** cut node count. Cheap
-  sequential probe = make `ordered_moves` take `Option<&IncEval>` (workers pass `None`,
-  parallel unchanged); the full win needs it through the YBWC split (`SplitCtx`,
-  `worker_loop_nws`, per-worker state) — the repo's highest-risk code. Watch that the
-  raw (non-canonical) ordering eval doesn't worsen `nodes/pos` vs the current
-  canonicalized `eval_position` ordering.
-- *Item B — shallow-search ordering bonus (Step 34 tier 2, the ~3.7× lever).* Depends on
-  Item A's incremental eval; adds the `sort_depth`/`min_depth_table` schedule +
-  `inc_sort_depth`, and **requires re-sweeping** the tuned ordering constants. The
-  largest potential exact-solve speedup, but ordering experiments here are routinely
-  built-measured-reverted — gate on the bench.
-- *Sequential baseline to beat* (eval-ordering on, `trained_weights.bin`, 3 playok
-  files): 16e 267.5k nodes/pos @ 33.4M n/s · 18e 1.17M @ 28.4M · 20e 4.35M @ 22.3M.
+A/B (sequential, 3 playok files, `trained_weights.bin`, vs the from-scratch baseline):
+**net-neutral** — `16e 267.5k→268.3k / 8.0→8.0 ms · 18e 1.135M→1.133M / 39.1→38.5 ms
+· 20e 4.955M→4.944M / 203.9→202.5 ms`. Two useful results: (1) the raw (non-canonical)
+incremental ordering does **not** worsen `nodes/pos` (≤0.3% at every depth) — the
+doc's stated risk is cleared; (2) the per-eval-cost lever is **~0 sequentially** — the
+unchanged 47-element dot product dominates the eval cost, the `IncEval` idx copy +
+flip-scatter roughly equals the from-scratch build, and ≥14 nodes are a minority of the
+tree. Kept because it is the structural prerequisite for Item B and a future stronger-
+eval retry, and it costs nothing. The "full win" (incremental state through the YBWC
+split — `SplitCtx`/`worker_loop_nws`/per-worker state, the repo's highest-risk code) is
+**not pursued**: the sequential probe shows the payoff is too small to justify it.
+
+**Item B — shallow-search ordering bonus (Step 34 tier 2, the ~3.7× lever) — BUILT,
+MEASURED, REVERTED.** On top of Item A: at `empties ≥ EVAL_ORDER_MIN_EMPTIES` the eval
+term scored each child by a short incremental negamax (`order_shallow`, Edax
+`search_eval_1`/`PVS_shallow`, not counted in `nodes`) to `sort_depth` plies instead of
+a static eval, with the Edax schedule `sort_depth = (empties − base) / 3` clamped to
+`[0, max]`. Exact scores stay correct (ordering can't change them; verified vs plain at
+18e). Swept `base`/`max`: `base=15` (Edax) → `sort_depth=1` only at 18e+, ~0–1% node
+cut; `base=12,max=6` → −3.2% nodes at 20e but `sort_depth=2` (18e) *increased* nodes;
+`base=12,max=1` (1-ply from 15e) → −0.3%/−0.6%/−2.9% nodes at 16/18/20e but **+0–2%
+wall-clock** everywhere. Every config is a net wall-clock loss: the node cuts are real
+(growing with depth — not an inverted signal) but too small to pay for the lookahead
+cost, exactly the Edax-comparison prediction that a depth-limited lookahead with our
+eval picks ~the same moves the static `order_score` + eval term already does.
+
+**Revisit Item B only with a stronger eval.** The mechanism is correct and the
+scaffolding (Item A's incremental threading) is in place; the gate is eval quality, as
+for the original static-eval ordering term (Step 34) before the eval fixes flipped it.
+When the eval improves (see [eval-quality.md](eval-quality.md)), re-introduce
+`order_shallow` + the `sort_depth` schedule (add `inc_sort_depth[node_type]`: deeper
+sort for PV than cut nodes) and re-sweep `base`/`max` on the bench. Largest latent
+exact-solve lever, still eval-gated.
+
+- *Why no GUI benefit either way:* exact eval-ordering is gated to `empties ≥ 14`. The
+  GUI's exact calls are at `empties ≤ exact_empties` (12), below the gate. Incremental
+  eval and the shallow bonus only help bulk/training exact solves at `empties ≥ 14`,
+  which run on the **parallel** solver.
+- *Sequential baseline* (eval-ordering on, `trained_weights.bin`, 3 playok files): 16e
+  267.5k nodes/pos @ 33.4M n/s · 18e 1.135M @ 29.0M · 20e 4.95M @ 24.3M.
 
 ### Steps 26 / 28 — SIMD primitives (low priority, Intel-gated)
 From a callgrind profile of the sequential hot path. Self-cost ranking: **flip
