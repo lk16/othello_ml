@@ -980,7 +980,6 @@ fn run_selfplay(args: SelfPlayArgs) {
             return;
         }
     };
-    let features = weights.features().clone();
 
     let interrupted = Arc::new(AtomicBool::new(false));
     {
@@ -1052,7 +1051,6 @@ fn run_selfplay(args: SelfPlayArgs) {
             }
             let ex = generate_examples(
                 &weights,
-                &features,
                 &sp_config,
                 args.games,
                 iter_seed,

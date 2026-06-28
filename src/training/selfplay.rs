@@ -34,13 +34,13 @@
 //! `λ→1` is pure Monte-Carlo (label = terminal outcome); `λ→0` is one-ply
 //! bootstrapping off the next state's eval.
 
-use crate::eval::alphabeta::{best_move, bootstrap_score};
 use crate::eval::pattern::FlatEval;
 use crate::othello::position::Position;
-use crate::training::features::Features;
 use crate::training::weights::Weights;
 use crate::training::TrainingExample;
+use crate::Solver;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Knobs for self-play game generation and TD(λ) labelling.
 #[derive(Debug, Clone)]
@@ -91,12 +91,49 @@ fn random_move(moves: u64, rng: &mut Rng) -> u32 {
     remaining.trailing_zeros()
 }
 
+/// Best legal move for `pos` via the fast eval-seeded search (Step 35): exact below
+/// the trust frontier, the ordered+TT+incremental heuristic search above. Mirrors the
+/// GUI's `score_moves` argmax and reuses the solver's transposition table across the
+/// sibling moves (and across the game), so it is far cheaper than the un-ordered
+/// negamax `best_move` it replaces. `None` only when there are no legal moves.
+fn fast_best_move(
+    solver: &mut Solver,
+    pos: &Position,
+    depth: u32,
+    exact_empties: u32,
+) -> Option<u32> {
+    let mut remaining = pos.get_moves();
+    if remaining == 0 {
+        return None;
+    }
+    // First legal move as the default, so the return is always a legal cell.
+    let mut best_cell = remaining.trailing_zeros();
+    let mut best_score = i32::MIN;
+    while remaining != 0 {
+        let cell = remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        let child = pos.do_move(cell);
+        // `child` is opponent-to-move; negate to get our score. Solve exactly once the
+        // child is within the frontier (also warms the shared TT), else search heuristically.
+        let child_score = if child.empties() <= exact_empties {
+            solver.exact_score(&child)
+        } else {
+            solver.heuristic_score(&child, depth.saturating_sub(1))
+        };
+        if -child_score > best_score {
+            best_score = -child_score;
+            best_cell = cell;
+        }
+    }
+    Some(best_cell)
+}
+
 /// Play one self-play game and return its TD(λ)-labelled training examples
-/// (only positions with empties in `(exact_empties, max_empties]`).
+/// (only positions with empties in `(exact_empties, max_empties]`). `solver` carries
+/// the current eval ([`Solver::with_eval`]) and is reused across moves and the U(s)
+/// bootstrap so its transposition table stays warm.
 fn play_one_game(
-    weights: &Weights,
-    features: &Features,
-    flat: &FlatEval,
+    solver: &mut Solver,
     config: &SelfPlayConfig,
     rng: &mut Rng,
 ) -> Vec<TrainingExample> {
@@ -121,9 +158,9 @@ fn play_one_game(
         let mv = if ply < config.random_plies {
             random_move(pos.get_moves(), rng)
         } else {
-            // `best_move` switches to exact search at ≤ exact_empties, so the
-            // endgame is played (near-)perfectly — strengthening the terminal `z`.
-            best_move(&pos, config.depth, config.exact_empties, weights, features)
+            // `fast_best_move` solves exactly within the frontier, so the endgame is
+            // played (near-)perfectly — strengthening the terminal `z`.
+            fast_best_move(solver, &pos, config.depth, config.exact_empties)
                 .unwrap_or_else(|| random_move(pos.get_moves(), rng))
         };
         // Both move sources return a *legal* cell drawn from `get_moves()`, so the
@@ -144,18 +181,13 @@ fn play_one_game(
     let z_stm = pos.final_score() as f64;
     let z_black = if black_to_move { z_stm } else { -z_stm };
 
-    // Black-perspective bootstrap estimate U(s) for each decision state.
-    let u_black: Vec<f64> = nodes
-        .iter()
-        .map(|&(p, b)| {
-            let v = bootstrap_score(&p, flat, config.depth) as f64;
-            if b {
-                v
-            } else {
-                -v
-            }
-        })
-        .collect();
+    // Black-perspective bootstrap estimate U(s) for each decision state, via the same
+    // fast eval-seeded search used for move selection (Step 35 `heuristic_score`).
+    let mut u_black: Vec<f64> = Vec::with_capacity(k);
+    for &(p, b) in &nodes {
+        let v = solver.heuristic_score(&p, config.depth) as f64;
+        u_black.push(if b { v } else { -v });
+    }
 
     // Backward forward-view λ-return (Black perspective). g[k] is the terminal.
     let mut g = vec![0f64; k + 1];
@@ -188,54 +220,47 @@ fn play_one_game(
 /// is polled between games so Ctrl+C stops generation promptly with a partial batch.
 pub fn generate_examples(
     weights: &Weights,
-    features: &Features,
     config: &SelfPlayConfig,
     games: usize,
     base_seed: u64,
     progress: &AtomicUsize,
     interrupted: &AtomicBool,
 ) -> Vec<TrainingExample> {
-    let flat = FlatEval::from_weights(weights);
+    // Build the flat eval once and share it (read-only) across the per-thread solvers.
+    let flat = Arc::new(FlatEval::from_weights(weights));
     let threads = config.threads.max(1);
 
-    let play_range = |lo: usize, hi: usize| -> Vec<TrainingExample> {
+    // One reused solver per thread: its transposition table warms across the chunk's
+    // games (entries are position-keyed and path-independent, so cross-game reuse is
+    // sound and only speeds ordering).
+    let play_chunk = |flat: Arc<FlatEval>, lo: usize, hi: usize| -> Vec<TrainingExample> {
+        let mut solver = Solver::with_eval(flat);
         let mut out = Vec::new();
         for gi in lo..hi {
             if interrupted.load(Ordering::Relaxed) {
                 break;
             }
             let mut rng = Rng(base_seed ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            out.extend(play_one_game(weights, features, &flat, config, &mut rng));
+            out.extend(play_one_game(&mut solver, config, &mut rng));
             progress.fetch_add(1, Ordering::Relaxed);
         }
         out
     };
 
     if threads <= 1 {
-        return play_range(0, games);
+        return play_chunk(flat, 0, games);
     }
 
     // Split the game indices into `threads` contiguous chunks; each thread owns one.
     let chunk = games.div_ceil(threads);
     std::thread::scope(|s| {
-        let flat = &flat;
+        let play_chunk = &play_chunk;
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let lo = (t * chunk).min(games);
                 let hi = ((t + 1) * chunk).min(games);
-                s.spawn(move || {
-                    let mut out = Vec::new();
-                    for gi in lo..hi {
-                        if interrupted.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let mut rng =
-                            Rng(base_seed ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                        out.extend(play_one_game(weights, features, flat, config, &mut rng));
-                        progress.fetch_add(1, Ordering::Relaxed);
-                    }
-                    out
-                })
+                let flat = Arc::clone(&flat);
+                s.spawn(move || play_chunk(flat, lo, hi))
             })
             .collect();
         handles
@@ -248,6 +273,13 @@ pub fn generate_examples(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::training::features::Features;
+
+    /// An eval-backed solver over a fresh (zero) weight table — enough to drive the
+    /// self-play machinery in tests (label structure does not depend on eval quality).
+    fn solver_for(weights: &Weights) -> Solver {
+        Solver::with_eval(Arc::new(FlatEval::from_weights(weights)))
+    }
 
     fn cfg() -> SelfPlayConfig {
         SelfPlayConfig {
@@ -273,12 +305,11 @@ mod tests {
 
     #[test]
     fn one_game_labels_are_bounded_and_in_band() {
-        let features = Features::edax();
-        let weights = Weights::new(features.clone());
-        let flat = FlatEval::from_weights(&weights);
+        let weights = Weights::new(Features::edax());
+        let mut solver = solver_for(&weights);
         let config = cfg();
         let mut rng = Rng(999);
-        let examples = play_one_game(&weights, &features, &flat, &config, &mut rng);
+        let examples = play_one_game(&mut solver, &config, &mut rng);
         assert!(!examples.is_empty(), "a full game should yield examples");
         for ex in &examples {
             let e = ex.position.empties();
@@ -299,14 +330,13 @@ mod tests {
         // With λ=1 every state's Black-return is the exact terminal differential,
         // so each label equals ±z (sign = side to move). Verifiable without the
         // recursion: just replay and compare to final_score.
-        let features = Features::edax();
-        let weights = Weights::new(features.clone());
-        let flat = FlatEval::from_weights(&weights);
+        let weights = Weights::new(Features::edax());
+        let mut solver = solver_for(&weights);
         let mut config = cfg();
         config.lambda = 1.0;
         config.random_plies = 0; // deterministic greedy game
         let mut rng = Rng(7);
-        let examples = play_one_game(&weights, &features, &flat, &config, &mut rng);
+        let examples = play_one_game(&mut solver, &config, &mut rng);
         // All labels must have equal magnitude (|z|), differing only in sign.
         let mag = examples[0].target_score.abs();
         for ex in &examples {
@@ -316,20 +346,11 @@ mod tests {
 
     #[test]
     fn generate_examples_respects_interrupt() {
-        let features = Features::edax();
-        let weights = Weights::new(features.clone());
+        let weights = Weights::new(Features::edax());
         let config = cfg();
         let progress = AtomicUsize::new(0);
         let interrupted = AtomicBool::new(true); // already set → no games played
-        let out = generate_examples(
-            &weights,
-            &features,
-            &config,
-            100,
-            1,
-            &progress,
-            &interrupted,
-        );
+        let out = generate_examples(&weights, &config, 100, 1, &progress, &interrupted);
         assert!(out.is_empty());
         assert_eq!(progress.load(Ordering::Relaxed), 0);
     }
